@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/hotaru_mqtt.svg)](https://crates.io/crates/hotaru_mqtt)
 [![Docs.rs](https://docs.rs/hotaru_mqtt/badge.svg)](https://docs.rs/hotaru_mqtt)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
 
 MQTT 3.1.1 broker and client for the [Hotaru](https://github.com/hotaru/hotaru) framework.
 
@@ -119,4 +119,4 @@ cargo test
 
 ## License
 
-Licensed under either of [MIT](https://opensource.org/licenses/MIT) or [Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0) at your option.
+Licensed under [MIT](https://opensource.org/licenses/MIT)
