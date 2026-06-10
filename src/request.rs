@@ -1,0 +1,198 @@
+//! User-facing request / response types and shared data types.
+//!
+//! `MqttRequest` / `MqttResponse` are the protocol's `RequestContext::Request`
+//! / `Response`. All three outpoint operations (`Publish` / `Subscribe` /
+//! `Unsubscribe`) go through this enum via `run!(...)`.
+
+use std::sync::Arc;
+
+use bytes::Bytes;
+
+/// MQTT Quality of Service level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum QoS {
+    AtMostOnce = 0,
+    AtLeastOnce = 1,
+    ExactlyOnce = 2,
+}
+
+impl QoS {
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::AtMostOnce),
+            1 => Some(Self::AtLeastOnce),
+            2 => Some(Self::ExactlyOnce),
+            _ => None,
+        }
+    }
+}
+
+/// Wire-level packet identifier (16-bit per MQTT spec).
+pub type PacketId = u16;
+
+// ----------------------------------------------------------------------------
+// Outpoint request enum
+// ----------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub enum MqttRequest {
+    Publish(PublishRequest),
+    Subscribe(Vec<TopicFilter>),
+    Unsubscribe(Vec<Arc<str>>),
+}
+
+#[derive(Debug, Clone)]
+pub enum MqttResponse {
+    Published(PublishAck),
+    Subscribed(Vec<SubackCode>),
+    Unsubscribed,
+}
+
+// ----------------------------------------------------------------------------
+// User-facing PUBLISH constructs
+// ----------------------------------------------------------------------------
+
+/// What the user constructs to publish.
+#[derive(Debug, Clone)]
+pub struct PublishRequest {
+    pub topic: Arc<str>,
+    pub payload: Bytes,
+    pub qos: QoS,
+    pub retain: bool,
+}
+
+impl Default for PublishRequest {
+    fn default() -> Self {
+        Self {
+            topic: Arc::from(""),
+            payload: Bytes::new(),
+            qos: QoS::AtMostOnce,
+            retain: false,
+        }
+    }
+}
+
+/// What the user receives from an inbound PUBLISH (server or client side).
+#[derive(Debug, Clone)]
+pub struct IncomingPublish {
+    pub topic: Arc<str>,
+    pub payload: Bytes,
+    pub qos: QoS,
+    pub retain: bool,
+    pub dup: bool,
+    pub packet_id: Option<PacketId>,
+}
+
+impl IncomingPublish {
+    pub fn topic(&self) -> &str {
+        self.topic.as_ref()
+    }
+    pub fn payload(&self) -> &[u8] {
+        self.payload.as_ref()
+    }
+}
+
+/// Result returned by `Protocol::send` for a PUBLISH operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishAck {
+    /// QoS 0: sent on the wire, no acknowledgement expected.
+    Sent,
+    /// QoS 1: PUBACK received from peer.
+    Acknowledged(PacketId),
+    /// QoS 2: full PUBREC + PUBREL + PUBCOMP handshake completed.
+    Completed(PacketId),
+}
+
+// ----------------------------------------------------------------------------
+// SUBSCRIBE / UNSUBSCRIBE constructs
+// ----------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct TopicFilter {
+    pub filter: Arc<str>,
+    pub qos: QoS,
+}
+
+impl TopicFilter {
+    pub fn new(filter: impl Into<Arc<str>>, qos: QoS) -> Self {
+        Self {
+            filter: filter.into(),
+            qos,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubackCode {
+    Granted(QoS),
+    Failure,
+}
+
+impl SubackCode {
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Granted(q) => q.as_u8(),
+            Self::Failure => 0x80,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Granted(QoS::AtMostOnce)),
+            1 => Some(Self::Granted(QoS::AtLeastOnce)),
+            2 => Some(Self::Granted(QoS::ExactlyOnce)),
+            0x80 => Some(Self::Failure),
+            _ => None,
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// CONNECT-time constructs
+// ----------------------------------------------------------------------------
+
+/// CONNECT-time authentication payload.
+#[derive(Debug, Clone)]
+pub struct Credentials {
+    pub username: Arc<str>,
+    pub password: Bytes,
+}
+
+impl Credentials {
+    pub fn new(username: impl Into<Arc<str>>, password: impl Into<Bytes>) -> Self {
+        Self {
+            username: username.into(),
+            password: password.into(),
+        }
+    }
+}
+
+/// Last Will and Testament — published by broker when this client crashes.
+#[derive(Debug, Clone)]
+pub struct WillMessage {
+    pub topic: Arc<str>,
+    pub payload: Bytes,
+    pub qos: QoS,
+    pub retain: bool,
+}
+
+impl WillMessage {
+    pub fn new(
+        topic: impl Into<Arc<str>>,
+        payload: impl Into<Bytes>,
+        qos: QoS,
+        retain: bool,
+    ) -> Self {
+        Self {
+            topic: topic.into(),
+            payload: payload.into(),
+            qos,
+            retain,
+        }
+    }
+}

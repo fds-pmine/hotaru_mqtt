@@ -1,0 +1,96 @@
+# Rust build artifacts
+/target
+**/target/
+debug/
+release/
+
+# Cargo lock file
+Cargo.lock
+
+# Documentation
+doc/
+**/doc/
+hotaru_core/REFACTOR_NOTES.md
+hotaru_core/RENAME_TRACKER.md
+hotaru_core/TRANSPORT_RUNTIME_PROPOSAL.md
+hotaru_core/OUTPOINT_DESIGN.md
+hotaru_core/OUTPOINT_IMPLEMENTATION_PLAN.md
+hotaru_core/OUTPOINT_TEAM_PLAN.md
+
+# Backup files
+*.swp
+*.swo
+*~
+.DS_Store
+
+# IDE / Editor files
+.vscode/
+.claude/
+.idea/
+*.iml
+.project
+.classpath
+.settings/
+*.sublime-project
+*.sublime-workspace
+.vs/
+
+# Keys, certificates, and secrets
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.der
+*.cer
+secrets/
+keys/
+.env
+.env.*
+!.env.example
+rsgithub
+rsgithub.pub
+
+# Project-specific
+/templates
+/programfiles
+starberry.toml
+
+# Benchmark results
+bench_results/
+
+# Test coverage
+tarpaulin-report.html
+cobertura.xml
+*.profraw
+*.profdata
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
