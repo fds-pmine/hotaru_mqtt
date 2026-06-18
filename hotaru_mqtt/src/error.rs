@@ -25,6 +25,11 @@ pub enum MqttError {
     NotConnected(String),
     Protocol(Violation),
     Codec(CodecError),
+    /// Bounded channel rejected a write because the queue was full. Producers
+    /// experiencing this must apply a slow-consumer policy (see
+    /// `hotaru_mqtt_broker::SlowConsumerPolicy`); P1.B introduces the error,
+    /// P3 wires the enforcement.
+    Backpressure,
     /// Temporary stub for features not yet implemented. Should not appear in
     /// production code paths once Phase 2 implementation completes — new
     /// occurrences require PR review.
@@ -58,6 +63,39 @@ pub enum Violation {
     HashWildcardNotTerminal,
     WildcardMixedWithLiteral,
     SessionAlreadyBound,
+    // ── Stage A P1 hardening (spec §1.3 / §2.2 / §2.3 / §3.1) ──────────
+    /// PUBLISH with DUP=1 and QoS=0 — spec §3.3.1.1.
+    DupSetOnQos0,
+    /// PUBLISH (or any ack) carrying packet_id=0 — spec §2.3.1.
+    PacketIdZero,
+    /// PUBLISH with zero-length topic — spec §3.3.2.1.
+    EmptyPublishTopic,
+    /// Reserved header bits set on a fixed header that defines them as 0.
+    /// Used by P2 strict CONNECT parsing. P1 only adds the variant.
+    ReservedHeaderBits,
+    /// CONNACK first byte has bits 1-7 set (only bit 0 = SessionPresent
+    /// is defined) — spec §3.2.2.1.
+    ConnackReservedBits,
+    /// CONNACK SessionPresent=1 paired with non-Accepted return code —
+    /// spec §3.2.2.2.
+    SessionPresentWithError,
+    /// UTF-8 string contains U+0000 NUL — spec §1.5.3 forbids.
+    Utf8NullCharacter,
+    /// Packet remaining length exceeds the configured `max_packet_size`.
+    /// Carries (declared, limit) bytes for diagnostics.
+    PacketTooLarge { len: usize, max: usize },
+    // ── Stage A P3.A: fixed-header flag strictness (spec §1.6 / §2.1) ─────
+    /// SUBSCRIBE fixed-header low nibble MUST be `0010` (§3.8.1).
+    SubscribeReservedBits,
+    /// UNSUBSCRIBE fixed-header low nibble MUST be `0010` (§3.10.1).
+    UnsubscribeReservedBits,
+    // ── hardening additions ───────────────────────────────────────────────
+    /// Per-session inbound QoS-2 stash would exceed the configured cap
+    /// (`MqttSafety.receive_maximum_inbound()`). Connection MUST close.
+    ReceiveMaximumExceeded { limit: usize },
+    /// SUBSCRIBE / UNSUBSCRIBE filter count exceeds
+    /// `MqttSafety.max_filters_per_subscribe()`. Connection MUST close.
+    TooManyFilters { count: usize, max: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +107,14 @@ pub enum CodecError {
     PayloadTooLong { len: usize, max: usize },
     QosInvalid(u8),
     ReservedFlagSet,
+    /// Encode-side: a length-prefixed string or bytes field exceeds the
+    /// u16 wire encoding (spec §1.5.3 / §1.5.4 — MUST be ≤ 65 535).
+    /// Surfacing this surfaces F2 (second-audit): prior `as u16` truncation
+    /// would silently corrupt the wire frame.
+    FieldTooLong {
+        kind: &'static str,
+        len: usize,
+    },
 }
 
 impl fmt::Display for MqttError {
@@ -82,6 +128,7 @@ impl fmt::Display for MqttError {
             Self::NotConnected(m) => write!(f, "not connected: {}", m),
             Self::Protocol(v) => write!(f, "protocol violation: {:?}", v),
             Self::Codec(c) => write!(f, "codec: {:?}", c),
+            Self::Backpressure => f.write_str("write queue full (backpressure)"),
             Self::Unsupported(m) => write!(f, "unsupported: {}", m),
         }
     }

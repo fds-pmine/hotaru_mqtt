@@ -2,7 +2,8 @@
 //!
 //! Internal layout per BCH design:
 //! - `reader`: single-take `Arc<Mutex<Option<...>>>`; handle_*_loop owns it
-//! - `cmd_tx`: writer actor input — pub(crate) so broker can fanout directly
+//! - `cmd_tx`: writer actor input — drained via the public `send_cmd` /
+//!   `send_packet` / `send_publish` helpers; one queue per connection
 //! - `session`: `Arc<MqttSession>` — logical state, may outlive channel (M phase)
 //! - `open` / `shutdown`: lifecycle signals
 //!
@@ -54,9 +55,13 @@ pub enum WriteCmd {
 pub struct MqttChannel<W: ConnStream> {
     // ── Physical wire ───────────────────────────────────────────
     reader: Arc<Mutex<Option<BufReader<W::ReadHalf>>>>,
-    /// Writer actor's input. `pub(crate)` so `Broker::publish` can directly
-    /// fanout `WriteCmd::Publish(...)` to subscriber channels (G simplification).
-    pub(crate) cmd_tx: mpsc::UnboundedSender<WriteCmd>,
+    /// Writer actor's input — **bounded** (capacity from caller's `MqttSafety`).
+    /// `pub(crate)`; downstream protocol implementations drive it via the
+    /// public `send_cmd` / `send_packet` / `send_publish` methods, never
+    /// touch the sender directly. Full queue → `MqttError::Backpressure`
+    /// (P1.B); slow-consumer policy that translates that into drop-vs-
+    /// disconnect lives in `hotaru_mqtt_broker` and gets wired in P3.
+    pub(crate) cmd_tx: mpsc::Sender<WriteCmd>,
 
     // ── Connection metadata ─────────────────────────────────────
     connection_id: u64,
@@ -108,14 +113,20 @@ impl<W: ConnStream> Channel for MqttChannel<W> {
 
 impl<W: ConnStream> MqttChannel<W> {
     /// Construct a new channel, spawn its writer actor, and stash the reader
-    /// for `take_reader`. Called from `MqttProtocol::open_channel`.
-    pub(crate) fn new(
+    /// for `take_reader`. Called from `Protocol::open_channel` implementations
+    /// in any downstream protocol crate, client or server.
+    ///
+    /// `cmd_buffer_size` bounds the writer actor's input queue
+    /// (`MqttSafety.max_queued_messages()`). A producer overrunning it gets
+    /// `MqttError::Backpressure`.
+    pub fn new(
         reader: BufReader<W::ReadHalf>,
         writer: W::WriteHalf,
         meta: &W::Meta,
         role: ProtocolRole,
+        cmd_buffer_size: usize,
     ) -> Self {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel(cmd_buffer_size.max(1));
         let open = Arc::new(AtomicBool::new(true));
         let shutdown = Arc::new(Notify::new());
         let session = MqttSession::new();
@@ -144,7 +155,7 @@ impl<W: ConnStream> MqttChannel<W> {
     /// Take ownership of the reader. Returns `None` on subsequent calls.
     ///
     /// Called once by the `Protocol::handle` loop at startup. Channel clones
-    /// (e.g. broker-held copies) cannot read — they only push commands.
+    /// held elsewhere cannot read — they only push commands.
     pub async fn take_reader(&self) -> Option<BufReader<W::ReadHalf>> {
         self.reader.lock().await.take()
     }
@@ -177,24 +188,39 @@ impl<W: ConnStream> MqttChannel<W> {
         self.session.bind.keep_alive()
     }
 
-    /// Send a control packet through the writer actor. Returns
-    /// `MqttError::ChannelClosed` if the actor has exited.
+    /// Send a control packet through the writer actor. Non-blocking:
+    /// returns `MqttError::Backpressure` on queue-full, `MqttError::ChannelClosed`
+    /// if the actor has exited.
     pub fn send_packet(&self, packet: Packet) -> Result<(), MqttError> {
-        self.cmd_tx
-            .send(WriteCmd::Packet(packet))
-            .map_err(|_| MqttError::ChannelClosed)
+        self.try_send(WriteCmd::Packet(packet))
     }
 
-    /// Send a PUBLISH through the writer actor (optimized path).
+    /// Send a PUBLISH through the writer actor (optimized path). Non-blocking.
     pub fn send_publish(&self, packet: PublishPacket) -> Result<(), MqttError> {
-        self.cmd_tx
-            .send(WriteCmd::Publish(packet))
-            .map_err(|_| MqttError::ChannelClosed)
+        self.try_send(WriteCmd::Publish(packet))
+    }
+
+    /// Send any `WriteCmd` through the writer actor. General-purpose entry
+    /// point for downstream protocol implementations that need to push commands
+    /// the specialized `send_packet` / `send_publish` helpers don't cover
+    /// (e.g. `Flush`, `Shutdown`). Non-blocking.
+    pub fn send_cmd(&self, cmd: WriteCmd) -> Result<(), MqttError> {
+        self.try_send(cmd)
+    }
+
+    fn try_send(&self, cmd: WriteCmd) -> Result<(), MqttError> {
+        use mpsc::error::TrySendError;
+        match self.cmd_tx.try_send(cmd) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(MqttError::Backpressure),
+            Err(TrySendError::Closed(_)) => Err(MqttError::ChannelClosed),
+        }
     }
 
     /// Shared `Notify` that fires on `close()`. `handle_*` loops `.await`
-    /// `notified()` on this to break early.
-    pub(crate) fn shutdown_signal(&self) -> Arc<Notify> {
+    /// `notified()` on this to break early. Exposed `pub` so downstream
+    /// dispatchers can react to channel shutdown.
+    pub fn shutdown_signal(&self) -> Arc<Notify> {
         self.shutdown.clone()
     }
 }
@@ -205,7 +231,7 @@ impl<W: ConnStream> MqttChannel<W> {
 
 async fn writer_actor<W: ConnStream>(
     mut writer: W::WriteHalf,
-    mut cmd_rx: mpsc::UnboundedReceiver<WriteCmd>,
+    mut cmd_rx: mpsc::Receiver<WriteCmd>,
     shutdown: Arc<Notify>,
     open: Arc<AtomicBool>,
 ) {

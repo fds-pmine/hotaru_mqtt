@@ -1,12 +1,13 @@
 //! MQTT 3.1.1 wire packet types.
 //!
 //! All payload bytes use `Bytes` (Arc-backed) and topics use `Arc<str>` so
-//! that fanout to N subscribers costs N Arc-clones, no `memcpy`.
+//! that cloning a packet across N consumers costs N Arc-clones, no `memcpy`.
 //!
 //! `Packet` is the framework's `Message` type for `MqttProtocol`. Encoding
 //! and decoding live in `codec.rs`; this module is plain data definitions.
 
 use std::error::Error;
+use std::fmt;
 use std::sync::Arc;
 
 use bitflags::bitflags;
@@ -15,7 +16,7 @@ use bytes::{Bytes, BytesMut};
 use hotaru_core::protocol::Message;
 
 use crate::codec::{decode_packet_from_bytes, encode_packet};
-use crate::request::{PacketId, QoS, SubackCode};
+use crate::request::{IncomingPublish, PacketId, QoS, SubackCode};
 
 #[derive(Debug, Clone)]
 pub enum Packet {
@@ -68,14 +69,15 @@ pub struct PublishPacket {
 }
 
 impl PublishPacket {
-    /// Clone with a different packet_id (used for fanout adjustment).
+    /// Clone with a different packet_id (used when re-targeting an outbound
+    /// PUBLISH onto a different inflight slot).
     pub fn with_id(mut self, id: PacketId) -> Self {
         self.packet_id = Some(id);
         self
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConnectPacket {
     pub client_id: Arc<str>,
     pub clean_session: bool,
@@ -83,6 +85,30 @@ pub struct ConnectPacket {
     pub username: Option<Arc<str>>,
     pub password: Option<Bytes>,
     pub will: Option<WillPacket>,
+}
+
+/// Hand-written `Debug` that **redacts** `password`. Spec audit L1: a
+/// downstream `tracing::debug!("{connect:?}")` (the derived impl) would dump
+/// the cleartext password into logs. Username is left visible because it is
+/// identity, not secret; will payload is also kept verbatim because it is
+/// broadcast on the wire anyway.
+impl fmt::Debug for ConnectPacket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectPacket")
+            .field("client_id", &self.client_id)
+            .field("clean_session", &self.clean_session)
+            .field("keep_alive", &self.keep_alive)
+            .field("username", &self.username)
+            .field(
+                "password",
+                &self
+                    .password
+                    .as_ref()
+                    .map(|p| format_args!("<redacted: {} bytes>", p.len()).to_string()),
+            )
+            .field("will", &self.will)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -245,11 +271,84 @@ impl Message for Packet {
     type BytesMut = BytesMut;
 
     fn encode(&self, buf: &mut Self::BytesMut) -> Result<(), Box<dyn Error + Send + Sync>> {
-        buf.extend_from_slice(&encode_packet(self));
+        let bytes =
+            encode_packet(self).map_err(|e| -> Box<dyn Error + Send + Sync> { Box::new(e) })?;
+        buf.extend_from_slice(&bytes);
         Ok(())
     }
 
     fn decode(buf: &mut Self::BytesMut) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
-        decode_packet_from_bytes(buf)
+        // The `Message::decode` framework hook lacks an `MqttSafety`
+        // handle, so we fall back to the spec hard cap (§2.2.3). The
+        // per-connection read path in `protocol.rs` uses `read_packet`
+        // with the user-configured `MqttSafety.max_packet_size()`, which
+        // is the security-relevant boundary.
+        decode_packet_from_bytes(buf, MQTT_SPEC_MAX_PACKET_SIZE)
+    }
+}
+
+/// MQTT 3.1.1 §2.2.3 hard cap on the remaining-length VBI (4 bytes max).
+pub const MQTT_SPEC_MAX_PACKET_SIZE: usize = 268_435_455;
+
+// ----------------------------------------------------------------------------
+// Wire-to-user conversion
+// ----------------------------------------------------------------------------
+
+/// Build a user-facing [`IncomingPublish`] from a wire [`PublishPacket`].
+///
+/// Topic and payload are `Arc<str>` / `Bytes` clones (O(1)). Used by both
+/// client-side inbound dispatch and broker-side server dispatch.
+pub fn incoming_from_packet(p: &PublishPacket) -> IncomingPublish {
+    IncomingPublish {
+        topic: p.topic.clone(),
+        payload: p.payload.clone(),
+        qos: p.qos,
+        retain: p.retain,
+        dup: p.dup,
+        packet_id: p.packet_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connect_packet_debug_redacts_password() {
+        let conn = ConnectPacket {
+            client_id: Arc::from("cid"),
+            clean_session: true,
+            keep_alive: 60,
+            username: Some(Arc::from("alice")),
+            password: Some(Bytes::from_static(b"supersecret-2025")),
+            will: None,
+        };
+        let dbg = format!("{conn:?}");
+        // Cleartext MUST NOT appear.
+        assert!(
+            !dbg.contains("supersecret"),
+            "password leaked into Debug: {dbg}"
+        );
+        // Marker that confirms our redaction ran (not just any random Debug).
+        assert!(dbg.contains("redacted"), "debug missing redaction marker: {dbg}");
+        // Non-secret fields are still visible.
+        assert!(dbg.contains("alice"));
+        assert!(dbg.contains("cid"));
+    }
+
+    #[test]
+    fn connect_packet_debug_keeps_none_password_visible() {
+        let conn = ConnectPacket {
+            client_id: Arc::from("cid"),
+            clean_session: true,
+            keep_alive: 60,
+            username: None,
+            password: None,
+            will: None,
+        };
+        let dbg = format!("{conn:?}");
+        // None should print as None — confirms we don't show "<redacted>"
+        // when there's nothing there.
+        assert!(dbg.contains("password: None"), "{dbg}");
     }
 }

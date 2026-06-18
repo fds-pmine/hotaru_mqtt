@@ -1,10 +1,12 @@
-//! `MqttContext` — the `RequestContext` for `MqttProtocol`.
+//! `MqttContext` — the `RequestContext` for MQTT protocol handlers.
 //!
 //! Carries:
 //! - `request` / `response` (outpoint path via `run!`)
 //! - `incoming` (endpoint inbound dispatch path)
 //! - `channel` (installed by `Protocol::install_channel` after acquire)
-//! - `fanout` (server-side chain may suppress broker fanout via `suppress_fanout`)
+//! - `propagate` flag (an endpoint chain may suppress further propagation via
+//!   `suppress_propagation`; consulted by downstream protocol implementations
+//!   that route a received PUBLISH onward, ignored by pure clients)
 //!
 //! `request` and `incoming` are mutually exclusive in normal flow — outpoint
 //! body reads `request`, endpoint body reads `incoming`. The framework guarantees
@@ -39,8 +41,11 @@ pub struct MqttContext<TS: TransportSpec = hotaru_core::connection::tcp::TcpTran
     /// `handle_*` for inbound dispatch).
     channel: Option<MqttChannel<TS::Wire>>,
 
-    /// Server-side endpoint can suppress broker fanout via `suppress_fanout()`.
-    fanout: bool,
+    /// Whether the inbound publish should continue past the chain into any
+    /// downstream propagation (re-publish, gateway, etc.). Endpoint code
+    /// calls `suppress_propagation()` to drop the message; pure clients
+    /// ignore this flag.
+    propagate: bool,
 
     /// For endpoint URL captures (named segments via `<id>`).
     endpoint: Option<Arc<UrlNode<MqttContext<TS>, TS>>>,
@@ -56,7 +61,7 @@ impl<TS: TransportSpec> Default for MqttContext<TS> {
             response: MqttResponse::Published(PublishAck::Sent),
             incoming: None,
             channel: None,
-            fanout: true,
+            propagate: true,
             endpoint: None,
             params: Default::default(),
             locals: Default::default(),
@@ -65,32 +70,53 @@ impl<TS: TransportSpec> Default for MqttContext<TS> {
 }
 
 impl<TS: TransportSpec> MqttContext<TS> {
-    // ── pub(crate) channel slot accessors ───────────────────────
+    // ── Channel + slot accessors (pub for downstream protocol implementations) ──
 
-    pub(crate) fn install_channel(&mut self, ch: MqttChannel<TS::Wire>) {
+    pub fn install_channel(&mut self, ch: MqttChannel<TS::Wire>) {
         self.channel = Some(ch);
     }
 
-    pub(crate) fn channel(&self) -> Option<&MqttChannel<TS::Wire>> {
+    pub fn channel(&self) -> Option<&MqttChannel<TS::Wire>> {
         self.channel.as_ref()
     }
 
-    pub(crate) fn set_incoming(&mut self, p: IncomingPublish) {
+    pub fn set_incoming(&mut self, p: IncomingPublish) {
         self.incoming = Some(p);
     }
 
-    pub(crate) fn set_endpoint(&mut self, node: Arc<UrlNode<MqttContext<TS>, TS>>) {
+    pub fn set_endpoint(&mut self, node: Arc<UrlNode<MqttContext<TS>, TS>>) {
         self.endpoint = Some(node);
     }
 
-    // ── Public fanout control (server-side) ─────────────────────
+    // ── Public factory for inbound dispatch ─────────────────────
 
-    pub fn should_fanout(&self) -> bool {
-        self.fanout
+    /// Build a context ready for inbound dispatch — installs channel, sets
+    /// the incoming publish, attaches the matched endpoint node, all in one
+    /// call. Used by the client-side `EndpointDispatcher` and by any
+    /// downstream server-side dispatcher.
+    ///
+    /// This is the public face of the per-slot setters so downstream protocol
+    /// implementations don't need to compose them one at a time.
+    pub fn for_inbound_dispatch(
+        channel: MqttChannel<TS::Wire>,
+        incoming: IncomingPublish,
+        endpoint: Arc<UrlNode<MqttContext<TS>, TS>>,
+    ) -> Self {
+        let mut ctx = Self::default();
+        ctx.install_channel(channel);
+        ctx.set_incoming(incoming);
+        ctx.set_endpoint(endpoint);
+        ctx
     }
 
-    pub fn suppress_fanout(&mut self) {
-        self.fanout = false;
+    // ── Propagation control (consulted by downstream protocol implementations) ──
+
+    pub fn should_propagate(&self) -> bool {
+        self.propagate
+    }
+
+    pub fn suppress_propagation(&mut self) {
+        self.propagate = false;
     }
 
     // ── Public convenience for endpoint bodies ──────────────────
@@ -126,10 +152,10 @@ impl<TS: TransportSpec> RequestContext for MqttContext<TS> {
     type Channel = MqttChannel<TS::Wire>;
 
     fn handle_error(&mut self) {
-        // MQTT has no "500 error response" concept. Suppress fanout
-        // defensively so an in-flight chain failure doesn't leak the
-        // half-processed message to other subscribers.
-        self.fanout = false;
+        // MQTT has no "500 error response" concept. Suppress downstream
+        // propagation defensively so an in-flight chain failure doesn't
+        // leak a half-processed message onward.
+        self.propagate = false;
     }
 
     fn role(&self) -> ProtocolRole {

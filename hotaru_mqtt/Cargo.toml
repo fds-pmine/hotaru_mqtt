@@ -1,0 +1,28 @@
+[package]
+name = "hotaru_mqtt"
+version = "0.8.3-rc1"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "MQTT 3.1.1 protocol core + client for the Hotaru framework"
+keywords = ["mqtt", "hotaru", "client", "iot"]
+categories = ["network-programming", "embedded"]
+
+[dependencies]
+hotaru_core = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+bytes = { workspace = true }
+bitflags = { workspace = true }
+
+hotaru_tls = { workspace = true, optional = true }
+
+[features]
+default = []
+tls = ["dep:hotaru_tls"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+hotaru_http = { workspace = true }

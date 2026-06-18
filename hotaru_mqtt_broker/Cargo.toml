@@ -1,0 +1,49 @@
+[package]
+name = "hotaru_mqtt_broker"
+version = "0.8.3-rc1"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "MQTT 3.1.1 broker implementation built on hotaru_mqtt"
+keywords = ["mqtt", "hotaru", "broker", "iot", "pubsub"]
+categories = ["network-programming"]
+
+[dependencies]
+hotaru_mqtt = { path = "../hotaru_mqtt", version = "0.8.3-rc1" }
+hotaru_core = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+
+# Stage A P2.C — password hashing (PBKDF2-SHA512 default).
+# pbkdf2 0.12 is pinned because 0.13 moved to digest 0.11; sha2 0.10 + hmac
+# 0.12 live on digest 0.10. Bumping requires upgrading the whole stack.
+pbkdf2 = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+subtle = "2"
+base64 = "0.22"
+# F4 hardening: wipe plaintext password buffers on drop so a process
+# coredump or post-free heap leak cannot leak credentials.
+zeroize = { version = "1", features = ["zeroize_derive"] }
+
+# Optional alt scheme (PHC-recognized prefix activates it).
+# Note: `auth-sha512crypt` is deferred — sha-crypt 0.6 dropped the high-level
+# MCF verify helper, so `$6$rounds=N$salt$hash` support needs a hand-rolled
+# parser. Tracked as a [future] task.
+bcrypt = { version = "0.19", optional = true }
+
+hotaru_tls = { workspace = true, optional = true }
+
+[features]
+default = []
+tls = ["hotaru_mqtt/tls", "dep:hotaru_tls"]
+auth-bcrypt = ["dep:bcrypt"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+hotaru_http = { workspace = true }
+

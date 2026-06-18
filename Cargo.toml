@@ -1,22 +1,24 @@
-[package]
-name = "hotaru_mqtt"
-version = "0.8.2"
-edition = "2024"
-authors = ["Redstone <redstone@fds.moe>"]
-description = "MQTT support for the Hotaru framework"
-license = "MIT"
-repository = "https://github.com/hotaru/hotaru"
-keywords = ["mqtt", "hotaru", "broker"]
-categories = ["network-programming", "web-programming"]
+[workspace]
+resolver = "2"
+members = [
+    "hotaru_mqtt",
+    "hotaru_mqtt_broker",
+]
 
-[dependencies]
-bitflags = "2"
-bytes = "1"
+[workspace.package]
+edition = "2024"
+authors = ["Redstone <redstone@fds.moe>", "JerrySu <jerrysu@fds.moe>"]
+repository = "https://github.com/Field-of-Dreams-Studio/hotaru"
+license = "MIT"
+
+[workspace.dependencies]
+hotaru_core = "0.8.2"
+hotaru_tls = "0.8.1"
+hotaru_http = "0.8.2"
+tokio = { version = "1.28", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 async-trait = "0.1.88"
 dashmap = "6"
-hotaru_core = "0.8.2"
-tokio = { version = "1.28", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
-
-[dev-dependencies]
-tokio = { version = "1.28", features = ["io-util", "macros", "net", "rt", "sync", "time", "test-util"] }
-hotaru_http = "0.8.2"
+bytes = "1"
+bitflags = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }

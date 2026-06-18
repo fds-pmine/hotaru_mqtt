@@ -135,6 +135,27 @@ pub fn validate_publish_topic(topic: &str) -> Result<(), MqttError> {
     Ok(())
 }
 
+// ----------------------------------------------------------------------------
+// Spec §4.7.2 guard
+// ----------------------------------------------------------------------------
+
+/// MQTT 3.1.1 §4.7.2: wildcards (`+` / `#`) in the first segment of a filter
+/// MUST NOT match a Topic Name whose first segment begins with `$`. Returns
+/// `true` if `topic`'s first segment is dollar-prefixed (i.e. matcher MUST
+/// reject wildcard filters in that case).
+///
+/// Used by:
+/// - client-side inbound dispatch before calling `walk_cursor`
+/// - any downstream protocol implementation's subscription matcher
+/// - any retained-message store implementation's `matching` lookup
+///
+/// Note: this returns whether the topic *qualifies for* the guard. Callers
+/// still need to combine with "filter first segment is a wildcard" to decide
+/// whether to skip a match.
+pub fn is_dollar_prefixed_first_segment(topic: &str) -> bool {
+    topic.split('/').next().is_some_and(|seg| seg.starts_with('$'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +248,16 @@ mod tests {
         assert!(validate_subscribe_filter("a/#/b").is_err());
         assert!(validate_publish_topic("a/b/c").is_ok());
         assert!(validate_publish_topic("a/+").is_err());
+    }
+
+    #[test]
+    fn dollar_prefix_detection() {
+        assert!(is_dollar_prefixed_first_segment("$SYS/broker/clients"));
+        assert!(is_dollar_prefixed_first_segment("$share/group/topic"));
+        assert!(is_dollar_prefixed_first_segment("$"));
+        assert!(!is_dollar_prefixed_first_segment("sensors/$SYS/x")); // $ not at start
+        assert!(!is_dollar_prefixed_first_segment("sensors/temp"));
+        assert!(!is_dollar_prefixed_first_segment(""));
+        assert!(!is_dollar_prefixed_first_segment("/$SYS")); // first seg is empty
     }
 }

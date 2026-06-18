@@ -27,7 +27,16 @@ use crate::request::{QoS, SubackCode};
 
 /// Read one complete MQTT packet from the async reader. Used by handle_*
 /// loops that own the reader directly (single-take pattern).
-pub async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Packet, MqttError> {
+///
+/// `max_size` caps the declared remaining length BEFORE allocation — over-
+/// large frames are rejected without `vec![0u8; remaining]` ever running,
+/// so a malicious peer cannot OOM the process by declaring a 256 MiB body.
+/// Pass `usize::MAX` to disable (spec hard cap of 268_435_455 still applies
+/// via `read_remaining_length`).
+pub async fn read_packet<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_size: usize,
+) -> Result<Packet, MqttError> {
     let mut header_byte = [0u8; 1];
     reader.read_exact(&mut header_byte).await?;
     let first = header_byte[0];
@@ -37,6 +46,13 @@ pub async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Packet,
         PacketType::try_from(raw_type).map_err(|_| CodecError::InvalidPacketType(raw_type))?;
 
     let remaining = read_remaining_length(reader).await?;
+    if remaining > max_size {
+        return Err(Violation::PacketTooLarge {
+            len: remaining,
+            max: max_size,
+        }
+        .into());
+    }
     let mut body = vec![0u8; remaining];
     reader.read_exact(&mut body).await?;
 
@@ -45,8 +61,15 @@ pub async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Packet,
 
 /// Try to decode one MQTT packet from a buffer. Returns `Ok(None)` if more
 /// bytes are needed. On success consumes the packet bytes from the buffer.
+///
+/// `max_size` caps the declared remaining length BEFORE the parser
+/// touches `body` — passes 268_435_455 (spec hard cap) keeps the prior
+/// behavior; callers wanting a tighter `MqttSafety.max_packet_size()`
+/// budget pass that. Symmetric to [`read_packet`] (M2 close, second
+/// audit).
 pub fn decode_packet_from_bytes(
     buf: &mut BytesMut,
+    max_size: usize,
 ) -> Result<Option<Packet>, Box<dyn Error + Send + Sync>> {
     if buf.len() < 2 {
         return Ok(None);
@@ -60,6 +83,13 @@ pub fn decode_packet_from_bytes(
         Some(v) => v,
         None => return Ok(None),
     };
+
+    if remaining > max_size {
+        return Err(Box::new(MqttError::from(Violation::PacketTooLarge {
+            len: remaining,
+            max: max_size,
+        })));
+    }
 
     let header_len = 1 + rl_bytes;
     let total = header_len + remaining;
@@ -77,22 +107,26 @@ pub fn decode_packet_from_bytes(
 /// Encode any packet into a fresh `Vec<u8>`. Convenience for tests and the
 /// `Message::encode` trait impl. Hot paths use `write_packet` /
 /// `write_publish_packet` directly to avoid the intermediate Vec.
-pub fn encode_packet(packet: &Packet) -> Vec<u8> {
+///
+/// Returns [`CodecError::FieldTooLong`] when any length-prefixed string or
+/// bytes field exceeds the u16 wire encoding (second-audit F2 — prior
+/// `as u16` truncation was silently corrupting framing).
+pub fn encode_packet(packet: &Packet) -> Result<Vec<u8>, MqttError> {
     match packet {
         Packet::Connect(c) => encode_connect(c),
-        Packet::Connack(c) => encode_connack(c),
+        Packet::Connack(c) => Ok(encode_connack(c)),
         Packet::Publish(p) => encode_publish(p),
-        Packet::Puback(id) => vec![0x40, 0x02, (*id >> 8) as u8, (*id & 0xFF) as u8],
-        Packet::Pubrec(id) => vec![0x50, 0x02, (*id >> 8) as u8, (*id & 0xFF) as u8],
-        Packet::Pubrel(id) => vec![0x62, 0x02, (*id >> 8) as u8, (*id & 0xFF) as u8],
-        Packet::Pubcomp(id) => vec![0x70, 0x02, (*id >> 8) as u8, (*id & 0xFF) as u8],
+        Packet::Puback(id) => Ok(vec![0x40, 0x02, (*id >> 8) as u8, (*id & 0xFF) as u8]),
+        Packet::Pubrec(id) => Ok(vec![0x50, 0x02, (*id >> 8) as u8, (*id & 0xFF) as u8]),
+        Packet::Pubrel(id) => Ok(vec![0x62, 0x02, (*id >> 8) as u8, (*id & 0xFF) as u8]),
+        Packet::Pubcomp(id) => Ok(vec![0x70, 0x02, (*id >> 8) as u8, (*id & 0xFF) as u8]),
         Packet::Subscribe(s) => encode_subscribe(s),
-        Packet::Suback(s) => encode_suback(s),
+        Packet::Suback(s) => Ok(encode_suback(s)),
         Packet::Unsubscribe(u) => encode_unsubscribe(u),
-        Packet::Unsuback(id) => vec![0xB0, 0x02, (*id >> 8) as u8, (*id & 0xFF) as u8],
-        Packet::Pingreq => vec![0xC0, 0x00],
-        Packet::Pingresp => vec![0xD0, 0x00],
-        Packet::Disconnect => vec![0xE0, 0x00],
+        Packet::Unsuback(id) => Ok(vec![0xB0, 0x02, (*id >> 8) as u8, (*id & 0xFF) as u8]),
+        Packet::Pingreq => Ok(vec![0xC0, 0x00]),
+        Packet::Pingresp => Ok(vec![0xD0, 0x00]),
+        Packet::Disconnect => Ok(vec![0xE0, 0x00]),
     }
 }
 
@@ -102,7 +136,7 @@ pub async fn write_packet<W: AsyncWrite + Unpin>(
     writer: &mut W,
     packet: &Packet,
 ) -> Result<(), MqttError> {
-    let buf = encode_packet(packet);
+    let buf = encode_packet(packet)?;
     writer.write_all(&buf).await?;
     Ok(())
 }
@@ -123,11 +157,12 @@ pub async fn write_publish_packet<W: AsyncWrite + Unpin>(
     }
     let body_len = var_header_len + packet.payload.len();
 
+    let topic_len = u16_or_err(topic_bytes.len(), "publish.topic")?;
     let mut header = Vec::with_capacity(1 + 4 + var_header_len);
     let flags = pack_publish_flags(packet);
     header.push(((PacketType::Publish as u8) << 4) | flags);
     header.extend(encode_remaining_length(body_len));
-    header.extend_from_slice(&(topic_bytes.len() as u16).to_be_bytes());
+    header.extend_from_slice(&topic_len.to_be_bytes());
     header.extend_from_slice(topic_bytes);
     if packet.qos != QoS::AtMostOnce {
         let id = packet
@@ -214,9 +249,21 @@ fn parse_packet(
         PacketType::Puback | PacketType::Pubrec | PacketType::Pubrel | PacketType::Pubcomp => {
             parse_ack_packet(first, packet_type, remaining, body)
         }
-        PacketType::Subscribe => parse_subscribe(body),
+        PacketType::Subscribe => {
+            // spec §3.8.1: SUBSCRIBE reserved bits MUST be 0010.
+            if first & 0x0F != 0x02 {
+                return Err(Violation::SubscribeReservedBits.into());
+            }
+            parse_subscribe(body)
+        }
         PacketType::Suback => parse_suback(body),
-        PacketType::Unsubscribe => parse_unsubscribe(body),
+        PacketType::Unsubscribe => {
+            // spec §3.10.1: UNSUBSCRIBE reserved bits MUST be 0010.
+            if first & 0x0F != 0x02 {
+                return Err(Violation::UnsubscribeReservedBits.into());
+            }
+            parse_unsubscribe(body)
+        }
         PacketType::Unsuback => parse_unsuback(remaining, body),
         PacketType::Pingreq => {
             require_empty_body(remaining)?;
@@ -258,35 +305,54 @@ fn parse_connect(body: &[u8]) -> Result<Packet, MqttError> {
         return Err(Violation::UnsupportedProtocolLevel(level).into());
     }
     let flags_byte = body[7];
+    // spec §3.1.2.3: reserved bit (bit 0) MUST be 0.
+    if flags_byte & ConnectFlags::Reserved.bits() != 0 {
+        return Err(Violation::ReservedHeaderBits.into());
+    }
     let connect_flags = ConnectFlags::from_bits_truncate(flags_byte);
     let keep_alive = u16::from_be_bytes([body[8], body[9]]);
+
+    let will_flag = connect_flags.contains(ConnectFlags::WillFlag);
+    let will_qos_bits = (flags_byte & ConnectFlags::WillQoSMask.bits()) >> 3;
+    let will_retain = connect_flags.contains(ConnectFlags::WillRetain);
+    if !will_flag {
+        // spec §3.1.2.6-7: Will QoS and Will Retain MUST be 0 when Will Flag = 0.
+        if will_qos_bits != 0 || will_retain {
+            return Err(Violation::ReservedHeaderBits.into());
+        }
+    }
+
+    let username_flag = connect_flags.contains(ConnectFlags::Username);
+    let password_flag = connect_flags.contains(ConnectFlags::Password);
+    // spec §3.1.2.9: Password Flag MUST be 0 if Username Flag = 0.
+    if !username_flag && password_flag {
+        return Err(Violation::ReservedHeaderBits.into());
+    }
 
     let mut cursor = 10usize;
     let client_id = read_arc_str(body, &mut cursor)?;
 
-    let will = if connect_flags.contains(ConnectFlags::WillFlag) {
+    let will = if will_flag {
         let topic = read_arc_str(body, &mut cursor)?;
         let payload = read_bytes(body, &mut cursor)?;
-        let will_qos_bits = (flags_byte & ConnectFlags::WillQoSMask.bits()) >> 3;
         let qos = QoS::from_u8(will_qos_bits).ok_or(CodecError::QosInvalid(will_qos_bits))?;
-        let retain = connect_flags.contains(ConnectFlags::WillRetain);
         Some(WillPacket {
             topic,
             payload,
             qos,
-            retain,
+            retain: will_retain,
         })
     } else {
         None
     };
 
-    let username = if connect_flags.contains(ConnectFlags::Username) {
+    let username = if username_flag {
         Some(read_arc_str(body, &mut cursor)?)
     } else {
         None
     };
 
-    let password = if connect_flags.contains(ConnectFlags::Password) {
+    let password = if password_flag {
         Some(read_bytes(body, &mut cursor)?)
     } else {
         None
@@ -306,9 +372,17 @@ fn parse_connack(body: &[u8]) -> Result<Packet, MqttError> {
     if body.len() < 2 {
         return Err(CodecError::UnexpectedEof.into());
     }
+    // spec §3.2.2.1: bits 1-7 of the CONNACK first byte are reserved and MUST be 0.
+    if body[0] & 0xFE != 0 {
+        return Err(Violation::ConnackReservedBits.into());
+    }
     let session_present = (body[0] & 0x01) != 0;
     let return_code = ConnackReturnCode::try_from(body[1])
         .map_err(|_| MqttError::Codec(CodecError::InvalidPacketType(body[1])))?;
+    // spec §3.2.2.2: SessionPresent MUST be 0 if ReturnCode != Accepted.
+    if session_present && return_code != ConnackReturnCode::Accepted {
+        return Err(Violation::SessionPresentWithError.into());
+    }
     Ok(Packet::Connack(ConnackPacket {
         session_present,
         return_code,
@@ -327,11 +401,30 @@ fn parse_publish(first: u8, body: &[u8]) -> Result<Packet, MqttError> {
     let qos_bits = (header_flags.bits() & FixedHeaderFlags::QoS.bits()) >> 1;
     let qos = QoS::from_u8(qos_bits).ok_or(CodecError::QosInvalid(qos_bits))?;
 
+    // spec §3.3.1.1: DUP MUST be 0 for QoS 0.
+    if dup && qos == QoS::AtMostOnce {
+        return Err(Violation::DupSetOnQos0.into());
+    }
+
     let mut cursor = 0usize;
     let topic = read_arc_str(body, &mut cursor)?;
 
+    // spec §3.3.2.1: topic name MUST be at least 1 char.
+    if topic.is_empty() {
+        return Err(Violation::EmptyPublishTopic.into());
+    }
+    // spec §3.3.2.1 + §4.7.1.1: PUBLISH topic name MUST NOT contain
+    // wildcards. Reuses the canonical validator so client and server
+    // share one rule (§1.4).
+    crate::topic::validate_publish_topic(topic.as_ref())?;
+
     let packet_id = if qos != QoS::AtMostOnce {
-        Some(read_u16(body, &mut cursor)?)
+        let id = read_u16(body, &mut cursor)?;
+        // spec §2.3.1: packet_id MUST be non-zero for QoS > 0.
+        if id == 0 {
+            return Err(Violation::PacketIdZero.into());
+        }
+        Some(id)
     } else {
         None
     };
@@ -445,7 +538,7 @@ fn parse_unsuback(remaining: usize, body: &[u8]) -> Result<Packet, MqttError> {
 // Internal: packet encoders (Packet → Vec<u8>)
 // ============================================================================
 
-fn encode_connect(conn: &ConnectPacket) -> Vec<u8> {
+fn encode_connect(conn: &ConnectPacket) -> Result<Vec<u8>, MqttError> {
     let mut body = Vec::new();
     body.extend_from_slice(&[0x00, 0x04, b'M', b'Q', b'T', b'T']);
     body.push(0x04);
@@ -468,21 +561,21 @@ fn encode_connect(conn: &ConnectPacket) -> Vec<u8> {
     }
     body.push(flags);
     body.extend_from_slice(&conn.keep_alive.to_be_bytes());
-    write_arc_str(&mut body, &conn.client_id);
+    write_arc_str(&mut body, &conn.client_id, "client_id")?;
     if let Some(will) = &conn.will {
-        write_arc_str(&mut body, &will.topic);
-        write_bytes(&mut body, &will.payload);
+        write_arc_str(&mut body, &will.topic, "will.topic")?;
+        write_bytes(&mut body, &will.payload, "will.payload")?;
     }
     if let Some(username) = &conn.username {
-        write_arc_str(&mut body, username);
+        write_arc_str(&mut body, username, "username")?;
     }
     if let Some(password) = &conn.password {
-        write_bytes(&mut body, password);
+        write_bytes(&mut body, password, "password")?;
     }
     let mut buf = vec![(PacketType::Connect as u8) << 4];
     buf.extend(encode_remaining_length(body.len()));
     buf.extend(body);
-    buf
+    Ok(buf)
 }
 
 fn encode_connack(ack: &ConnackPacket) -> Vec<u8> {
@@ -494,10 +587,11 @@ fn encode_connack(ack: &ConnackPacket) -> Vec<u8> {
     ]
 }
 
-fn encode_publish(p: &PublishPacket) -> Vec<u8> {
+fn encode_publish(p: &PublishPacket) -> Result<Vec<u8>, MqttError> {
     let topic_bytes = p.topic.as_bytes();
+    let topic_len = u16_or_err(topic_bytes.len(), "publish.topic")?;
     let mut body = Vec::with_capacity(2 + topic_bytes.len() + 2 + p.payload.len());
-    body.extend_from_slice(&(topic_bytes.len() as u16).to_be_bytes());
+    body.extend_from_slice(&topic_len.to_be_bytes());
     body.extend_from_slice(topic_bytes);
     if p.qos != QoS::AtMostOnce
         && let Some(id) = p.packet_id
@@ -510,20 +604,20 @@ fn encode_publish(p: &PublishPacket) -> Vec<u8> {
     let mut buf = vec![((PacketType::Publish as u8) << 4) | flags];
     buf.extend(encode_remaining_length(body.len()));
     buf.extend(body);
-    buf
+    Ok(buf)
 }
 
-fn encode_subscribe(s: &SubscribePacket) -> Vec<u8> {
+fn encode_subscribe(s: &SubscribePacket) -> Result<Vec<u8>, MqttError> {
     let mut body = Vec::new();
     body.extend_from_slice(&s.packet_id.to_be_bytes());
     for sub in &s.subscriptions {
-        write_arc_str(&mut body, &sub.topic);
+        write_arc_str(&mut body, &sub.topic, "subscribe.filter")?;
         body.push(sub.qos.as_u8());
     }
     let mut buf = vec![((PacketType::Subscribe as u8) << 4) | 0x02];
     buf.extend(encode_remaining_length(body.len()));
     buf.extend(body);
-    buf
+    Ok(buf)
 }
 
 fn encode_suback(s: &SubackPacket) -> Vec<u8> {
@@ -538,16 +632,16 @@ fn encode_suback(s: &SubackPacket) -> Vec<u8> {
     buf
 }
 
-fn encode_unsubscribe(u: &UnsubscribePacket) -> Vec<u8> {
+fn encode_unsubscribe(u: &UnsubscribePacket) -> Result<Vec<u8>, MqttError> {
     let mut body = Vec::new();
     body.extend_from_slice(&u.packet_id.to_be_bytes());
     for topic in &u.topics {
-        write_arc_str(&mut body, topic);
+        write_arc_str(&mut body, topic, "unsubscribe.filter")?;
     }
     let mut buf = vec![((PacketType::Unsubscribe as u8) << 4) | 0x02];
     buf.extend(encode_remaining_length(body.len()));
     buf.extend(body);
-    buf
+    Ok(buf)
 }
 
 fn pack_publish_flags(p: &PublishPacket) -> u8 {
@@ -582,6 +676,10 @@ fn read_arc_str(body: &[u8], cursor: &mut usize) -> Result<Arc<str>, MqttError> 
     }
     let bytes = &body[*cursor..*cursor + len];
     let s = std::str::from_utf8(bytes).map_err(|_| CodecError::InvalidUtf8)?;
+    // spec §1.5.3: MQTT UTF-8 strings MUST NOT contain U+0000.
+    if s.contains('\0') {
+        return Err(Violation::Utf8NullCharacter.into());
+    }
     let result: Arc<str> = Arc::from(s);
     *cursor += len;
     Ok(result)
@@ -597,15 +695,26 @@ fn read_bytes(body: &[u8], cursor: &mut usize) -> Result<Bytes, MqttError> {
     Ok(Bytes::from(v))
 }
 
-fn write_arc_str(out: &mut Vec<u8>, s: &Arc<str>) {
+fn write_arc_str(out: &mut Vec<u8>, s: &Arc<str>, kind: &'static str) -> Result<(), MqttError> {
     let b = s.as_bytes();
-    out.extend_from_slice(&(b.len() as u16).to_be_bytes());
+    let len = u16_or_err(b.len(), kind)?;
+    out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(b);
+    Ok(())
 }
 
-fn write_bytes(out: &mut Vec<u8>, b: &Bytes) {
-    out.extend_from_slice(&(b.len() as u16).to_be_bytes());
+fn write_bytes(out: &mut Vec<u8>, b: &Bytes, kind: &'static str) -> Result<(), MqttError> {
+    let len = u16_or_err(b.len(), kind)?;
+    out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(&b[..]);
+    Ok(())
+}
+
+fn u16_or_err(len: usize, kind: &'static str) -> Result<u16, MqttError> {
+    if len > u16::MAX as usize {
+        return Err(CodecError::FieldTooLong { kind, len }.into());
+    }
+    Ok(len as u16)
 }
 
 // ============================================================================
@@ -626,9 +735,9 @@ mod tests {
             password: None,
             will: None,
         };
-        let bytes = encode_packet(&Packet::Connect(original.clone()));
+        let bytes = encode_packet(&Packet::Connect(original.clone())).unwrap();
         let mut buf = BytesMut::from(&bytes[..]);
-        match decode_packet_from_bytes(&mut buf).unwrap().unwrap() {
+        match decode_packet_from_bytes(&mut buf, usize::MAX).unwrap().unwrap() {
             Packet::Connect(c) => {
                 assert_eq!(c.client_id.as_ref(), "cid");
                 assert!(c.clean_session);
@@ -654,9 +763,9 @@ mod tests {
                 retain: true,
             }),
         };
-        let bytes = encode_packet(&Packet::Connect(original));
+        let bytes = encode_packet(&Packet::Connect(original)).unwrap();
         let mut buf = BytesMut::from(&bytes[..]);
-        match decode_packet_from_bytes(&mut buf).unwrap().unwrap() {
+        match decode_packet_from_bytes(&mut buf, usize::MAX).unwrap().unwrap() {
             Packet::Connect(c) => {
                 assert_eq!(c.username.as_ref().unwrap().as_ref(), "alice");
                 let p = c.password.as_ref().unwrap();
@@ -681,9 +790,9 @@ mod tests {
             retain: false,
             packet_id: None,
         };
-        let bytes = encode_packet(&Packet::Publish(p));
+        let bytes = encode_packet(&Packet::Publish(p)).unwrap();
         let mut buf = BytesMut::from(&bytes[..]);
-        match decode_packet_from_bytes(&mut buf).unwrap().unwrap() {
+        match decode_packet_from_bytes(&mut buf, usize::MAX).unwrap().unwrap() {
             Packet::Publish(p) => {
                 assert_eq!(p.topic.as_ref(), "sensors/temp");
                 assert_eq!(&p.payload[..], b"42");
@@ -704,9 +813,9 @@ mod tests {
             retain: false,
             packet_id: Some(42),
         };
-        let bytes = encode_packet(&Packet::Publish(p));
+        let bytes = encode_packet(&Packet::Publish(p)).unwrap();
         let mut buf = BytesMut::from(&bytes[..]);
-        match decode_packet_from_bytes(&mut buf).unwrap().unwrap() {
+        match decode_packet_from_bytes(&mut buf, usize::MAX).unwrap().unwrap() {
             Packet::Publish(p) => {
                 assert_eq!(p.qos, QoS::AtLeastOnce);
                 assert_eq!(p.packet_id, Some(42));
@@ -730,9 +839,9 @@ mod tests {
                 },
             ],
         };
-        let bytes = encode_packet(&Packet::Subscribe(s));
+        let bytes = encode_packet(&Packet::Subscribe(s)).unwrap();
         let mut buf = BytesMut::from(&bytes[..]);
-        match decode_packet_from_bytes(&mut buf).unwrap().unwrap() {
+        match decode_packet_from_bytes(&mut buf, usize::MAX).unwrap().unwrap() {
             Packet::Subscribe(s) => {
                 assert_eq!(s.packet_id, 7);
                 assert_eq!(s.subscriptions.len(), 2);
@@ -746,9 +855,9 @@ mod tests {
             packet_id: 8,
             topics: vec![Arc::from("a/+"), Arc::from("b/#")],
         };
-        let bytes = encode_packet(&Packet::Unsubscribe(u));
+        let bytes = encode_packet(&Packet::Unsubscribe(u)).unwrap();
         let mut buf = BytesMut::from(&bytes[..]);
-        match decode_packet_from_bytes(&mut buf).unwrap().unwrap() {
+        match decode_packet_from_bytes(&mut buf, usize::MAX).unwrap().unwrap() {
             Packet::Unsubscribe(u) => {
                 assert_eq!(u.packet_id, 8);
                 assert_eq!(u.topics.len(), 2);
@@ -759,19 +868,291 @@ mod tests {
 
     #[test]
     fn pingreq_pingresp_disconnect_unsuback() {
-        assert_eq!(encode_packet(&Packet::Pingreq), vec![0xC0, 0x00]);
-        assert_eq!(encode_packet(&Packet::Pingresp), vec![0xD0, 0x00]);
-        assert_eq!(encode_packet(&Packet::Disconnect), vec![0xE0, 0x00]);
+        assert_eq!(encode_packet(&Packet::Pingreq).unwrap(), vec![0xC0, 0x00]);
+        assert_eq!(encode_packet(&Packet::Pingresp).unwrap(), vec![0xD0, 0x00]);
         assert_eq!(
-            encode_packet(&Packet::Unsuback(42)),
+            encode_packet(&Packet::Disconnect).unwrap(),
+            vec![0xE0, 0x00]
+        );
+        assert_eq!(
+            encode_packet(&Packet::Unsuback(42)).unwrap(),
             vec![0xB0, 0x02, 0x00, 0x2A]
+        );
+    }
+
+    /// F2 regression — encode MUST surface an error rather than silently
+    /// truncate a >65 535-byte length-prefixed field.
+    #[test]
+    fn encode_rejects_oversize_topic() {
+        let oversize: Arc<str> = Arc::from("x".repeat(65_536).as_str());
+        let publish = PublishPacket {
+            topic: oversize,
+            payload: Bytes::new(),
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            packet_id: None,
+        };
+        let err = encode_packet(&Packet::Publish(publish)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MqttError::Codec(CodecError::FieldTooLong { kind, .. })
+                    if kind == "publish.topic"
+            ),
+            "expected FieldTooLong{{kind=publish.topic}}, got {err:?}"
         );
     }
 
     #[test]
     fn partial_buffer_returns_none() {
         let mut buf = BytesMut::from(&[0x10u8][..]);
-        assert!(decode_packet_from_bytes(&mut buf).unwrap().is_none());
+        assert!(decode_packet_from_bytes(&mut buf, usize::MAX).unwrap().is_none());
         assert_eq!(buf.len(), 1, "buffer must not be consumed on partial");
+    }
+
+    // ── Stage A P1.A: strict codec hardening ──────────────────────────
+
+    /// Build a PUBLISH frame on the wire with explicit fixed-header flags.
+    /// Bypasses the encode path (which would refuse invalid combos).
+    fn build_publish_wire(flags: u8, topic: &[u8], packet_id: Option<u16>, payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+        body.extend_from_slice(topic);
+        if let Some(id) = packet_id {
+            body.extend_from_slice(&id.to_be_bytes());
+        }
+        body.extend_from_slice(payload);
+        let mut frame = vec![0x30 | (flags & 0x0F)];
+        frame.extend(encode_remaining_length(body.len()));
+        frame.extend(body);
+        frame
+    }
+
+    fn must_violation(err: MqttError) -> Violation {
+        match err {
+            MqttError::Protocol(v) => v,
+            other => panic!("expected MqttError::Protocol, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn publish_with_dup_set_on_qos0_rejected() {
+        // Flags = DUP(1) | QoS=0 | RETAIN=0 → 0b1000 = 0x8
+        let wire = build_publish_wire(0x08, b"a", None, b"x");
+        let mut buf = BytesMut::from(&wire[..]);
+        let err = decode_packet_from_bytes(&mut buf, usize::MAX)
+            .expect_err("DUP+QoS0 must be rejected")
+            .downcast::<MqttError>()
+            .unwrap();
+        assert_eq!(must_violation(*err), Violation::DupSetOnQos0);
+    }
+
+    #[test]
+    fn publish_packet_id_zero_rejected() {
+        // Flags = QoS=1 → 0b0010 = 0x2; packet_id = 0
+        let wire = build_publish_wire(0x02, b"a", Some(0), b"x");
+        let mut buf = BytesMut::from(&wire[..]);
+        let err = decode_packet_from_bytes(&mut buf, usize::MAX)
+            .expect_err("packet_id=0 on QoS>0 must be rejected")
+            .downcast::<MqttError>()
+            .unwrap();
+        assert_eq!(must_violation(*err), Violation::PacketIdZero);
+    }
+
+    #[test]
+    fn publish_empty_topic_rejected() {
+        // QoS=0, zero-length topic
+        let wire = build_publish_wire(0x00, b"", None, b"x");
+        let mut buf = BytesMut::from(&wire[..]);
+        let err = decode_packet_from_bytes(&mut buf, usize::MAX)
+            .expect_err("empty topic must be rejected")
+            .downcast::<MqttError>()
+            .unwrap();
+        assert_eq!(must_violation(*err), Violation::EmptyPublishTopic);
+    }
+
+    #[test]
+    fn connack_reserved_bits_rejected() {
+        // first byte = 0x02 (any bit besides 0 set) — illegal per §3.2.2.1
+        let wire = [0x20, 0x02, 0x02, 0x00];
+        let mut buf = BytesMut::from(&wire[..]);
+        let err = decode_packet_from_bytes(&mut buf, usize::MAX)
+            .expect_err("CONNACK reserved bits must be rejected")
+            .downcast::<MqttError>()
+            .unwrap();
+        assert_eq!(must_violation(*err), Violation::ConnackReservedBits);
+    }
+
+    #[test]
+    fn connack_session_present_with_non_accepted_rejected() {
+        // SessionPresent=1 + return_code=5 (NotAuthorized) — illegal per §3.2.2.2
+        let wire = [0x20, 0x02, 0x01, 0x05];
+        let mut buf = BytesMut::from(&wire[..]);
+        let err = decode_packet_from_bytes(&mut buf, usize::MAX)
+            .expect_err("SessionPresent + error code must be rejected")
+            .downcast::<MqttError>()
+            .unwrap();
+        assert_eq!(must_violation(*err), Violation::SessionPresentWithError);
+    }
+
+    #[test]
+    fn publish_wildcard_in_topic_rejected() {
+        // spec §3.3.2.1: PUBLISH topic name MUST NOT contain `+` or `#`.
+        let wire = build_publish_wire(0x00, b"a/+/b", None, b"x");
+        let mut buf = BytesMut::from(&wire[..]);
+        let err = decode_packet_from_bytes(&mut buf, usize::MAX)
+            .expect_err("wildcard topic must be rejected")
+            .downcast::<MqttError>()
+            .unwrap();
+        assert_eq!(must_violation(*err), Violation::WildcardInPublishTopic);
+    }
+
+    /// Build a SUBSCRIBE wire frame with explicit fixed-header low nibble.
+    fn build_subscribe_wire(reserved_bits: u8, topic: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&7u16.to_be_bytes()); // packet_id
+        body.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+        body.extend_from_slice(topic);
+        body.push(0x00); // QoS=0
+        let mut frame = vec![0x80 | (reserved_bits & 0x0F)];
+        frame.extend(encode_remaining_length(body.len()));
+        frame.extend(body);
+        frame
+    }
+
+    fn build_unsubscribe_wire(reserved_bits: u8, topic: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&7u16.to_be_bytes());
+        body.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+        body.extend_from_slice(topic);
+        let mut frame = vec![0xA0 | (reserved_bits & 0x0F)];
+        frame.extend(encode_remaining_length(body.len()));
+        frame.extend(body);
+        frame
+    }
+
+    #[test]
+    fn subscribe_reserved_bits_must_be_0010() {
+        // spec §3.8.1 — only 0010 is legal for the low nibble.
+        let wire = build_subscribe_wire(0x00, b"a/b");
+        let mut buf = BytesMut::from(&wire[..]);
+        let err = decode_packet_from_bytes(&mut buf, usize::MAX)
+            .expect_err("SUBSCRIBE low-nibble 0000 must be rejected")
+            .downcast::<MqttError>()
+            .unwrap();
+        assert_eq!(must_violation(*err), Violation::SubscribeReservedBits);
+
+        // 0010 is the spec-required value — must succeed.
+        let wire_ok = build_subscribe_wire(0x02, b"a/b");
+        let mut buf_ok = BytesMut::from(&wire_ok[..]);
+        assert!(decode_packet_from_bytes(&mut buf_ok, usize::MAX).is_ok());
+    }
+
+    #[test]
+    fn unsubscribe_reserved_bits_must_be_0010() {
+        let wire = build_unsubscribe_wire(0x04, b"a/b");
+        let mut buf = BytesMut::from(&wire[..]);
+        let err = decode_packet_from_bytes(&mut buf, usize::MAX)
+            .expect_err("UNSUBSCRIBE non-0010 must be rejected")
+            .downcast::<MqttError>()
+            .unwrap();
+        assert_eq!(must_violation(*err), Violation::UnsubscribeReservedBits);
+    }
+
+    #[test]
+    fn utf8_null_in_topic_rejected() {
+        // PUBLISH QoS=0 with topic "a\0b" — UTF-8 valid but spec-forbidden.
+        let wire = build_publish_wire(0x00, b"a\0b", None, b"x");
+        let mut buf = BytesMut::from(&wire[..]);
+        let err = decode_packet_from_bytes(&mut buf, usize::MAX)
+            .expect_err("U+0000 in UTF-8 string must be rejected")
+            .downcast::<MqttError>()
+            .unwrap();
+        assert_eq!(must_violation(*err), Violation::Utf8NullCharacter);
+    }
+
+    // ── Stage A P2.B: CONNECT strict validation ──────────────────────
+
+    /// Build a CONNECT frame with explicit raw flags byte.
+    /// Bypasses the encode path so we can synthesize illegal combinations.
+    fn build_connect_wire(flags: u8, client_id: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x00, 0x04, b'M', b'Q', b'T', b'T']);
+        body.push(0x04); // protocol level
+        body.push(flags);
+        body.extend_from_slice(&60u16.to_be_bytes()); // keep_alive
+        body.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+        body.extend_from_slice(client_id);
+        let mut frame = vec![0x10];
+        frame.extend(encode_remaining_length(body.len()));
+        frame.extend(body);
+        frame
+    }
+
+    #[test]
+    fn connect_reserved_bit_rejected() {
+        // flags = 0x01 (reserved bit set, no other flags)
+        let wire = build_connect_wire(0x01, b"cid");
+        let mut buf = BytesMut::from(&wire[..]);
+        let err = decode_packet_from_bytes(&mut buf, usize::MAX)
+            .expect_err("reserved bit must be rejected")
+            .downcast::<MqttError>()
+            .unwrap();
+        assert_eq!(must_violation(*err), Violation::ReservedHeaderBits);
+    }
+
+    #[test]
+    fn connect_will_qos_set_without_will_flag_rejected() {
+        // flags = 0x18 = WillQoSMask(0b0001_1000) without WillFlag(0b0000_0100)
+        let wire = build_connect_wire(0x18, b"cid");
+        let mut buf = BytesMut::from(&wire[..]);
+        let err = decode_packet_from_bytes(&mut buf, usize::MAX)
+            .expect_err("will QoS without will flag must be rejected")
+            .downcast::<MqttError>()
+            .unwrap();
+        assert_eq!(must_violation(*err), Violation::ReservedHeaderBits);
+    }
+
+    #[test]
+    fn connect_will_retain_without_will_flag_rejected() {
+        // flags = 0x20 = WillRetain without WillFlag
+        let wire = build_connect_wire(0x20, b"cid");
+        let mut buf = BytesMut::from(&wire[..]);
+        let err = decode_packet_from_bytes(&mut buf, usize::MAX)
+            .expect_err("will retain without will flag must be rejected")
+            .downcast::<MqttError>()
+            .unwrap();
+        assert_eq!(must_violation(*err), Violation::ReservedHeaderBits);
+    }
+
+    #[test]
+    fn connect_password_flag_without_username_flag_rejected() {
+        // flags = 0x40 = Password without Username
+        let wire = build_connect_wire(0x40, b"cid");
+        let mut buf = BytesMut::from(&wire[..]);
+        let err = decode_packet_from_bytes(&mut buf, usize::MAX)
+            .expect_err("password without username must be rejected")
+            .downcast::<MqttError>()
+            .unwrap();
+        assert_eq!(must_violation(*err), Violation::ReservedHeaderBits);
+    }
+
+    #[tokio::test]
+    async fn read_packet_rejects_oversize_before_alloc() {
+        // 5-byte declared body but max_size = 4 → reject without allocating.
+        let mut wire = vec![0x30, 0x05];
+        wire.extend_from_slice(&[0u8; 5]);
+        let mut reader = &wire[..];
+        let err = read_packet(&mut reader, 4)
+            .await
+            .expect_err("oversize must be rejected");
+        match must_violation(err) {
+            Violation::PacketTooLarge { len, max } => {
+                assert_eq!(len, 5);
+                assert_eq!(max, 4);
+            }
+            other => panic!("expected PacketTooLarge, got {:?}", other),
+        }
     }
 }

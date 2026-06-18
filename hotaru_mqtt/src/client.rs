@@ -11,6 +11,7 @@ use bytes::Bytes;
 
 use crate::protocol::DefaultInboundHandler;
 use crate::request::{Credentials, QoS, TopicFilter, WillMessage};
+use crate::safety::MqttSafety;
 
 /// All settings required to bring up an MQTT client session.
 pub struct MqttClientConfig {
@@ -23,6 +24,8 @@ pub struct MqttClientConfig {
     pub will: Option<WillMessage>,
     /// Fallback for inbound publishes that don't match any registered endpoint.
     pub default_inbound: Option<Arc<dyn DefaultInboundHandler>>,
+    /// Wire-layer resource limits applied to this client session.
+    pub safety: MqttSafety,
 }
 
 impl MqttClientConfig {
@@ -36,6 +39,7 @@ impl MqttClientConfig {
             initial_subscriptions: Vec::new(),
             will: None,
             default_inbound: None,
+            safety: MqttSafety::new(),
         }
     }
 
@@ -79,6 +83,11 @@ impl MqttClientConfig {
 
     pub fn with_default_inbound(mut self, handler: Arc<dyn DefaultInboundHandler>) -> Self {
         self.default_inbound = Some(handler);
+        self
+    }
+
+    pub fn with_safety(mut self, safety: MqttSafety) -> Self {
+        self.safety = safety;
         self
     }
 }
