@@ -140,24 +140,14 @@ pub struct RetainedEntry {
 #[async_trait]
 pub trait RetainedStore: Send + Sync + 'static {
     /// Insert or replace the retained message for `topic`.
-    async fn store(
-        &self,
-        tenant: Option<&TenantId>,
-        topic: Arc<str>,
-        payload: Bytes,
-        qos: QoS,
-    );
+    async fn store(&self, tenant: Option<&TenantId>, topic: Arc<str>, payload: Bytes, qos: QoS);
 
     /// Delete the retained message for `topic` (retain=1 + empty payload).
     async fn remove(&self, tenant: Option<&TenantId>, topic: &str);
 
     /// Return all retained messages matching `filter`. Used at SUBSCRIBE
     /// time to replay state to a new subscriber.
-    async fn matching(
-        &self,
-        tenant: Option<&TenantId>,
-        filter: &str,
-    ) -> Vec<RetainedEntry>;
+    async fn matching(&self, tenant: Option<&TenantId>, filter: &str) -> Vec<RetainedEntry>;
 
     /// Total retained-message count for the tenant. Powers
     /// `$SYS/broker/retained messages/count`.
@@ -171,11 +161,7 @@ pub trait RetainedStore: Send + Sync + 'static {
     }
 
     /// Bulk import — inverse of [`snapshot`]. Default impl noop.
-    async fn restore(
-        &self,
-        _tenant: Option<&TenantId>,
-        _snapshot: Value,
-    ) -> Result<(), MqttError> {
+    async fn restore(&self, _tenant: Option<&TenantId>, _snapshot: Value) -> Result<(), MqttError> {
         Ok(())
     }
 }
@@ -192,30 +178,27 @@ pub trait RetainedStore: Send + Sync + 'static {
 /// by implementing this trait.
 #[async_trait]
 pub trait SessionStore: Send + Sync + 'static {
-    async fn load(
-        &self,
-        tenant: Option<&TenantId>,
-        client_id: &str,
-    ) -> Option<Arc<MqttSession>>;
+    async fn load(&self, tenant: Option<&TenantId>, client_id: &str) -> Option<Arc<MqttSession>>;
 
-    async fn save(
-        &self,
-        tenant: Option<&TenantId>,
-        client_id: Arc<str>,
-        session: Arc<MqttSession>,
-    );
+    async fn save(&self, tenant: Option<&TenantId>, client_id: Arc<str>, session: Arc<MqttSession>);
 
     async fn destroy(&self, tenant: Option<&TenantId>, client_id: &str);
+
+    /// Number of currently-stored persistent sessions for `tenant`.
+    /// Powers the `BrokerSafety::max_persistent_sessions_per_tenant` cap
+    /// (SAFETY_PROOF v5 T2(d)). Default returns 0 so impls that don't
+    /// track this silently waive the cap — operators who need DoS
+    /// hardening MUST override this on their custom store, or rely on
+    /// [`crate::DefaultSessionStore`] which implements it natively.
+    async fn count(&self, _tenant: Option<&TenantId>) -> usize {
+        0
+    }
 
     async fn snapshot(&self, _tenant: Option<&TenantId>) -> Value {
         Value::Dict(std::collections::HashMap::new())
     }
 
-    async fn restore(
-        &self,
-        _tenant: Option<&TenantId>,
-        _snapshot: Value,
-    ) -> Result<(), MqttError> {
+    async fn restore(&self, _tenant: Option<&TenantId>, _snapshot: Value) -> Result<(), MqttError> {
         Ok(())
     }
 }

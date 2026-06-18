@@ -16,8 +16,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::error::{CodecError, MqttError, Violation};
 use crate::packet::{
     ConnackPacket, ConnackReturnCode, ConnectFlags, ConnectPacket, FixedHeaderFlags, Packet,
-    PacketType, PublishPacket, SubackPacket, SubscribePacket, TopicSubscription,
-    UnsubscribePacket, WillPacket,
+    PacketType, PublishPacket, SubackPacket, SubscribePacket, TopicSubscription, UnsubscribePacket,
+    WillPacket,
 };
 use crate::request::{QoS, SubackCode};
 
@@ -198,9 +198,7 @@ async fn read_remaining_length<R: AsyncRead + Unpin>(reader: &mut R) -> Result<u
     unreachable!()
 }
 
-fn decode_remaining_length_from_slice(
-    data: &[u8],
-) -> Result<Option<(usize, usize)>, MqttError> {
+fn decode_remaining_length_from_slice(data: &[u8]) -> Result<Option<(usize, usize)>, MqttError> {
     let mut result = 0usize;
     let mut multiplier = 1usize;
     for (i, &byte) in data.iter().enumerate() {
@@ -394,8 +392,7 @@ fn parse_publish(first: u8, body: &[u8]) -> Result<Packet, MqttError> {
         return Err(CodecError::UnexpectedEof.into());
     }
     let raw_flags = first & 0x0F;
-    let header_flags = FixedHeaderFlags::from_bits(raw_flags)
-        .ok_or(CodecError::ReservedFlagSet)?;
+    let header_flags = FixedHeaderFlags::from_bits(raw_flags).ok_or(CodecError::ReservedFlagSet)?;
     let dup = header_flags.contains(FixedHeaderFlags::Dup);
     let retain = header_flags.contains(FixedHeaderFlags::Retain);
     let qos_bits = (header_flags.bits() & FixedHeaderFlags::QoS.bits()) >> 1;
@@ -456,7 +453,11 @@ fn parse_ack_packet(
         .into());
     }
     let flags = first & 0x0F;
-    let expected = if packet_type == PacketType::Pubrel { 0x02 } else { 0x00 };
+    let expected = if packet_type == PacketType::Pubrel {
+        0x02
+    } else {
+        0x00
+    };
     if flags != expected {
         return Err(CodecError::ReservedFlagSet.into());
     }
@@ -517,10 +518,7 @@ fn parse_unsubscribe(body: &[u8]) -> Result<Packet, MqttError> {
     while cursor < body.len() {
         topics.push(read_arc_str(body, &mut cursor)?);
     }
-    Ok(Packet::Unsubscribe(UnsubscribePacket {
-        packet_id,
-        topics,
-    }))
+    Ok(Packet::Unsubscribe(UnsubscribePacket { packet_id, topics }))
 }
 
 fn parse_unsuback(remaining: usize, body: &[u8]) -> Result<Packet, MqttError> {
@@ -593,9 +591,17 @@ fn encode_publish(p: &PublishPacket) -> Result<Vec<u8>, MqttError> {
     let mut body = Vec::with_capacity(2 + topic_bytes.len() + 2 + p.payload.len());
     body.extend_from_slice(&topic_len.to_be_bytes());
     body.extend_from_slice(topic_bytes);
-    if p.qos != QoS::AtMostOnce
-        && let Some(id) = p.packet_id
-    {
+    if p.qos != QoS::AtMostOnce {
+        // SAFETY_PROOF v6 F5: spec §3.3.2.2 — a QoS ≥ 1 PUBLISH MUST carry
+        // a non-zero packet identifier. The previous `if let Some(id)`
+        // silently emitted a malformed frame (truncated wire body) when
+        // a caller built a PublishPacket directly with `packet_id = None`
+        // (or with zero). Fail closed here so the bug surfaces at the
+        // encode boundary instead of being interpreted by a remote peer.
+        let id = p.packet_id.ok_or(CodecError::QosRequiresPacketId)?;
+        if id == 0 {
+            return Err(CodecError::QosRequiresPacketId.into());
+        }
         body.extend_from_slice(&id.to_be_bytes());
     }
     body.extend_from_slice(&p.payload[..]);
@@ -737,7 +743,10 @@ mod tests {
         };
         let bytes = encode_packet(&Packet::Connect(original.clone())).unwrap();
         let mut buf = BytesMut::from(&bytes[..]);
-        match decode_packet_from_bytes(&mut buf, usize::MAX).unwrap().unwrap() {
+        match decode_packet_from_bytes(&mut buf, usize::MAX)
+            .unwrap()
+            .unwrap()
+        {
             Packet::Connect(c) => {
                 assert_eq!(c.client_id.as_ref(), "cid");
                 assert!(c.clean_session);
@@ -765,7 +774,10 @@ mod tests {
         };
         let bytes = encode_packet(&Packet::Connect(original)).unwrap();
         let mut buf = BytesMut::from(&bytes[..]);
-        match decode_packet_from_bytes(&mut buf, usize::MAX).unwrap().unwrap() {
+        match decode_packet_from_bytes(&mut buf, usize::MAX)
+            .unwrap()
+            .unwrap()
+        {
             Packet::Connect(c) => {
                 assert_eq!(c.username.as_ref().unwrap().as_ref(), "alice");
                 let p = c.password.as_ref().unwrap();
@@ -792,7 +804,10 @@ mod tests {
         };
         let bytes = encode_packet(&Packet::Publish(p)).unwrap();
         let mut buf = BytesMut::from(&bytes[..]);
-        match decode_packet_from_bytes(&mut buf, usize::MAX).unwrap().unwrap() {
+        match decode_packet_from_bytes(&mut buf, usize::MAX)
+            .unwrap()
+            .unwrap()
+        {
             Packet::Publish(p) => {
                 assert_eq!(p.topic.as_ref(), "sensors/temp");
                 assert_eq!(&p.payload[..], b"42");
@@ -815,7 +830,10 @@ mod tests {
         };
         let bytes = encode_packet(&Packet::Publish(p)).unwrap();
         let mut buf = BytesMut::from(&bytes[..]);
-        match decode_packet_from_bytes(&mut buf, usize::MAX).unwrap().unwrap() {
+        match decode_packet_from_bytes(&mut buf, usize::MAX)
+            .unwrap()
+            .unwrap()
+        {
             Packet::Publish(p) => {
                 assert_eq!(p.qos, QoS::AtLeastOnce);
                 assert_eq!(p.packet_id, Some(42));
@@ -841,7 +859,10 @@ mod tests {
         };
         let bytes = encode_packet(&Packet::Subscribe(s)).unwrap();
         let mut buf = BytesMut::from(&bytes[..]);
-        match decode_packet_from_bytes(&mut buf, usize::MAX).unwrap().unwrap() {
+        match decode_packet_from_bytes(&mut buf, usize::MAX)
+            .unwrap()
+            .unwrap()
+        {
             Packet::Subscribe(s) => {
                 assert_eq!(s.packet_id, 7);
                 assert_eq!(s.subscriptions.len(), 2);
@@ -857,7 +878,10 @@ mod tests {
         };
         let bytes = encode_packet(&Packet::Unsubscribe(u)).unwrap();
         let mut buf = BytesMut::from(&bytes[..]);
-        match decode_packet_from_bytes(&mut buf, usize::MAX).unwrap().unwrap() {
+        match decode_packet_from_bytes(&mut buf, usize::MAX)
+            .unwrap()
+            .unwrap()
+        {
             Packet::Unsubscribe(u) => {
                 assert_eq!(u.packet_id, 8);
                 assert_eq!(u.topics.len(), 2);
@@ -907,7 +931,11 @@ mod tests {
     #[test]
     fn partial_buffer_returns_none() {
         let mut buf = BytesMut::from(&[0x10u8][..]);
-        assert!(decode_packet_from_bytes(&mut buf, usize::MAX).unwrap().is_none());
+        assert!(
+            decode_packet_from_bytes(&mut buf, usize::MAX)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(buf.len(), 1, "buffer must not be consumed on partial");
     }
 
@@ -915,7 +943,12 @@ mod tests {
 
     /// Build a PUBLISH frame on the wire with explicit fixed-header flags.
     /// Bypasses the encode path (which would refuse invalid combos).
-    fn build_publish_wire(flags: u8, topic: &[u8], packet_id: Option<u16>, payload: &[u8]) -> Vec<u8> {
+    fn build_publish_wire(
+        flags: u8,
+        topic: &[u8],
+        packet_id: Option<u16>,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&(topic.len() as u16).to_be_bytes());
         body.extend_from_slice(topic);
@@ -1154,5 +1187,66 @@ mod tests {
             }
             other => panic!("expected PacketTooLarge, got {:?}", other),
         }
+    }
+
+    // SAFETY_PROOF v6 F5 — encode_publish must reject QoS ≥ 1 PUBLISH that
+    // lacks a non-zero packet identifier. Spec §3.3.2.2 says the identifier
+    // is MUST-have; emitting a malformed frame would be silently confusing.
+
+    fn must_codec_error(err: MqttError) -> CodecError {
+        match err {
+            MqttError::Codec(c) => c,
+            other => panic!("expected CodecError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn encode_publish_rejects_qos1_without_packet_id() {
+        let pkt = Packet::Publish(PublishPacket {
+            topic: Arc::from("sensors/temp"),
+            payload: bytes::Bytes::from_static(b"21"),
+            dup: false,
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            packet_id: None,
+        });
+        let err = encode_packet(&pkt).expect_err("QoS1 without pkt-id must fail");
+        assert!(matches!(
+            must_codec_error(err),
+            CodecError::QosRequiresPacketId
+        ));
+    }
+
+    #[test]
+    fn encode_publish_rejects_qos2_with_zero_packet_id() {
+        let pkt = Packet::Publish(PublishPacket {
+            topic: Arc::from("sensors/temp"),
+            payload: bytes::Bytes::from_static(b"21"),
+            dup: false,
+            qos: QoS::ExactlyOnce,
+            retain: false,
+            packet_id: Some(0),
+        });
+        let err = encode_packet(&pkt).expect_err("QoS2 with pkt-id 0 must fail");
+        assert!(matches!(
+            must_codec_error(err),
+            CodecError::QosRequiresPacketId
+        ));
+    }
+
+    #[test]
+    fn encode_publish_qos0_still_accepts_none_packet_id() {
+        // QoS 0 deliberately has no packet identifier (spec §3.3.2.2).
+        // F5 must NOT regress that path.
+        let pkt = Packet::Publish(PublishPacket {
+            topic: Arc::from("sensors/temp"),
+            payload: bytes::Bytes::from_static(b"21"),
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            packet_id: None,
+        });
+        let bytes = encode_packet(&pkt).expect("QoS0 + None must encode fine");
+        assert!(!bytes.is_empty());
     }
 }

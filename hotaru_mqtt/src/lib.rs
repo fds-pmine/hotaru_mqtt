@@ -31,10 +31,14 @@ pub use channel::{MqttChannel, WriteCmd};
 pub use client::MqttClientConfig;
 pub use context::MqttContext;
 pub use error::{CodecError, MqttError, TimeoutKind, Violation};
+#[cfg(feature = "tls")]
+pub use hotaru_tls::{
+    ClientAuth, TlsClientConfig, TlsClientConfigBuilder, TlsConfig, TlsConfigBuilder, TlsMeta,
+    TlsOutbound, TlsOutboundTarget, TlsStream, TlsTransport,
+};
 pub use packet::{
-    ConnackPacket, ConnackReturnCode, ConnectPacket, Packet, PublishPacket,
-    SubackPacket, SubscribePacket, TopicSubscription, UnsubscribePacket,
-    WillPacket, incoming_from_packet,
+    ConnackPacket, ConnackReturnCode, ConnectPacket, Packet, PublishPacket, SubackPacket,
+    SubscribePacket, TopicSubscription, UnsubscribePacket, WillPacket, incoming_from_packet,
 };
 pub use protocol::{
     CLIENT_CONFIG_STATICS_KEY, DefaultInboundHandler, DefaultMqttTransport, MQTT,
@@ -42,14 +46,9 @@ pub use protocol::{
 };
 #[cfg(feature = "tls")]
 pub use protocol::{MQTTS, MqttTlsProtocol};
-#[cfg(feature = "tls")]
-pub use hotaru_tls::{
-    ClientAuth, TlsClientConfig, TlsClientConfigBuilder, TlsConfig, TlsConfigBuilder,
-    TlsMeta, TlsOutbound, TlsOutboundTarget, TlsStream, TlsTransport,
-};
 pub use request::{
-    Credentials, IncomingPublish, MqttRequest, MqttResponse, PacketId, PublishAck,
-    PublishRequest, QoS, SubackCode, TopicFilter, WillMessage,
+    Credentials, IncomingPublish, MqttRequest, MqttResponse, PacketId, PublishAck, PublishRequest,
+    QoS, SubackCode, TopicFilter, WillMessage,
 };
 pub use safety::MqttSafety;
 pub use session::{AckSlot, BindInfo, MqttSession, ack_inbound_publish_pre_chain};

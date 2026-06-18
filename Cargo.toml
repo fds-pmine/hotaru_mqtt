@@ -12,9 +12,13 @@ repository = "https://github.com/Field-of-Dreams-Studio/hotaru"
 license = "MIT"
 
 [workspace.dependencies]
-hotaru_core = "0.8.2"
-hotaru_tls = "0.8.1"
-hotaru_http = "0.8.2"
+# Path-deps to local ~/hotaru `no_std_update` branch — pre-aligns to the
+# upcoming `0.8.3-rc1` release. Once upstream publishes, switch back to
+# `"0.8.3-rc1"` registry deps and (if desired) drop the path. Tracked in
+# HANDOFF §8.1.
+hotaru_core = { path = "../hotaru/hotaru_core", version = "0.8.2" }
+hotaru_tls = { path = "../hotaru/hotaru_tls", version = "0.8.1" }
+hotaru_http = { path = "../hotaru/hotaru_http", version = "0.8.2" }
 tokio = { version = "1.28", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 async-trait = "0.1.88"
 dashmap = "6"

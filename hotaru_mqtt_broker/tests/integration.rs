@@ -17,8 +17,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 use hotaru_mqtt::{
-    ConnackPacket, ConnackReturnCode, ConnectPacket, Packet, PublishPacket, QoS,
-    SubackPacket, SubscribePacket, TopicSubscription, codec,
+    ConnackPacket, ConnackReturnCode, ConnectPacket, Packet, PublishPacket, QoS, SubackPacket,
+    SubscribePacket, TopicSubscription, codec,
 };
 use hotaru_mqtt_broker::{
     AclChecker, AclDecision, BROKER_STATICS_KEY, Broker, BrokerSafety, MQTT_SERVER, TenantId,
@@ -90,10 +90,13 @@ async fn send_packet(writer: &mut tokio::net::tcp::OwnedWriteHalf, packet: &Pack
 }
 
 async fn read_packet(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Packet {
-    timeout(Duration::from_secs(5), codec::read_packet(reader, usize::MAX))
-        .await
-        .expect("read_packet timeout")
-        .expect("read_packet error")
+    timeout(
+        Duration::from_secs(5),
+        codec::read_packet(reader, usize::MAX),
+    )
+    .await
+    .expect("read_packet timeout")
+    .expect("read_packet error")
 }
 
 fn connect_packet(client_id: &str) -> Packet {
@@ -154,8 +157,7 @@ impl TenantResolver for PrefixTenantResolver {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cross_tenant_fanout_is_blocked() {
-    let broker = Broker::<TcpStream>::new()
-        .with_tenant_resolver(Arc::new(PrefixTenantResolver));
+    let broker = Broker::<TcpStream>::new().with_tenant_resolver(Arc::new(PrefixTenantResolver));
     let (port, _broker) = start_broker_with(broker).await;
 
     // Subscriber in tenant `ta`, listening on the wildcard `#`.
@@ -210,8 +212,7 @@ async fn cross_tenant_fanout_is_blocked() {
 async fn same_tenant_fanout_still_works() {
     // Counter-positive control: with PrefixTenantResolver in place, two
     // clients in the SAME tenant DO see each other's traffic.
-    let broker = Broker::<TcpStream>::new()
-        .with_tenant_resolver(Arc::new(PrefixTenantResolver));
+    let broker = Broker::<TcpStream>::new().with_tenant_resolver(Arc::new(PrefixTenantResolver));
     let (port, _broker) = start_broker_with(broker).await;
 
     let (mut sub_r, mut sub_w) = connect_raw(port).await;
@@ -505,8 +506,7 @@ impl AclChecker for DenyBlockedPubOnSecretAcl {
 /// DoS retained state for topics it had no publish permission on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn acl_denied_publisher_cannot_modify_retained_store() {
-    let broker = Broker::<TcpStream>::new()
-        .with_acl_checker(Arc::new(DenyBlockedPubOnSecretAcl));
+    let broker = Broker::<TcpStream>::new().with_acl_checker(Arc::new(DenyBlockedPubOnSecretAcl));
     let (port, _broker) = start_broker_with(broker).await;
 
     // 1. allowed-pub seeds the retained store on `secret/z` with "original".
@@ -820,7 +820,10 @@ async fn reconnect_retransmits_unacked_qos1_with_dup() {
             assert_eq!(&p.payload[..], b"unacked");
             assert_eq!(p.qos, QoS::AtLeastOnce);
             assert!(p.dup, "retransmitted PUBLISH MUST have dup=1");
-            assert!(p.packet_id.is_some(), "QoS≥1 retransmit MUST carry packet_id");
+            assert!(
+                p.packet_id.is_some(),
+                "QoS≥1 retransmit MUST carry packet_id"
+            );
         }
         other => panic!("expected retransmitted PUBLISH, got {other:?}"),
     }
@@ -888,12 +891,20 @@ async fn fanout_enforces_max_inflight_messages_per_subscriber() {
     // because the workspace test runner schedules many tests in parallel.
     let mut delivered = 0;
     for _ in 0..2 {
-        match timeout(Duration::from_secs(2), codec::read_packet(&mut sr, usize::MAX)).await {
+        match timeout(
+            Duration::from_secs(2),
+            codec::read_packet(&mut sr, usize::MAX),
+        )
+        .await
+        {
             Ok(Ok(Packet::Publish(_))) => delivered += 1,
             other => panic!("expected PUBLISH ({delivered} so far), got {other:?}"),
         }
     }
-    assert_eq!(delivered, 2, "exactly the cap's worth of PUBLISH should arrive");
+    assert_eq!(
+        delivered, 2,
+        "exactly the cap's worth of PUBLISH should arrive"
+    );
 
     // Past the cap, the channel MUST be closed (DisconnectLaggard).
     let closed = timeout(
@@ -947,8 +958,7 @@ impl AclChecker for DenyPubOnWillTopicAcl {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn will_publish_blocked_by_acl_at_dispatch() {
-    let broker =
-        Broker::<TcpStream>::new().with_acl_checker(Arc::new(DenyPubOnWillTopicAcl));
+    let broker = Broker::<TcpStream>::new().with_acl_checker(Arc::new(DenyPubOnWillTopicAcl));
     let (port, _broker) = start_broker_with(broker).await;
 
     // Subscriber on the Will topic.
@@ -1052,7 +1062,12 @@ async fn publish_sys_retained_respects_max_inflight_cap() {
 
     let mut delivered = 0;
     for _ in 0..2 {
-        match timeout(Duration::from_secs(2), codec::read_packet(&mut sr, usize::MAX)).await {
+        match timeout(
+            Duration::from_secs(2),
+            codec::read_packet(&mut sr, usize::MAX),
+        )
+        .await
+        {
             Ok(Ok(Packet::Publish(p))) => {
                 assert_eq!(p.topic.as_ref(), "$SYS/broker/version");
                 assert_eq!(p.qos, QoS::AtLeastOnce);
@@ -1233,7 +1248,7 @@ async fn broker_drops_connection_on_malformed_subscribe_header() {
     // spec §3.8.1. We hand-craft a SUBSCRIBE with 0000 — `parse_subscribe`
     // surfaces `Violation::SubscribeReservedBits`, `handle_server`
     // propagates the error, and the channel closes.
-    let (port, _broker) = start_broker().await;
+    let (port, broker) = start_broker().await;
     let (mut reader, mut writer) = connect_raw(port).await;
     send_packet(&mut writer, &connect_packet("malformed-sub")).await;
     let _ = read_packet(&mut reader).await; // CONNACK
@@ -1246,14 +1261,17 @@ async fn broker_drops_connection_on_malformed_subscribe_header() {
         0x08, // remaining length
         0x00, 0x07, // packet_id = 7
         0x00, 0x03, // topic length
-        b'a', b'/', b'b',
-        0x00, // qos = 0
+        b'a', b'/', b'b', 0x00, // qos = 0
     ];
     writer.write_all(&bytes).await.unwrap();
     writer.flush().await.unwrap();
 
     // Broker should close the wire — the next read times out / returns EOF.
-    let next = timeout(Duration::from_secs(2), codec::read_packet(&mut reader, usize::MAX)).await;
+    let next = timeout(
+        Duration::from_secs(2),
+        codec::read_packet(&mut reader, usize::MAX),
+    )
+    .await;
     match next {
         Err(_) => panic!("broker should have closed the wire, not stayed open"),
         Ok(Ok(other)) => panic!("unexpected packet after malformed SUBSCRIBE: {other:?}"),
@@ -1261,6 +1279,13 @@ async fn broker_drops_connection_on_malformed_subscribe_header() {
             // expected: I/O error from peer disconnect
         }
     }
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        broker.active_connection_count(),
+        0,
+        "malformed post-CONNECT packet MUST unregister the session and release the slot"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1292,8 +1317,8 @@ async fn broker_rejects_empty_id_with_persistent_session() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn broker_rejects_connect_at_max_connections() {
     // Stage A P1.B: BrokerSafety.max_connections enforced before CONNACK.
-    let broker = Broker::<TcpStream>::new()
-        .with_broker_safety(BrokerSafety::new().with_max_connections(1));
+    let broker =
+        Broker::<TcpStream>::new().with_broker_safety(BrokerSafety::new().with_max_connections(1));
     let (port, broker) = start_broker_with(broker).await;
 
     // First CONNECT — should succeed.
@@ -1568,7 +1593,11 @@ async fn unsubscribe_stops_delivery() {
     )
     .await;
 
-    let waited = timeout(Duration::from_millis(300), codec::read_packet(&mut sub_reader, usize::MAX)).await;
+    let waited = timeout(
+        Duration::from_millis(300),
+        codec::read_packet(&mut sub_reader, usize::MAX),
+    )
+    .await;
     assert!(
         waited.is_err(),
         "subscriber should not receive after UNSUBSCRIBE; got {:?}",
@@ -1624,7 +1653,11 @@ async fn self_fanout_suppression() {
     )
     .await;
 
-    let waited = timeout(Duration::from_millis(300), codec::read_packet(&mut reader, usize::MAX)).await;
+    let waited = timeout(
+        Duration::from_millis(300),
+        codec::read_packet(&mut reader, usize::MAX),
+    )
+    .await;
     assert!(
         waited.is_err(),
         "self-publish should be suppressed; got {:?}",
@@ -1810,7 +1843,9 @@ async fn start_multi_protocol_broker() -> (u16, Broker<TcpStream>) {
 
     let registry: ProtocolEntryRegistry<hotaru_core::connection::tcp::TcpTransport> =
         ProtocolRegistryBuilder::new()
-            .protocol(ProtocolEntryBuilder::new(HTTP::server(HttpSafety::default())))
+            .protocol(ProtocolEntryBuilder::new(HTTP::server(
+                HttpSafety::default(),
+            )))
             .protocol(ProtocolEntryBuilder::new(MQTT_SERVER::new()))
             .build();
     let registry = Arc::new(registry);
@@ -1898,7 +1933,10 @@ async fn external_broker_publish_reaches_mqtt_subscriber() {
             assert_eq!(p.topic.as_ref(), "aiot/event");
             assert_eq!(&p.payload[..], b"from-http");
         }
-        other => panic!("expected PUBLISH from external broker.publish, got {:?}", other),
+        other => panic!(
+            "expected PUBLISH from external broker.publish, got {:?}",
+            other
+        ),
     }
 }
 

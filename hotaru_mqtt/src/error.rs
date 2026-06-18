@@ -83,7 +83,10 @@ pub enum Violation {
     Utf8NullCharacter,
     /// Packet remaining length exceeds the configured `max_packet_size`.
     /// Carries (declared, limit) bytes for diagnostics.
-    PacketTooLarge { len: usize, max: usize },
+    PacketTooLarge {
+        len: usize,
+        max: usize,
+    },
     // ── Stage A P3.A: fixed-header flag strictness (spec §1.6 / §2.1) ─────
     /// SUBSCRIBE fixed-header low nibble MUST be `0010` (§3.8.1).
     SubscribeReservedBits,
@@ -92,10 +95,15 @@ pub enum Violation {
     // ── hardening additions ───────────────────────────────────────────────
     /// Per-session inbound QoS-2 stash would exceed the configured cap
     /// (`MqttSafety.receive_maximum_inbound()`). Connection MUST close.
-    ReceiveMaximumExceeded { limit: usize },
+    ReceiveMaximumExceeded {
+        limit: usize,
+    },
     /// SUBSCRIBE / UNSUBSCRIBE filter count exceeds
     /// `MqttSafety.max_filters_per_subscribe()`. Connection MUST close.
-    TooManyFilters { count: usize, max: usize },
+    TooManyFilters {
+        count: usize,
+        max: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,7 +112,10 @@ pub enum CodecError {
     InvalidPacketType(u8),
     MalformedLength,
     InvalidUtf8,
-    PayloadTooLong { len: usize, max: usize },
+    PayloadTooLong {
+        len: usize,
+        max: usize,
+    },
     QosInvalid(u8),
     ReservedFlagSet,
     /// Encode-side: a length-prefixed string or bytes field exceeds the
@@ -115,6 +126,12 @@ pub enum CodecError {
         kind: &'static str,
         len: usize,
     },
+    /// Encode-side: a `PublishPacket` with `qos > AtMostOnce` was passed
+    /// with `packet_id = None` (or zero). Spec §3.3.2.2: QoS ≥ 1 PUBLISH
+    /// MUST carry a non-zero packet identifier. SAFETY_PROOF v6 F5 — the
+    /// prior encode path silently omitted the packet-id bytes, emitting
+    /// a malformed wire frame.
+    QosRequiresPacketId,
 }
 
 impl fmt::Display for MqttError {

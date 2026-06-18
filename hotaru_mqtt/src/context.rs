@@ -21,9 +21,7 @@ use hotaru_core::url::UrlNode;
 
 use crate::channel::MqttChannel;
 use crate::error::MqttError;
-use crate::request::{
-    IncomingPublish, MqttRequest, MqttResponse, PublishAck, PublishRequest,
-};
+use crate::request::{IncomingPublish, MqttRequest, MqttResponse, PublishAck, PublishRequest};
 
 pub struct MqttContext<TS: TransportSpec = hotaru_core::connection::tcp::TcpTransport> {
     /// `run!` path: injected by `RequestContext::inject_request`.

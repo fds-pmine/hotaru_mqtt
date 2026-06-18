@@ -256,5 +256,5 @@ async fn writer_actor<W: ConnStream>(
     }
     // Mark channel closed (idempotent with Channel::close).
     open.store(false, Ordering::Release);
-    let _ = writer.shutdown().await;   // W policy §1: shutdown path
+    let _ = writer.shutdown().await; // W policy §1: shutdown path
 }

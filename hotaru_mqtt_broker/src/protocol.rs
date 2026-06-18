@@ -18,17 +18,16 @@ use hotaru_core::url::UrlRoot;
 use tokio::io::BufReader;
 use tokio::time::timeout;
 
+use crate::traits::TenantId;
 use hotaru_mqtt::ack_inbound_publish_pre_chain;
 use hotaru_mqtt::channel::MqttChannel;
 use hotaru_mqtt::codec::read_packet;
 use hotaru_mqtt::context::MqttContext;
 use hotaru_mqtt::error::{MqttError, TimeoutKind, Violation};
 use hotaru_mqtt::packet::{
-    ConnackPacket, ConnackReturnCode, Packet, PublishPacket, SubackPacket,
-    incoming_from_packet,
+    ConnackPacket, ConnackReturnCode, Packet, PublishPacket, SubackPacket, incoming_from_packet,
 };
 use hotaru_mqtt::request::{QoS, TopicFilter, WillMessage};
-use crate::traits::TenantId;
 use hotaru_mqtt::session::BindInfo;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -134,6 +133,22 @@ where
             .first()
             .map(|b| (b >> 4) == 1)
             .unwrap_or(false)
+    }
+
+    fn tokenize_url(
+        input: &str,
+    ) -> Result<Vec<hotaru_core::url::RawToken>, hotaru_core::url::PatternError> {
+        // Closes hotaru #4 on the server side: when a broker host wires
+        // `Server::register::<MqttServerProtocol, _>("sensors/+/temp", ...)`,
+        // the framework's HTTP URL lexer no longer mangles `+`/`#` into
+        // literals. Both client (MqttClientProtocol) and server overrides
+        // share the same MQTT-flavored lexer so registered patterns match
+        // wire filters identically.
+        hotaru_mqtt::topic::tokenize_mqtt_filter(input)
+    }
+
+    fn lit_parser<'a>(input: &'a str) -> Vec<&'a str> {
+        hotaru_mqtt::topic::split_mqtt_topic(input)
     }
 
     fn open_channel(
@@ -258,8 +273,7 @@ where
     // 2b. Resolve tenant — runs BEFORE authenticate so the authenticator
     //     can scope per-tenant credentials (D17 / D21). Default
     //     `SingleTenantResolver` returns `None` → single-tenant behavior.
-    let tenant: Option<TenantId> =
-        broker.resolve_tenant(&connect, channel.remote_addr()).await;
+    let tenant: Option<TenantId> = broker.resolve_tenant(&connect, channel.remote_addr()).await;
 
     // 2c. Authenticate within the resolved tenant scope.
     let auth = broker
@@ -326,10 +340,14 @@ where
     );
 
     // 4. Send CONNACK
-    channel.send_packet(Packet::Connack(ConnackPacket {
+    if let Err(e) = channel.send_packet(Packet::Connack(ConnackPacket {
         session_present,
         return_code: ConnackReturnCode::Accepted,
-    }))?;
+    })) {
+        broker.unregister_session(&tenant, &client_id, false).await;
+        broker.release_connection();
+        return Err(e);
+    }
 
     // 4b. P7: if a persistent session was resumed, retransmit every
     //     outbound QoS≥1 inflight publish (DUP=1, spec §3.1.2.4 + §4.4).
@@ -378,6 +396,7 @@ where
         Duration::from_secs((keep_alive as u64 * 3) / 2)
     };
     let mut graceful = false;
+    let mut terminal_error: Option<MqttError> = None;
     let shutdown = channel.shutdown_signal();
 
     loop {
@@ -389,20 +408,26 @@ where
                 match packet {
                     Err(_) => break,                              // keep-alive timeout
                     Ok(Err(MqttError::Io(_))) => break,           // wire closed
-                    Ok(Err(e)) => return Err(e),
+                    Ok(Err(e)) => {
+                        terminal_error = Some(e);
+                        break;
+                    }
                     Ok(Ok(Packet::Disconnect)) => {
                         graceful = true;
                         break;
                     }
                     Ok(Ok(p)) => {
-                        dispatch_server_inbound(
+                        if let Err(e) = dispatch_server_inbound(
                             channel.clone(),
                             broker.clone(),
                             &tenant,
                             &client_id,
                             p,
                             &fanout_tx,
-                        ).await?;
+                        ).await {
+                            terminal_error = Some(e);
+                            break;
+                        }
                     }
                 }
             }
@@ -420,8 +445,13 @@ where
         graceful,
         "session exiting"
     );
-    broker.unregister_session(&tenant, &client_id, graceful).await;
+    broker
+        .unregister_session(&tenant, &client_id, graceful)
+        .await;
     broker.release_connection();
+    if let Some(e) = terminal_error {
+        return Err(e);
+    }
     Ok(ProtocolFlow::Close)
 }
 
@@ -532,9 +562,7 @@ where
                 .iter()
                 .zip(codes.iter())
                 .filter_map(|(tf, code)| match code {
-                    hotaru_mqtt::request::SubackCode::Granted(q) => {
-                        Some((tf.filter.clone(), *q))
-                    }
+                    hotaru_mqtt::request::SubackCode::Granted(q) => Some((tf.filter.clone(), *q)),
                     _ => None,
                 })
                 .collect();

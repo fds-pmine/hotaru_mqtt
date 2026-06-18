@@ -330,7 +330,10 @@ mod tests {
             "password leaked into Debug: {dbg}"
         );
         // Marker that confirms our redaction ran (not just any random Debug).
-        assert!(dbg.contains("redacted"), "debug missing redaction marker: {dbg}");
+        assert!(
+            dbg.contains("redacted"),
+            "debug missing redaction marker: {dbg}"
+        );
         // Non-secret fields are still visible.
         assert!(dbg.contains("alice"));
         assert!(dbg.contains("cid"));

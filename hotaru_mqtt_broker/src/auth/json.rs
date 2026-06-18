@@ -39,6 +39,8 @@ use hotaru_mqtt::packet::ConnackReturnCode;
 use hotaru_mqtt::packet::ConnectPacket;
 use pbkdf2::pbkdf2;
 use sha2::Sha512;
+use tracing::warn;
+use zeroize::Zeroizing;
 
 use crate::auth::password::{DefaultPasswordVerifier, PasswordHash, PasswordVerifier};
 use crate::traits::{AuthResult, Authenticator, TenantId};
@@ -107,8 +109,25 @@ impl JsonAuthenticator {
         // modal `rounds` value from every parseable PHC, and seed the
         // dummy with that. If a deployment hashes at `rounds ≠ 10_000`
         // and the operator forgets `with_dummy_rounds`, this still keeps
-        // unknown-vs-known verify cost indistinguishable. Empty snapshot
-        // or all-bcrypt snapshot falls back to `DEFAULT_DUMMY_ROUNDS`.
+        // unknown-vs-known verify cost indistinguishable for the majority.
+        // Empty snapshot or all-bcrypt snapshot falls back to
+        // `DEFAULT_DUMMY_ROUNDS`.
+        //
+        // SAFETY_PROOF v4 §C.U4 (recommendation b): loud-warn when the
+        // snapshot has more than one distinct `rounds` value, so non-modal
+        // users' "unknown vs. existing" timing remains distinguishable
+        // until the operator migrates to `from_str_strict`. A silent
+        // fallback would let the leak persist invisibly.
+        let distinct = count_distinct_rounds(&snapshot);
+        if distinct > 1 {
+            warn!(
+                target: "hotaru_mqtt_broker",
+                distinct_rounds = distinct,
+                "JsonAuthenticator: snapshot has multiple PBKDF2 `rounds`; non-modal users \
+                 stay timing-distinguishable from unknown users. Use `from_str_strict` \
+                 / `from_path_strict` to reject such snapshots at load time."
+            );
+        }
         let rounds = detect_modal_rounds(&snapshot).unwrap_or(DEFAULT_DUMMY_ROUNDS);
         Self {
             snapshot,
@@ -188,15 +207,22 @@ impl Authenticator for JsonAuthenticator {
         let stored_hash = username
             .and_then(|u| self.lookup_hash(tenant, u))
             .unwrap_or(self.dummy_hash.as_str());
-        let candidate = password.map(|p| p.as_ref()).unwrap_or(b"");
-        let hash_ok = self.verifier.verify(stored_hash, candidate);
+        // SAFETY_PROOF v4 §U5 caller-side mitigation: copy the wire-backed
+        // password bytes into a `Zeroizing<Vec<u8>>` so OUR copy of the
+        // plaintext is wiped on scope exit. The original `Bytes` inside
+        // `ConnectPacket.password` still lives until the packet drops
+        // (codec-side fix is carry-over #69), but the residency window of
+        // any copy WE control collapses to the verifier call duration.
+        let candidate: Zeroizing<Vec<u8>> = Zeroizing::new(
+            password.map(|p| p.as_ref().to_vec()).unwrap_or_default(),
+        );
+        let hash_ok = self.verifier.verify(stored_hash, &candidate);
 
         // Accept only if (a) the username, password, and stored hash all
         // really existed, AND (b) the verifier reported a match against the
         // *real* hash. The lookup re-check is necessary because the verifier
         // ran against the dummy when the user was unknown.
-        let user_exists = username
-            .is_some_and(|u| self.lookup_hash(tenant, u).is_some());
+        let user_exists = username.is_some_and(|u| self.lookup_hash(tenant, u).is_some());
         if hash_ok && user_exists && password.is_some() {
             AuthResult::accept()
         } else {
@@ -229,6 +255,30 @@ fn detect_modal_rounds(snapshot: &Value) -> Option<u32> {
     counts.into_iter().max_by_key(|&(_, c)| c).map(|(r, _)| r)
 }
 
+/// SAFETY_PROOF v4 §C.U4(b): cheap distinct-count probe used by
+/// `with_snapshot` to decide whether to emit the loud-warn. Walks the
+/// same shape as `detect_modal_rounds` / `detect_uniform_rounds` and
+/// returns the size of the `(rounds → count)` map. `0` for empty /
+/// all-bcrypt; `1` for uniform; `> 1` triggers the warn.
+fn count_distinct_rounds(snapshot: &Value) -> usize {
+    let mut counts: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    if let Value::Dict(top) = snapshot {
+        if let Some(Value::Dict(users)) = top.get("users") {
+            collect_user_rounds(users, &mut counts);
+        }
+        if let Some(Value::Dict(tenants)) = top.get("tenants") {
+            for (_, tenant) in tenants.iter() {
+                if let Value::Dict(t) = tenant
+                    && let Some(Value::Dict(users)) = t.get("users")
+                {
+                    collect_user_rounds(users, &mut counts);
+                }
+            }
+        }
+    }
+    counts.len()
+}
+
 /// U4 strict variant: walk the snapshot's PBKDF2 PHCs and require ALL
 /// to share the same `rounds`. Returns `Err` if rounds disagree, or if
 /// there are no parseable PBKDF2 hashes (then the caller can't pin a
@@ -251,8 +301,7 @@ fn detect_uniform_rounds(snapshot: &Value) -> Result<u32, String> {
     }
     match counts.len() {
         0 => Err(
-            "snapshot has no PBKDF2 users — strict mode cannot pin a dummy rounds value"
-                .to_owned(),
+            "snapshot has no PBKDF2 users — strict mode cannot pin a dummy rounds value".to_owned(),
         ),
         1 => Ok(counts.into_iter().next().map(|(r, _)| r).unwrap()),
         n => Err(format!(
@@ -329,10 +378,7 @@ mod tests {
     #[tokio::test]
     async fn single_tenant_round_trip() {
         let phc = make_phc(b"hunter2", b"s0", 1000);
-        let json = format!(
-            r#"{{"users":{{"alice":{{"password":"{}"}}}}}}"#,
-            phc
-        );
+        let json = format!(r#"{{"users":{{"alice":{{"password":"{}"}}}}}}"#, phc);
         let auth = JsonAuthenticator::from_str(&json).unwrap();
         let connect = connect_with(Some("alice"), Some(b"hunter2"));
         let result = auth.authenticate(None, &connect, None).await;
@@ -342,18 +388,12 @@ mod tests {
     #[tokio::test]
     async fn wrong_password_rejected_with_bad_username_or_password_code() {
         let phc = make_phc(b"hunter2", b"s0", 1000);
-        let json = format!(
-            r#"{{"users":{{"alice":{{"password":"{}"}}}}}}"#,
-            phc
-        );
+        let json = format!(r#"{{"users":{{"alice":{{"password":"{}"}}}}}}"#, phc);
         let auth = JsonAuthenticator::from_str(&json).unwrap();
         let connect = connect_with(Some("alice"), Some(b"WRONG"));
         let result = auth.authenticate(None, &connect, None).await;
         assert!(!result.accepted);
-        assert_eq!(
-            result.return_code,
-            ConnackReturnCode::BadUsernameOrPassword
-        );
+        assert_eq!(result.return_code, ConnackReturnCode::BadUsernameOrPassword);
     }
 
     #[tokio::test]
@@ -362,10 +402,7 @@ mod tests {
         let connect = connect_with(Some("ghost"), Some(b"x"));
         let result = auth.authenticate(None, &connect, None).await;
         assert!(!result.accepted);
-        assert_eq!(
-            result.return_code,
-            ConnackReturnCode::BadUsernameOrPassword
-        );
+        assert_eq!(result.return_code, ConnackReturnCode::BadUsernameOrPassword);
     }
 
     #[tokio::test]
@@ -406,9 +443,7 @@ mod tests {
     #[tokio::test]
     async fn verifier_runs_on_every_reject_path_for_uniform_timing() {
         let real_hash = "$pbkdf2-sha512$rounds=1$AA$BB"; // ignored value
-        let json = format!(
-            r#"{{"users":{{"alice":{{"password":"{real_hash}"}}}}}}"#
-        );
+        let json = format!(r#"{{"users":{{"alice":{{"password":"{real_hash}"}}}}}}"#);
         let counter = Arc::new(CountingVerifier::new(real_hash));
         let auth = JsonAuthenticator::from_str(&json)
             .unwrap()
@@ -441,7 +476,9 @@ mod tests {
         assert!(!r.accepted);
 
         // 4) Missing username → reject; dummy hash MUST be exercised.
-        let r = auth2.authenticate(None, &connect_with(None, Some(b"pw")), None).await;
+        let r = auth2
+            .authenticate(None, &connect_with(None, Some(b"pw")), None)
+            .await;
         assert!(!r.accepted);
 
         // 5) Missing password → reject; dummy hash MUST be exercised.

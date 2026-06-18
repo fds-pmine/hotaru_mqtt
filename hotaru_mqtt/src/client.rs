@@ -67,12 +67,9 @@ impl MqttClientConfig {
         self
     }
 
-    pub fn with_initial_subscribe(
-        mut self,
-        filter: impl Into<Arc<str>>,
-        qos: QoS,
-    ) -> Self {
-        self.initial_subscriptions.push(TopicFilter::new(filter, qos));
+    pub fn with_initial_subscribe(mut self, filter: impl Into<Arc<str>>, qos: QoS) -> Self {
+        self.initial_subscriptions
+            .push(TopicFilter::new(filter, qos));
         self
     }
 

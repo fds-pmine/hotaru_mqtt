@@ -24,6 +24,8 @@ use hotaru_mqtt::packet::{ConnectPacket, Packet, PublishPacket};
 use hotaru_mqtt::request::{PacketId, QoS, SubackCode, TopicFilter, WillMessage};
 use hotaru_mqtt::topic;
 
+use tracing::warn;
+
 use crate::defaults::{
     AcceptAllAuthenticator, AllowAllAclChecker, DefaultRetainedStore, DefaultSessionStore,
     SingleTenantResolver, is_dollar_topic,
@@ -89,13 +91,7 @@ impl SubscriptionTree {
         }
     }
 
-    fn subscribe(
-        &self,
-        tenant: Option<TenantId>,
-        client_id: Arc<str>,
-        filter: Arc<str>,
-        qos: QoS,
-    ) {
+    fn subscribe(&self, tenant: Option<TenantId>, client_id: Arc<str>, filter: Arc<str>, qos: QoS) {
         let set = self
             .subs
             .entry((tenant, filter))
@@ -154,9 +150,7 @@ pub(crate) fn filter_matches(filter: &str, topic_segs: &[&str]) -> bool {
 
     // spec §4.7.2 guard
     if matches!(filter_segs.first(), Some(&"+") | Some(&"#"))
-        && topic_segs
-            .first()
-            .is_some_and(|t| t.starts_with('$'))
+        && topic_segs.first().is_some_and(|t| t.starts_with('$'))
     {
         let _ = topic::is_dollar_prefixed_first_segment;
         return false;
@@ -248,6 +242,25 @@ impl<W: ConnStream> Default for Broker<W> {
 
 impl<W: ConnStream> Broker<W> {
     pub fn new() -> Self {
+        // SAFETY_PROOF v6 F1: `Broker::new()` wires the test-only open
+        // defaults (`AcceptAllAuthenticator` + `AllowAllAclChecker`).
+        // These accept every client and permit every publish / subscribe.
+        // Deployments that reach the network MUST swap both via
+        // `with_authenticator` + `with_acl_checker` (and ideally a real
+        // `TenantResolver` too) BEFORE cloning the broker into runtime
+        // statics (per A4 builder-then-clone discipline). Emit a loud
+        // structured warn so the unsafe-default state is operator-visible
+        // at startup instead of being a silent documentation footnote.
+        // The warn is a one-shot at construction; configure your tracing
+        // subscriber to silence it for tests if needed.
+        warn!(
+            target: "hotaru_mqtt_broker",
+            authenticator = "AcceptAllAuthenticator",
+            acl_checker = "AllowAllAclChecker",
+            "Broker::new() initialized with test-only open defaults — \
+             replace via Broker::new().with_authenticator(...).with_acl_checker(...) \
+             before binding to a network. See SAFETY_PROOF v6 F1."
+        );
         Self::build(
             Arc::new(AcceptAllAuthenticator),
             Arc::new(AllowAllAclChecker),
@@ -365,9 +378,7 @@ impl<W: ConnStream> Broker<W> {
             entry.value().channel.close();
         }
         let start = std::time::Instant::now();
-        while self.inner.active_connections.load(Ordering::Acquire) > 0
-            && start.elapsed() < grace
-        {
+        while self.inner.active_connections.load(Ordering::Acquire) > 0 && start.elapsed() < grace {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         let remaining = self.inner.active_connections.load(Ordering::Acquire);
@@ -477,9 +488,7 @@ impl<W: ConnStream> Broker<W> {
         if clean_session {
             // CleanSession=1 sweeps subscriptions AND any persisted state
             // accumulated by a prior persistent session for this client.
-            self.inner
-                .subscriptions
-                .remove_client(&tenant, &client_id);
+            self.inner.subscriptions.remove_client(&tenant, &client_id);
             self.inner
                 .session_store
                 .destroy(tenant.as_ref(), client_id.as_ref())
@@ -571,19 +580,50 @@ impl<W: ConnStream> Broker<W> {
             // and stash the session handle for the next CONNECT to pick
             // up. The Will is per-CONNECT (spec §3.1.2.5), so it is NOT
             // re-saved beyond this disconnect's potential fire below.
-            self.inner
+            //
+            // SAFETY_PROOF v5 T2(d): cap stored `clean_session=false`
+            // sessions per tenant. Over cap: skip the save (the session
+            // simply won't resume on the next CONNECT — the client sees
+            // `session_present=0`). Subscriptions still need to be torn
+            // down so the SubscriptionTree doesn't accumulate orphan
+            // entries pointing at a discarded session blob. This mirrors
+            // the `clean_session=true` cleanup, except we don't call
+            // `destroy` on the store (there's nothing stored).
+            let cap = self
+                .inner
+                .broker_safety
+                .max_persistent_sessions_per_tenant();
+            let current = self
+                .inner
                 .session_store
-                .save(
-                    session_tenant.as_ref(),
-                    client_id.clone(),
-                    persisted_session,
-                )
+                .count(session_tenant.as_ref())
                 .await;
+            if current >= cap {
+                warn!(
+                    target: "hotaru_mqtt_broker",
+                    tenant = ?session_tenant.as_deref(),
+                    client_id = %client_id,
+                    current,
+                    cap,
+                    "persistent-sessions-per-tenant cap hit: dropping session blob"
+                );
+                self.inner
+                    .subscriptions
+                    .remove_client(&session_tenant, client_id);
+                persisted_session.wipe();
+            } else {
+                self.inner
+                    .session_store
+                    .save(
+                        session_tenant.as_ref(),
+                        client_id.clone(),
+                        persisted_session,
+                    )
+                    .await;
+            }
         }
 
-        if !graceful
-            && let Some(will) = entry.will
-        {
+        if !graceful && let Some(will) = entry.will {
             let will_packet = PublishPacket {
                 topic: will.topic,
                 payload: will.payload,
@@ -652,12 +692,7 @@ impl<W: ConnStream> Broker<W> {
             let decision = self
                 .inner
                 .acl_checker
-                .check_subscribe(
-                    tenant.as_ref(),
-                    client_id,
-                    username.as_ref(),
-                    &tf.filter,
-                )
+                .check_subscribe(tenant.as_ref(), client_id, username.as_ref(), &tf.filter)
                 .await;
             if decision == AclDecision::Deny {
                 codes.push(SubackCode::Failure);
@@ -669,7 +704,29 @@ impl<W: ConnStream> Broker<W> {
             // got installed — the SubscriptionTree insert below still
             // happens, so a subsequent re-register will pick it up via
             // the same key (clean_session semantics).
+            //
+            // SAFETY_PROOF v5 T2(c): cap total subscriptions per client.
+            // `SubscriberEntry.filters` is authoritative for the count;
+            // when full, surface `SubackCode::Failure` and skip both the
+            // entry write AND the SubscriptionTree insert so the limit
+            // is observed end-to-end (no orphan entries in the tree).
+            // Re-subscribe to the same filter is a no-op against the cap
+            // (DashMap.insert overwrites; len stays the same).
+            let cap = self.inner.broker_safety.max_subscriptions_per_client();
             if let Some(entry) = self.inner.sessions.get(&key) {
+                let already_has = entry.filters.contains_key(&tf.filter);
+                if !already_has && entry.filters.len() >= cap {
+                    warn!(
+                        target: "hotaru_mqtt_broker",
+                        tenant = ?tenant.as_deref(),
+                        client_id = %client_id,
+                        filter = %tf.filter,
+                        cap,
+                        "subscriptions-per-client cap hit: rejecting filter with SUBACK Failure"
+                    );
+                    codes.push(SubackCode::Failure);
+                    continue;
+                }
                 entry.filters.insert(tf.filter.clone(), tf.qos);
             }
             self.inner.subscriptions.subscribe(
@@ -885,15 +942,37 @@ impl<W: ConnStream> Broker<W> {
                     .remove(source_tenant.as_ref(), &packet.topic)
                     .await;
             } else {
-                self.inner
+                // SAFETY_PROOF v5 T2(a) — cap retained-message count per
+                // tenant. Over cap: drop the `store` call but DO continue
+                // fanout (the in-flight subscribers still see this publish;
+                // only the long-term retention is suppressed). Operator
+                // gets a structured warn so the leak is visible.
+                let cap = self.inner.broker_safety.max_retained_messages_per_tenant();
+                let current = self
+                    .inner
                     .retained_store
-                    .store(
-                        source_tenant.as_ref(),
-                        packet.topic.clone(),
-                        packet.payload.clone(),
-                        packet.qos,
-                    )
+                    .count(source_tenant.as_ref())
                     .await;
+                if current >= cap {
+                    warn!(
+                        target: "hotaru_mqtt_broker",
+                        tenant = ?source_tenant.as_deref(),
+                        topic = %packet.topic,
+                        current,
+                        cap,
+                        "retained-message cap hit: dropping store call (fanout still proceeds)"
+                    );
+                } else {
+                    self.inner
+                        .retained_store
+                        .store(
+                            source_tenant.as_ref(),
+                            packet.topic.clone(),
+                            packet.payload.clone(),
+                            packet.qos,
+                        )
+                        .await;
+                }
             }
         }
 
@@ -1024,11 +1103,7 @@ impl<W: ConnStream> Broker<W> {
         let policy = self.inner.broker_safety.slow_consumer_policy();
         let max_inflight = self.inner.broker_safety.max_inflight_messages();
         for (sub_id, sub_qos) in matching {
-            let Some(entry) = self
-                .inner
-                .sessions
-                .get(&(tenant.clone(), sub_id.clone()))
-            else {
+            let Some(entry) = self.inner.sessions.get(&(tenant.clone(), sub_id.clone())) else {
                 continue;
             };
             let effective_qos = qos.min(sub_qos);

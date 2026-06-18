@@ -51,6 +51,6 @@ pub use protocol::{MQTTS_SERVER, MqttTlsServerProtocol};
 pub use safety::{BrokerSafety, SlowConsumerPolicy};
 pub use statics::BROKER_STATICS_KEY;
 pub use traits::{
-    AclChecker, AclDecision, AuthResult, Authenticator, RetainedEntry, RetainedStore,
-    SessionStore, TenantId, TenantResolver,
+    AclChecker, AclDecision, AuthResult, Authenticator, RetainedEntry, RetainedStore, SessionStore,
+    TenantId, TenantResolver,
 };

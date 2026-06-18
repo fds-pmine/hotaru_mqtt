@@ -157,10 +157,28 @@ impl SubackCode {
 // ----------------------------------------------------------------------------
 
 /// CONNECT-time authentication payload.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written to redact the password bytes — SAFETY_PROOF v4
+/// flagged that a derived `Debug` would let user code accidentally leak
+/// the plaintext via `tracing::debug!("creds = {:?}", creds)` or any
+/// other `{:?}`-style logging path. The server-side analogue
+/// (`PasswordHash::Debug`) was already redacted (audit G3).
+#[derive(Clone)]
 pub struct Credentials {
     pub username: Arc<str>,
     pub password: Bytes,
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("username", &self.username)
+            .field(
+                "password",
+                &format_args!("<redacted: {} bytes>", self.password.len()),
+            )
+            .finish()
+    }
 }
 
 impl Credentials {
@@ -169,6 +187,28 @@ impl Credentials {
             username: username.into(),
             password: password.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod credentials_debug_tests {
+    use super::*;
+
+    #[test]
+    fn credentials_debug_redacts_password_bytes() {
+        // SAFETY_PROOF v4 regression: the literal password bytes must
+        // not appear in the Debug rendering, only the byte length.
+        let c = Credentials::new("alice", Bytes::from_static(b"super-secret-pw"));
+        let rendered = format!("{:?}", c);
+        assert!(rendered.contains("alice"), "username should be visible");
+        assert!(
+            !rendered.contains("super-secret-pw"),
+            "password bytes MUST NOT appear in Debug; got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("<redacted: 15 bytes>"),
+            "Debug should show byte length only; got {rendered:?}"
+        );
     }
 }
 

@@ -214,9 +214,7 @@ mod tests {
     #[tokio::test]
     async fn missing_acl_section_denies_by_default() {
         let acl = JsonAclChecker::from_str(r#"{"users":{"alice":{}}}"#).unwrap();
-        let d = acl
-            .check_publish(None, &cid(), Some(&alice()), "x/y")
-            .await;
+        let d = acl.check_publish(None, &cid(), Some(&alice()), "x/y").await;
         assert_eq!(
             d,
             AclDecision::Deny,
@@ -228,8 +226,8 @@ mod tests {
     async fn anonymous_user_denied() {
         // Authenticator might accept-all; ACL must still deny when there's
         // no username to look up.
-        let acl = JsonAclChecker::from_str(r##"{"users":{"alice":{"acl":{"publish":["#"]}}}}"##)
-            .unwrap();
+        let acl =
+            JsonAclChecker::from_str(r##"{"users":{"alice":{"acl":{"publish":["#"]}}}}"##).unwrap();
         let d = acl.check_publish(None, &cid(), None, "x/y").await;
         assert_eq!(d, AclDecision::Deny);
     }
@@ -250,20 +248,24 @@ mod tests {
 
         // alice@ta can publish a/x but not b/x.
         assert_eq!(
-            acl.check_publish(Some(&ta), &cid(), Some(&alice()), "a/x").await,
+            acl.check_publish(Some(&ta), &cid(), Some(&alice()), "a/x")
+                .await,
             AclDecision::Allow
         );
         assert_eq!(
-            acl.check_publish(Some(&ta), &cid(), Some(&alice()), "b/x").await,
+            acl.check_publish(Some(&ta), &cid(), Some(&alice()), "b/x")
+                .await,
             AclDecision::Deny
         );
         // alice@tb is the inverse.
         assert_eq!(
-            acl.check_publish(Some(&tb), &cid(), Some(&alice()), "b/x").await,
+            acl.check_publish(Some(&tb), &cid(), Some(&alice()), "b/x")
+                .await,
             AclDecision::Allow
         );
         assert_eq!(
-            acl.check_publish(Some(&tb), &cid(), Some(&alice()), "a/x").await,
+            acl.check_publish(Some(&tb), &cid(), Some(&alice()), "a/x")
+                .await,
             AclDecision::Deny
         );
     }
@@ -272,10 +274,8 @@ mod tests {
     async fn dollar_sys_subscribe_requires_explicit_grant() {
         // spec §4.7.2 + AOI §5.1.1 — even with `#` ACL, a $SYS topic should
         // NOT be reachable via wildcard. Explicit `$SYS/#` grant required.
-        let acl = JsonAclChecker::from_str(
-            r##"{"users":{"alice":{"acl":{"subscribe":["#"]}}}}"##,
-        )
-        .unwrap();
+        let acl = JsonAclChecker::from_str(r##"{"users":{"alice":{"acl":{"subscribe":["#"]}}}}"##)
+            .unwrap();
         let d = acl
             .check_subscribe(None, &cid(), Some(&alice()), "$SYS/broker/version")
             .await;
@@ -285,10 +285,9 @@ mod tests {
             "wildcard `#` MUST NOT reach $-prefixed topics per spec §4.7.2"
         );
 
-        let acl2 = JsonAclChecker::from_str(
-            r##"{"users":{"alice":{"acl":{"subscribe":["$SYS/#"]}}}}"##,
-        )
-        .unwrap();
+        let acl2 =
+            JsonAclChecker::from_str(r##"{"users":{"alice":{"acl":{"subscribe":["$SYS/#"]}}}}"##)
+                .unwrap();
         let d2 = acl2
             .check_subscribe(None, &cid(), Some(&alice()), "$SYS/broker/version")
             .await;

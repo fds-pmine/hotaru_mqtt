@@ -129,10 +129,7 @@ impl DefaultRetainedStore {
         }
     }
 
-    fn tenant_map(
-        &self,
-        tenant: Option<&TenantId>,
-    ) -> Arc<DashMap<Arc<str>, RetainedRecord>> {
+    fn tenant_map(&self, tenant: Option<&TenantId>) -> Arc<DashMap<Arc<str>, RetainedRecord>> {
         self.tenants
             .entry(tenant.cloned())
             .or_insert_with(|| Arc::new(DashMap::new()))
@@ -157,13 +154,7 @@ impl Default for DefaultRetainedStore {
 
 #[async_trait]
 impl RetainedStore for DefaultRetainedStore {
-    async fn store(
-        &self,
-        tenant: Option<&TenantId>,
-        topic: Arc<str>,
-        payload: Bytes,
-        qos: QoS,
-    ) {
+    async fn store(&self, tenant: Option<&TenantId>, topic: Arc<str>, payload: Bytes, qos: QoS) {
         let inner = self.tenant_map(tenant);
         inner.insert(topic, RetainedRecord { payload, qos });
     }
@@ -187,11 +178,7 @@ impl RetainedStore for DefaultRetainedStore {
         }
     }
 
-    async fn matching(
-        &self,
-        tenant: Option<&TenantId>,
-        filter: &str,
-    ) -> Vec<RetainedEntry> {
+    async fn matching(&self, tenant: Option<&TenantId>, filter: &str) -> Vec<RetainedEntry> {
         let Some(inner) = self.try_tenant_map(tenant) else {
             return Vec::new();
         };
@@ -214,9 +201,7 @@ impl RetainedStore for DefaultRetainedStore {
     }
 
     async fn count(&self, tenant: Option<&TenantId>) -> usize {
-        self.try_tenant_map(tenant)
-            .map(|m| m.len())
-            .unwrap_or(0)
+        self.try_tenant_map(tenant).map(|m| m.len()).unwrap_or(0)
     }
 }
 
@@ -253,11 +238,7 @@ impl Default for DefaultSessionStore {
 
 #[async_trait]
 impl SessionStore for DefaultSessionStore {
-    async fn load(
-        &self,
-        tenant: Option<&TenantId>,
-        client_id: &str,
-    ) -> Option<Arc<MqttSession>> {
+    async fn load(&self, tenant: Option<&TenantId>, client_id: &str) -> Option<Arc<MqttSession>> {
         let key = (tenant.cloned(), Arc::<str>::from(client_id));
         self.store.remove(&key).map(|(_, session)| session)
     }
@@ -278,6 +259,16 @@ impl SessionStore for DefaultSessionStore {
             // client's explicit `clean_session=true` reconnect.
             session.wipe();
         }
+    }
+
+    async fn count(&self, tenant: Option<&TenantId>) -> usize {
+        // SAFETY_PROOF v5 T2(d): used by
+        // `BrokerSafety::max_persistent_sessions_per_tenant` cap-check
+        // at `unregister_session(clean_session=false)`. O(N) over the
+        // global map but only runs on the disconnect path — a low-
+        // frequency lifecycle event, not the hot path.
+        let want = tenant.cloned();
+        self.store.iter().filter(|e| e.key().0 == want).count()
     }
 }
 
@@ -316,10 +307,20 @@ mod tests {
     #[tokio::test]
     async fn store_overwrites_prior_entry_for_same_topic() {
         let s = DefaultRetainedStore::new();
-        s.store(None, Arc::from("x"), Bytes::from_static(b"1"), QoS::AtMostOnce)
-            .await;
-        s.store(None, Arc::from("x"), Bytes::from_static(b"2"), QoS::AtMostOnce)
-            .await;
+        s.store(
+            None,
+            Arc::from("x"),
+            Bytes::from_static(b"1"),
+            QoS::AtMostOnce,
+        )
+        .await;
+        s.store(
+            None,
+            Arc::from("x"),
+            Bytes::from_static(b"2"),
+            QoS::AtMostOnce,
+        )
+        .await;
         let hits = s.matching(None, "x").await;
         assert_eq!(hits.len(), 1);
         assert_eq!(&hits[0].payload[..], b"2");
@@ -328,8 +329,13 @@ mod tests {
     #[tokio::test]
     async fn remove_clears_entry() {
         let s = DefaultRetainedStore::new();
-        s.store(None, Arc::from("x"), Bytes::from_static(b"v"), QoS::AtMostOnce)
-            .await;
+        s.store(
+            None,
+            Arc::from("x"),
+            Bytes::from_static(b"v"),
+            QoS::AtMostOnce,
+        )
+        .await;
         s.remove(None, "x").await;
         assert!(s.matching(None, "x").await.is_empty());
     }
@@ -390,5 +396,37 @@ mod tests {
         assert!(is_dollar_topic("$SYS"));
         assert!(!is_dollar_topic("home/temp"));
         assert!(!is_dollar_topic("nodollar"));
+    }
+
+    // SAFETY_PROOF v5 T2(d) — DefaultSessionStore::count powers the
+    // persistent-sessions-per-tenant cap. Must be tenant-scoped.
+
+    #[tokio::test]
+    async fn session_store_count_returns_tenant_scoped_size() {
+        let s = DefaultSessionStore::new();
+        let session = MqttSession::new();
+
+        // Stash three persistent sessions: two for tenant A, one for tenant B,
+        // and one in the default (None) tenant.
+        s.save(ten("ta").as_ref(), Arc::from("alice"), session.clone()).await;
+        s.save(ten("ta").as_ref(), Arc::from("bob"), session.clone()).await;
+        s.save(ten("tb").as_ref(), Arc::from("carol"), session.clone()).await;
+        s.save(None, Arc::from("dave"), session.clone()).await;
+
+        assert_eq!(s.count(ten("ta").as_ref()).await, 2);
+        assert_eq!(s.count(ten("tb").as_ref()).await, 1);
+        assert_eq!(s.count(None).await, 1);
+        // Unknown tenant → zero, no allocation.
+        assert_eq!(s.count(ten("nope").as_ref()).await, 0);
+    }
+
+    #[tokio::test]
+    async fn session_store_count_drops_to_zero_after_destroy() {
+        let s = DefaultSessionStore::new();
+        let session = MqttSession::new();
+        s.save(ten("ta").as_ref(), Arc::from("alice"), session).await;
+        assert_eq!(s.count(ten("ta").as_ref()).await, 1);
+        s.destroy(ten("ta").as_ref(), "alice").await;
+        assert_eq!(s.count(ten("ta").as_ref()).await, 0);
     }
 }

@@ -146,9 +146,7 @@ pub fn verify_password(hash: &str, password: &[u8]) -> bool {
             verify_pbkdf2_sha512(password, &salt, rounds, &hash)
         }
         #[cfg(feature = "auth-bcrypt")]
-        PasswordHash::Bcrypt(phc) => {
-            bcrypt::verify(password, &phc).unwrap_or(false)
-        }
+        PasswordHash::Bcrypt(phc) => bcrypt::verify(password, &phc).unwrap_or(false),
     }
 }
 
@@ -203,10 +201,7 @@ mod tests {
         // Swap salt segment with a different one (re-encode).
         let parts: Vec<&str> = phc.splitn(5, '$').collect();
         let bad_salt = general_purpose::STANDARD_NO_PAD.encode(b"different");
-        let tampered = format!(
-            "${}${}${}${}",
-            parts[1], parts[2], bad_salt, parts[4],
-        );
+        let tampered = format!("${}${}${}${}", parts[1], parts[2], bad_salt, parts[4],);
         assert!(!verify_password(&tampered, b"hunter2"));
     }
 

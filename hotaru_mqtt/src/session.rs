@@ -89,7 +89,10 @@ impl MqttSession {
     /// receive-maximum cap.
     pub fn try_allocate_packet_id(&self) -> Option<u16> {
         for _ in 0..u16::MAX {
-            let raw = self.pkt_counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            let raw = self
+                .pkt_counter
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
             let id = if raw == 0 { 1 } else { raw };
             if !self.outbound_inflight.contains_key(&id) {
                 return Some(id);
@@ -102,8 +105,9 @@ impl MqttSession {
     /// not equipped to handle exhaustion. Panics on full inflight space —
     /// see [`Self::try_allocate_packet_id`] for the fallible API.
     pub fn allocate_packet_id(&self) -> u16 {
-        self.try_allocate_packet_id()
-            .expect("packet-id space exhausted — receive-maximum should bound inflight far below 65535")
+        self.try_allocate_packet_id().expect(
+            "packet-id space exhausted — receive-maximum should bound inflight far below 65535",
+        )
     }
 
     /// Called by `MqttChannel::close` on every disconnect. Drops only the
@@ -159,8 +163,7 @@ impl MqttSession {
                 .insert(*entry.key(), entry.value().clone());
         }
         for entry in source.qos2_recv.iter() {
-            self.qos2_recv
-                .insert(*entry.key(), entry.value().clone());
+            self.qos2_recv.insert(*entry.key(), entry.value().clone());
         }
         source.outbound_inflight.clear();
         source.qos2_recv.clear();
@@ -262,13 +265,8 @@ pub fn ack_inbound_publish_pre_chain<W: ConnStream>(
                 // Allow re-stash on the SAME id (idempotent on duplicate
                 // delivery — spec §4.3.3); only reject when adding a NEW
                 // id would push the stash past the cap.
-                if !session.qos2_recv.contains_key(&id)
-                    && session.qos2_recv.len() >= receive_max
-                {
-                    return Err(Violation::ReceiveMaximumExceeded {
-                        limit: receive_max,
-                    }
-                    .into());
+                if !session.qos2_recv.contains_key(&id) && session.qos2_recv.len() >= receive_max {
+                    return Err(Violation::ReceiveMaximumExceeded { limit: receive_max }.into());
                 }
                 session.stash_qos2_inbound(id, incoming_from_packet(publish));
                 channel.send_packet(Packet::Pubrec(id))?;

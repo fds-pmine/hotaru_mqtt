@@ -29,8 +29,8 @@ use crate::codec::read_packet;
 use crate::context::MqttContext;
 use crate::error::{MqttError, TimeoutKind, Violation};
 use crate::packet::{
-    ConnackReturnCode, ConnectPacket, Packet, PublishPacket, SubackPacket,
-    SubscribePacket, TopicSubscription, UnsubscribePacket, WillPacket, incoming_from_packet,
+    ConnackReturnCode, ConnectPacket, Packet, PublishPacket, SubackPacket, SubscribePacket,
+    TopicSubscription, UnsubscribePacket, WillPacket, incoming_from_packet,
 };
 use crate::request::{
     IncomingPublish, MqttRequest, MqttResponse, PublishAck, PublishRequest, QoS, TopicFilter,
@@ -63,8 +63,7 @@ pub type MQTT = MqttClientProtocol<tokio::net::TcpStream, DefaultMqttTransport>;
 
 /// MQTT over TLS (gated by `tls` feature). Mirrors `hotaru_http::HTTPS`.
 #[cfg(feature = "tls")]
-pub type MqttTlsProtocol =
-    MqttClientProtocol<hotaru_tls::TlsStream, hotaru_tls::TlsTransport>;
+pub type MqttTlsProtocol = MqttClientProtocol<hotaru_tls::TlsStream, hotaru_tls::TlsTransport>;
 
 /// `MQTTS` alias (MQTT over TLS), enabled by `tls` feature.
 #[cfg(feature = "tls")]
@@ -139,6 +138,25 @@ where
             .unwrap_or(false)
     }
 
+    fn tokenize_url(
+        input: &str,
+    ) -> Result<Vec<hotaru_core::url::RawToken>, hotaru_core::url::PatternError> {
+        // Closes hotaru #4 (RFC_TRANS_ENDPOINT_DECOUPLE.md) on the client side:
+        // user `endpoint!("sensors/+/temp", ...)` now natively understands
+        // MQTT topic syntax (`/` separator, `+` single-level wildcard, `#`
+        // multi-level wildcard) instead of the default HTTP URL lexer
+        // mangling `+`/`#` into literal characters.
+        crate::topic::tokenize_mqtt_filter(input)
+    }
+
+    fn lit_parser<'a>(input: &'a str) -> Vec<&'a str> {
+        // MQTT topic at dispatch time: split on '/', no leading-empty
+        // handling (MQTT topics have no leading '/' unlike HTTP URLs).
+        // Empty input → empty Vec → root-endpoint slot (per upstream
+        // Protocol::lit_parser docstring).
+        crate::topic::split_mqtt_topic(input)
+    }
+
     fn open_channel(
         self,
         reader: BufReader<<<Self::TS as TransportSpec>::Wire as ConnStream>::ReadHalf>,
@@ -175,9 +193,7 @@ where
         _outbound: Arc<<Self::TS as TransportSpec>::Outbound>,
     ) -> Result<Self::Channel, CtxError<Self>> {
         let channel = self.session_channel.get().ok_or_else(|| {
-            MqttError::NotConnected(
-                "call client.run_wire(wire) to establish session first".into(),
-            )
+            MqttError::NotConnected("call client.run_wire(wire) to establish session first".into())
         })?;
         Ok(channel.clone())
     }
@@ -207,9 +223,7 @@ where
     let config = runtime
         .get_static::<Arc<MqttClientConfig>>(CLIENT_CONFIG_STATICS_KEY)
         .ok_or_else(|| {
-            MqttError::Configuration(
-                "MqttClientConfig not registered in runtime statics".into(),
-            )
+            MqttError::Configuration("MqttClientConfig not registered in runtime statics".into())
         })?;
 
     // 1. Take exclusive reader ownership (single-take).
@@ -229,8 +243,8 @@ where
         config.connect_timeout,
         read_packet(&mut reader, max_packet_size),
     )
-        .await
-        .map_err(|_| MqttError::Timeout(TimeoutKind::Connack))??;
+    .await
+    .map_err(|_| MqttError::Timeout(TimeoutKind::Connack))??;
     let Packet::Connack(ack) = connack_packet else {
         return Err(Violation::ExpectedConnack.into());
     };
@@ -434,10 +448,8 @@ fn node_key<TS: TransportSpec>(node: &Arc<UrlNode<MqttContext<TS>, TS>>) -> Node
     Arc::as_ptr(node) as *const () as usize
 }
 
-type EndpointQueueMap<TS> = DashMap<
-    NodeKey,
-    mpsc::Sender<(IncomingPublish, Arc<UrlNode<MqttContext<TS>, TS>>)>,
->;
+type EndpointQueueMap<TS> =
+    DashMap<NodeKey, mpsc::Sender<(IncomingPublish, Arc<UrlNode<MqttContext<TS>, TS>>)>>;
 
 struct EndpointDispatcher<W: ConnStream, TS: TransportSpec<Wire = W>> {
     channel: MqttChannel<W>,
@@ -549,8 +561,7 @@ async fn endpoint_worker<W, TS>(
             None => rx.recv().await,
         };
         let Some((incoming, node)) = next else { return };
-        let ctx =
-            MqttContext::<TS>::for_inbound_dispatch(channel.clone(), incoming, node.clone());
+        let ctx = MqttContext::<TS>::for_inbound_dispatch(channel.clone(), incoming, node.clone());
         let _ = node.run(ctx).await;
     }
 }
@@ -583,10 +594,9 @@ async fn send_impl<TS>(mut ctx: MqttContext<TS>) -> Result<MqttContext<TS>, Mqtt
 where
     TS: TransportSpec,
 {
-    let channel = ctx
-        .channel()
-        .cloned()
-        .ok_or(MqttError::NotConnected("no channel installed in ctx".into()))?;
+    let channel = ctx.channel().cloned().ok_or(MqttError::NotConnected(
+        "no channel installed in ctx".into(),
+    ))?;
 
     let request = std::mem::replace(
         &mut ctx.request,
@@ -711,10 +721,7 @@ async fn send_unsubscribe<W: ConnStream>(
     channel
         .session()
         .install_ack_slot(packet_id, AckSlot::Unsuback(tx));
-    channel.send_packet(Packet::Unsubscribe(UnsubscribePacket {
-        packet_id,
-        topics,
-    }))?;
+    channel.send_packet(Packet::Unsubscribe(UnsubscribePacket { packet_id, topics }))?;
     timeout(DEFAULT_ACK_TIMEOUT, rx)
         .await
         .map_err(|_| {

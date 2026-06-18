@@ -23,6 +23,21 @@ pub struct BrokerSafety {
     max_connections: Option<usize>,
     slow_consumer_policy: Option<SlowConsumerPolicy>,
     shutdown_grace_period: Option<Duration>,
+    /// SAFETY_PROOF v5 T2(a): cap retained-message count per tenant. A
+    /// `retain=1` publish that would push the tenant past this cap skips
+    /// the `RetainedStore::store` call (fanout still delivers).
+    /// `None` = unlimited; default is 65_536.
+    max_retained_messages_per_tenant: Option<usize>,
+    /// SAFETY_PROOF v5 T2(c): cap total subscriptions per client. A
+    /// SUBSCRIBE filter that would push the client past this cap gets
+    /// `SubackCode::Failure` instead of `Granted`. `None` = unlimited;
+    /// default is 1_024.
+    max_subscriptions_per_client: Option<usize>,
+    /// SAFETY_PROOF v5 T2(d): cap stored `clean_session=false` sessions
+    /// per tenant. A disconnect that would push the tenant past this cap
+    /// drops the session (treats as `clean_session=true` at exit). `None`
+    /// = unlimited; default is 4_096.
+    max_persistent_sessions_per_tenant: Option<usize>,
 }
 
 /// What to do when a subscriber's bounded queue overflows.
@@ -68,6 +83,9 @@ const DEFAULT_MAX_INFLIGHT: usize = 20;
 const DEFAULT_MAX_QUEUED: usize = 1000;
 const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+const DEFAULT_MAX_RETAINED_PER_TENANT: usize = 65_536;
+const DEFAULT_MAX_SUBS_PER_CLIENT: usize = 1_024;
+const DEFAULT_MAX_PERSISTENT_PER_TENANT: usize = 4_096;
 
 impl BrokerSafety {
     pub fn new() -> Self {
@@ -96,6 +114,21 @@ impl BrokerSafety {
         self.shutdown_grace_period.unwrap_or(DEFAULT_SHUTDOWN_GRACE)
     }
 
+    pub fn max_retained_messages_per_tenant(&self) -> usize {
+        self.max_retained_messages_per_tenant
+            .unwrap_or(DEFAULT_MAX_RETAINED_PER_TENANT)
+    }
+
+    pub fn max_subscriptions_per_client(&self) -> usize {
+        self.max_subscriptions_per_client
+            .unwrap_or(DEFAULT_MAX_SUBS_PER_CLIENT)
+    }
+
+    pub fn max_persistent_sessions_per_tenant(&self) -> usize {
+        self.max_persistent_sessions_per_tenant
+            .unwrap_or(DEFAULT_MAX_PERSISTENT_PER_TENANT)
+    }
+
     // ── Builder-style setters ───────────────────────────────────
 
     pub fn with_max_inflight_messages(mut self, n: usize) -> Self {
@@ -120,6 +153,21 @@ impl BrokerSafety {
 
     pub fn with_shutdown_grace_period(mut self, d: Duration) -> Self {
         self.shutdown_grace_period = Some(d);
+        self
+    }
+
+    pub fn with_max_retained_messages_per_tenant(mut self, n: usize) -> Self {
+        self.max_retained_messages_per_tenant = Some(n);
+        self
+    }
+
+    pub fn with_max_subscriptions_per_client(mut self, n: usize) -> Self {
+        self.max_subscriptions_per_client = Some(n);
+        self
+    }
+
+    pub fn with_max_persistent_sessions_per_tenant(mut self, n: usize) -> Self {
+        self.max_persistent_sessions_per_tenant = Some(n);
         self
     }
 }
@@ -148,6 +196,30 @@ mod tests {
     #[test]
     fn default_policy_is_drop_oldest_qos0() {
         let bs = BrokerSafety::new();
-        assert_eq!(bs.slow_consumer_policy(), SlowConsumerPolicy::DropOldestQos0);
+        assert_eq!(
+            bs.slow_consumer_policy(),
+            SlowConsumerPolicy::DropOldestQos0
+        );
+    }
+
+    // SAFETY_PROOF v5 T2 — defaults + builders for the three bounded-memory caps.
+
+    #[test]
+    fn v5_caps_have_sensible_secure_defaults() {
+        let bs = BrokerSafety::new();
+        assert_eq!(bs.max_retained_messages_per_tenant(), 65_536);
+        assert_eq!(bs.max_subscriptions_per_client(), 1_024);
+        assert_eq!(bs.max_persistent_sessions_per_tenant(), 4_096);
+    }
+
+    #[test]
+    fn v5_caps_round_trip_through_builders() {
+        let bs = BrokerSafety::new()
+            .with_max_retained_messages_per_tenant(7)
+            .with_max_subscriptions_per_client(13)
+            .with_max_persistent_sessions_per_tenant(21);
+        assert_eq!(bs.max_retained_messages_per_tenant(), 7);
+        assert_eq!(bs.max_subscriptions_per_client(), 13);
+        assert_eq!(bs.max_persistent_sessions_per_tenant(), 21);
     }
 }
