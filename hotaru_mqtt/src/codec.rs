@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use zeroize::Zeroizing;
 
 use crate::error::{CodecError, MqttError, Violation};
 use crate::packet::{
@@ -350,8 +351,14 @@ fn parse_connect(body: &[u8]) -> Result<Packet, MqttError> {
         None
     };
 
+    // SAFETY_PROOF v5 §7 F1 / #69: copy the wire bytes into an owned, zeroized
+    // buffer instead of holding a `Bytes` view. The wire arena is still alive
+    // until `parse_connect` returns, but our long-lived copy is `Zeroizing<Vec<u8>>`
+    // — guaranteed wiped at packet-drop. `read_bytes`' internal `Vec` allocated
+    // for the slice is dropped here without an explicit wipe; the wire arena
+    // is the residual window addressed by the future wipeable wire allocator.
     let password = if password_flag {
-        Some(read_bytes(body, &mut cursor)?)
+        Some(Zeroizing::new(read_bytes(body, &mut cursor)?.to_vec()))
     } else {
         None
     };
@@ -568,7 +575,11 @@ fn encode_connect(conn: &ConnectPacket) -> Result<Vec<u8>, MqttError> {
         write_arc_str(&mut body, username, "username")?;
     }
     if let Some(password) = &conn.password {
-        write_bytes(&mut body, password, "password")?;
+        // `Zeroizing<Vec<u8>>` derefs to `[u8]`. Wire-bound bytes get
+        // staged in `body: Vec<u8>` — that buffer is NOT zeroized; the
+        // encode-side residency is the same wire-arena window addressed
+        // by the future wipeable wire allocator.
+        write_bytes(&mut body, password.as_slice(), "password")?;
     }
     let mut buf = vec![(PacketType::Connect as u8) << 4];
     buf.extend(encode_remaining_length(body.len()));
@@ -709,10 +720,10 @@ fn write_arc_str(out: &mut Vec<u8>, s: &Arc<str>, kind: &'static str) -> Result<
     Ok(())
 }
 
-fn write_bytes(out: &mut Vec<u8>, b: &Bytes, kind: &'static str) -> Result<(), MqttError> {
+fn write_bytes(out: &mut Vec<u8>, b: &[u8], kind: &'static str) -> Result<(), MqttError> {
     let len = u16_or_err(b.len(), kind)?;
     out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(&b[..]);
+    out.extend_from_slice(b);
     Ok(())
 }
 
@@ -764,7 +775,7 @@ mod tests {
             clean_session: false,
             keep_alive: 30,
             username: Some(Arc::from("alice")),
-            password: Some(Bytes::from_static(b"secret")),
+            password: Some(Zeroizing::new(b"secret".to_vec())),
             will: Some(WillPacket {
                 topic: Arc::from("offline"),
                 payload: Bytes::from_static(b"bye"),

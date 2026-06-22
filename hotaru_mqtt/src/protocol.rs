@@ -783,7 +783,14 @@ fn build_connect(config: &MqttClientConfig) -> ConnectPacket {
         clean_session: config.clean_session,
         keep_alive: config.keep_alive_secs,
         username: config.credentials.as_ref().map(|c| c.username.clone()),
-        password: config.credentials.as_ref().map(|c| c.password.clone()),
+        // SAFETY_PROOF v5 §7 F1 / #69: convert the caller's `Bytes` into an
+        // owned `Zeroizing<Vec<u8>>` so the wire-bound CONNECT plaintext is
+        // wiped at packet drop. Client-side `Credentials.password` still
+        // holds plaintext as `Bytes` (caller-managed lifetime).
+        password: config
+            .credentials
+            .as_ref()
+            .map(|c| zeroize::Zeroizing::new(c.password.to_vec())),
         will: config.will.as_ref().map(|w| WillPacket {
             topic: w.topic.clone(),
             payload: w.payload.clone(),

@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use bitflags::bitflags;
 use bytes::{Bytes, BytesMut};
+use zeroize::Zeroizing;
 
 use hotaru_core::protocol::Message;
 
@@ -83,7 +84,12 @@ pub struct ConnectPacket {
     pub clean_session: bool,
     pub keep_alive: u16,
     pub username: Option<Arc<str>>,
-    pub password: Option<Bytes>,
+    /// CONNECT password. Wrapped in `Zeroizing<Vec<u8>>` so the plaintext
+    /// is wiped when the packet drops — SAFETY_PROOF v5 §7 F1 / #69 closure.
+    /// The codec copies the wire bytes into an owned `Vec<u8>` rather than
+    /// holding a `Bytes` view, because `Bytes` may be refcounted and cannot
+    /// reliably be zeroized at a single drop site.
+    pub password: Option<Zeroizing<Vec<u8>>>,
     pub will: Option<WillPacket>,
 }
 
@@ -320,7 +326,7 @@ mod tests {
             clean_session: true,
             keep_alive: 60,
             username: Some(Arc::from("alice")),
-            password: Some(Bytes::from_static(b"supersecret-2025")),
+            password: Some(Zeroizing::new(b"supersecret-2025".to_vec())),
             will: None,
         };
         let dbg = format!("{conn:?}");

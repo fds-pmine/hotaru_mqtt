@@ -16,6 +16,7 @@ async-trait = { workspace = true }
 dashmap = { workspace = true }
 bytes = { workspace = true }
 bitflags = { workspace = true }
+zeroize = { workspace = true }
 
 hotaru_tls = { workspace = true, optional = true }
 

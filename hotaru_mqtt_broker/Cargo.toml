@@ -28,7 +28,7 @@ subtle = "2"
 base64 = "0.22"
 # F4 hardening: wipe plaintext password buffers on drop so a process
 # coredump or post-free heap leak cannot leak credentials.
-zeroize = { version = "1", features = ["zeroize_derive"] }
+zeroize = { workspace = true }
 
 # Optional alt scheme (PHC-recognized prefix activates it).
 # Note: `auth-sha512crypt` is deferred — sha-crypt 0.6 dropped the high-level

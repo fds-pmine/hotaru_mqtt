@@ -39,8 +39,7 @@ use hotaru_mqtt::packet::ConnackReturnCode;
 use hotaru_mqtt::packet::ConnectPacket;
 use pbkdf2::pbkdf2;
 use sha2::Sha512;
-use tracing::warn;
-use zeroize::Zeroizing;
+use tracing::error;
 
 use crate::auth::password::{DefaultPasswordVerifier, PasswordHash, PasswordVerifier};
 use crate::traits::{AuthResult, Authenticator, TenantId};
@@ -64,15 +63,22 @@ pub struct JsonAuthenticator {
 impl JsonAuthenticator {
     /// Construct from a JSON string. Returns the akari parse error string on
     /// failure — caller surfaces it in their own error wrapping.
+    ///
+    /// SAFETY_PROOF v5 §7 F2 closure: rejects mixed-rounds snapshots
+    /// (`> 1` distinct PBKDF2 `rounds` value) at load time. Previously this
+    /// path emitted a `warn!` and silently fell back to modal rounds, leaving
+    /// the non-modal subset of users timing-distinguishable from unknown
+    /// users. Uniform / empty / all-bcrypt snapshots load unchanged.
     pub fn from_str(json: &str) -> Result<Self, String> {
         let snapshot = Value::from_json(json)?;
-        Ok(Self::with_snapshot(snapshot))
+        Self::with_snapshot(snapshot)
     }
 
-    /// Construct by reading a JSON file at `path`.
+    /// Construct by reading a JSON file at `path`. See [`Self::from_str`] —
+    /// same fail-closed semantics on mixed rounds.
     pub fn from_path(path: impl AsRef<str>) -> Result<Self, String> {
         let snapshot = Value::from_jsonf(path.as_ref())?;
-        Ok(Self::with_snapshot(snapshot))
+        Self::with_snapshot(snapshot)
     }
 
     /// Strict variant (SAFETY_PROOF v3 U4 closure): rejects snapshots in
@@ -104,36 +110,42 @@ impl JsonAuthenticator {
         })
     }
 
-    fn with_snapshot(snapshot: Value) -> Self {
+    fn with_snapshot(snapshot: Value) -> Result<Self, String> {
         // G4 mitigation: scan the snapshot at construction time, pick the
         // modal `rounds` value from every parseable PHC, and seed the
-        // dummy with that. If a deployment hashes at `rounds ≠ 10_000`
-        // and the operator forgets `with_dummy_rounds`, this still keeps
-        // unknown-vs-known verify cost indistinguishable for the majority.
-        // Empty snapshot or all-bcrypt snapshot falls back to
-        // `DEFAULT_DUMMY_ROUNDS`.
+        // dummy with that. Empty snapshot or all-bcrypt snapshot falls
+        // back to `DEFAULT_DUMMY_ROUNDS`.
         //
-        // SAFETY_PROOF v4 §C.U4 (recommendation b): loud-warn when the
-        // snapshot has more than one distinct `rounds` value, so non-modal
-        // users' "unknown vs. existing" timing remains distinguishable
-        // until the operator migrates to `from_str_strict`. A silent
-        // fallback would let the leak persist invisibly.
+        // SAFETY_PROOF v5 §7 F2 closure (replaces R6's loud-warn): when
+        // the snapshot has more than one distinct PBKDF2 `rounds` value,
+        // **reject at load time**. Modal fallback is no longer permitted
+        // because non-modal users stay timing-distinguishable from unknown
+        // users — the warn-and-continue path was a silent timing-leak vector
+        // unless the operator independently noticed the log line. Strict
+        // is now the only mode; `from_str_strict` is kept as an alias that
+        // *also* rejects empty / all-bcrypt snapshots (no PBKDF2 anchor).
         let distinct = count_distinct_rounds(&snapshot);
         if distinct > 1 {
-            warn!(
+            error!(
                 target: "hotaru_mqtt_broker",
                 distinct_rounds = distinct,
-                "JsonAuthenticator: snapshot has multiple PBKDF2 `rounds`; non-modal users \
-                 stay timing-distinguishable from unknown users. Use `from_str_strict` \
-                 / `from_path_strict` to reject such snapshots at load time."
+                "JsonAuthenticator: snapshot has multiple PBKDF2 `rounds` values; \
+                 rejected at load time. Non-modal users would be timing-distinguishable \
+                 from unknown users — re-hash all entries to a single `rounds` setting \
+                 before retrying."
             );
+            return Err(format!(
+                "JsonAuthenticator: snapshot has {distinct} distinct PBKDF2 `rounds` \
+                 values; refusing to load (SAFETY_PROOF v5 §7 F2). Re-hash all entries \
+                 to a single `rounds` setting."
+            ));
         }
         let rounds = detect_modal_rounds(&snapshot).unwrap_or(DEFAULT_DUMMY_ROUNDS);
-        Self {
+        Ok(Self {
             snapshot,
             verifier: Arc::new(DefaultPasswordVerifier),
             dummy_hash: build_dummy_phc(rounds),
-        }
+        })
     }
 
     /// Override the default PBKDF2-SHA512 verifier (e.g. inject a fake in
@@ -207,16 +219,12 @@ impl Authenticator for JsonAuthenticator {
         let stored_hash = username
             .and_then(|u| self.lookup_hash(tenant, u))
             .unwrap_or(self.dummy_hash.as_str());
-        // SAFETY_PROOF v4 §U5 caller-side mitigation: copy the wire-backed
-        // password bytes into a `Zeroizing<Vec<u8>>` so OUR copy of the
-        // plaintext is wiped on scope exit. The original `Bytes` inside
-        // `ConnectPacket.password` still lives until the packet drops
-        // (codec-side fix is carry-over #69), but the residency window of
-        // any copy WE control collapses to the verifier call duration.
-        let candidate: Zeroizing<Vec<u8>> = Zeroizing::new(
-            password.map(|p| p.as_ref().to_vec()).unwrap_or_default(),
-        );
-        let hash_ok = self.verifier.verify(stored_hash, &candidate);
+        // SAFETY_PROOF v5 §7 F1 / #69 closure: `ConnectPacket.password` is now
+        // `Option<Zeroizing<Vec<u8>>>`, wiped at packet drop. We no longer
+        // need the prior R6 local `Zeroizing<Vec<u8>>` copy — the source IS
+        // the zeroized buffer. Borrow a slice straight into the verifier.
+        let candidate_slice: &[u8] = password.map(|p| p.as_slice()).unwrap_or(&[]);
+        let hash_ok = self.verifier.verify(stored_hash, candidate_slice);
 
         // Accept only if (a) the username, password, and stored hash all
         // really existed, AND (b) the verifier reported a match against the
@@ -255,11 +263,14 @@ fn detect_modal_rounds(snapshot: &Value) -> Option<u32> {
     counts.into_iter().max_by_key(|&(_, c)| c).map(|(r, _)| r)
 }
 
-/// SAFETY_PROOF v4 §C.U4(b): cheap distinct-count probe used by
-/// `with_snapshot` to decide whether to emit the loud-warn. Walks the
-/// same shape as `detect_modal_rounds` / `detect_uniform_rounds` and
-/// returns the size of the `(rounds → count)` map. `0` for empty /
-/// all-bcrypt; `1` for uniform; `> 1` triggers the warn.
+/// SAFETY_PROOF v5 §7 F2: cheap distinct-count probe used by
+/// `with_snapshot` to decide whether to **reject** the snapshot at load
+/// time. Walks the same shape as `detect_modal_rounds` /
+/// `detect_uniform_rounds` and returns the size of the
+/// `(rounds → count)` map. `0` for empty / all-bcrypt; `1` for uniform;
+/// `> 1` triggers fail-closed (the prior R6 loud-warn-and-continue path
+/// was promoted to a hard reject because operators routinely miss `warn!`
+/// lines in dev consoles).
 fn count_distinct_rounds(snapshot: &Value) -> usize {
     let mut counts: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
     if let Value::Dict(top) = snapshot {
@@ -351,7 +362,7 @@ fn build_dummy_phc(rounds: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
+    use zeroize::Zeroizing;
 
     fn make_phc(password: &[u8], salt: &[u8], rounds: u32) -> String {
         let mut hash = vec![0u8; 32];
@@ -370,7 +381,7 @@ mod tests {
             clean_session: true,
             keep_alive: 60,
             username: username.map(Arc::from),
-            password: password.map(Bytes::copy_from_slice),
+            password: password.map(|p| Zeroizing::new(p.to_vec())),
             will: None,
         }
     }
@@ -627,5 +638,41 @@ mod tests {
             Ok(_) => panic!("strict mode should reject empty snapshot"),
         };
         assert!(err.contains("no PBKDF2 users"));
+    }
+
+    /// SAFETY_PROOF v5 §7 F2 regression: the non-strict `from_str` path
+    /// must ALSO reject mixed-rounds snapshots (it was previously a
+    /// warn-and-continue path that fell back to modal rounds and left
+    /// non-modal users timing-distinguishable).
+    #[test]
+    fn from_str_rejects_mixed_rounds_fail_closed() {
+        let phc_a = make_phc(b"pwa", b"sa", 5000);
+        let phc_b = make_phc(b"pwb", b"sb", 12000);
+        let json = format!(
+            r#"{{"users": {{
+                "alice": {{"password": "{phc_a}"}},
+                "bob": {{"password": "{phc_b}"}}
+            }}}}"#
+        );
+        let err = match JsonAuthenticator::from_str(&json) {
+            Err(e) => e,
+            Ok(_) => panic!("from_str must fail-closed on mixed rounds (F2)"),
+        };
+        assert!(
+            err.contains("distinct PBKDF2") && err.contains("rounds"),
+            "expected F2 fail-closed mixed-rounds error, got {err}"
+        );
+    }
+
+    /// F2 regression: empty / all-bcrypt snapshots STILL load through
+    /// `from_str` (only `from_str_strict` rejects those). The reject is
+    /// scoped to the actual timing-leak case: more-than-one PBKDF2 round.
+    #[test]
+    fn from_str_accepts_empty_snapshot_under_f2() {
+        let auth = JsonAuthenticator::from_str(r#"{"users":{}}"#)
+            .expect("empty snapshot is operational, F2 only rejects mixed rounds");
+        // dummy must still encode the DEFAULT_DUMMY_ROUNDS fallback
+        // so timing-equality with the unknown-user path holds.
+        assert!(auth.dummy_hash.contains("rounds="));
     }
 }

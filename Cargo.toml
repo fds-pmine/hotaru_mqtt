@@ -26,3 +26,8 @@ bytes = "1"
 bitflags = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
+# no_std-ready: drop `std`, keep `alloc` (needed for `Zeroizing<Vec<u8>>`).
+# `zeroize_derive` is a proc-macro, target-agnostic. Upstream akari/hotaru
+# no_std push (see memory `reference_akari_no_std_upstream_state.md`) means
+# we should not pull `std` here even though current callers are std-only.
+zeroize = { version = "1", default-features = false, features = ["alloc", "zeroize_derive"] }
