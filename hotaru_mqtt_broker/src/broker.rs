@@ -1005,25 +1005,47 @@ impl<W: ConnStream> Broker<W> {
                     .remove(source_tenant.as_ref(), &packet.topic)
                     .await;
             } else {
-                // SAFETY_PROOF v5 T2(a) — cap retained-message count per
-                // tenant. Over cap: drop the `store` call but DO continue
-                // fanout (the in-flight subscribers still see this publish;
-                // only the long-term retention is suppressed). Operator
-                // gets a structured warn so the leak is visible.
-                let cap = self.inner.broker_safety.max_retained_messages_per_tenant();
-                let current = self
+                // SAFETY_PROOF v5 T2(a)/T2(b) — cap retained-message COUNT
+                // and BYTES per tenant. Over either cap: drop the `store`
+                // call but DO continue fanout (the in-flight subscribers
+                // still see this publish; only the long-term retention is
+                // suppressed). Operator gets a structured warn so the leak
+                // is visible.
+                let count_cap = self.inner.broker_safety.max_retained_messages_per_tenant();
+                let byte_cap = self.inner.broker_safety.max_retained_bytes_per_tenant();
+                let current_count = self
                     .inner
                     .retained_store
                     .count(source_tenant.as_ref())
                     .await;
-                if current >= cap {
+                let current_bytes = self
+                    .inner
+                    .retained_store
+                    .bytes(source_tenant.as_ref())
+                    .await;
+                let new_bytes = packet.payload.len();
+                if current_count >= count_cap {
                     warn!(
                         target: "hotaru_mqtt_broker",
                         tenant = ?source_tenant.as_deref(),
                         topic = %packet.topic,
-                        current,
-                        cap,
-                        "retained-message cap hit: dropping store call (fanout still proceeds)"
+                        current = current_count,
+                        cap = count_cap,
+                        "retained-message count cap hit: dropping store call (fanout still proceeds)"
+                    );
+                } else if current_bytes.saturating_add(new_bytes) > byte_cap {
+                    // Pessimistic on same-topic overwrite (doesn't subtract
+                    // the replaced entry's size) — acceptable: the threat is
+                    // a single oversized retained payload, which this gate
+                    // rejects even on an empty tenant.
+                    warn!(
+                        target: "hotaru_mqtt_broker",
+                        tenant = ?source_tenant.as_deref(),
+                        topic = %packet.topic,
+                        current_bytes,
+                        new_bytes,
+                        cap = byte_cap,
+                        "retained-byte cap hit: dropping store call (fanout still proceeds)"
                     );
                 } else {
                     self.inner

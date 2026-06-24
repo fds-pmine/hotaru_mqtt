@@ -30,6 +30,15 @@ pub enum MqttError {
     /// `hotaru_mqtt_broker::SlowConsumerPolicy`); P1.B introduces the error,
     /// P3 wires the enforcement.
     Backpressure,
+    /// The client's outbound `Protocol::send` could not allocate a packet-id
+    /// because `MqttSafety.max_inflight_messages()` outstanding ack-awaiting
+    /// ops are already in flight (or the u16 id space is exhausted). Mirrors
+    /// the broker-side `max_inflight` cap (#61); closes SAFETY_PROOF F3 — the
+    /// prior infallible allocator could collide a live packet-id under a
+    /// self-inflicted flood. Caller should back off and retry after acks drain.
+    TooManyInflight {
+        limit: usize,
+    },
     /// Temporary stub for features not yet implemented. Should not appear in
     /// production code paths once Phase 2 implementation completes — new
     /// occurrences require PR review.
@@ -146,6 +155,9 @@ impl fmt::Display for MqttError {
             Self::Protocol(v) => write!(f, "protocol violation: {:?}", v),
             Self::Codec(c) => write!(f, "codec: {:?}", c),
             Self::Backpressure => f.write_str("write queue full (backpressure)"),
+            Self::TooManyInflight { limit } => {
+                write!(f, "too many inflight outbound ops (limit {})", limit)
+            }
             Self::Unsupported(m) => write!(f, "unsupported: {}", m),
         }
     }

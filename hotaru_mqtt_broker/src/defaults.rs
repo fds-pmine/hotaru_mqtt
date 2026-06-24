@@ -9,6 +9,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -134,6 +135,27 @@ struct RetainedRecord {
     qos: QoS,
 }
 
+/// One tenant's retained state: the topic→record map plus a running total
+/// of retained payload bytes. Both are `Arc` so a cloned `TenantBucket`
+/// (returned by `tenant_map`) shares the same map and counter.
+#[derive(Clone)]
+struct TenantBucket {
+    entries: Arc<DashMap<Arc<str>, RetainedRecord>>,
+    /// Running sum of `payload.len()` across `entries`. Maintained on every
+    /// `store`/`remove` so `bytes()` is O(1) — backs the
+    /// `max_retained_bytes_per_tenant` cap (SAFETY_PROOF v5 T2(b) / #74(a)).
+    bytes: Arc<AtomicUsize>,
+}
+
+impl TenantBucket {
+    fn new() -> Self {
+        Self {
+            entries: Arc::new(DashMap::new()),
+            bytes: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
 /// In-memory `RetainedStore`. Two-level keying (SAFETY_PROOF v3 U6):
 /// outer map keyed by `Option<TenantId>`, inner map keyed by topic.
 /// `matching` / `remove` / `count` walk ONLY the requesting tenant's
@@ -144,7 +166,7 @@ struct RetainedRecord {
 /// Persistence across broker restarts is out of scope — operators who need
 /// it implement [`RetainedStore`] over their own storage layer.
 pub struct DefaultRetainedStore {
-    tenants: DashMap<Option<TenantId>, Arc<DashMap<Arc<str>, RetainedRecord>>>,
+    tenants: DashMap<Option<TenantId>, TenantBucket>,
 }
 
 impl DefaultRetainedStore {
@@ -154,17 +176,14 @@ impl DefaultRetainedStore {
         }
     }
 
-    fn tenant_map(&self, tenant: Option<&TenantId>) -> Arc<DashMap<Arc<str>, RetainedRecord>> {
+    fn tenant_map(&self, tenant: Option<&TenantId>) -> TenantBucket {
         self.tenants
             .entry(tenant.cloned())
-            .or_insert_with(|| Arc::new(DashMap::new()))
+            .or_insert_with(TenantBucket::new)
             .clone()
     }
 
-    fn try_tenant_map(
-        &self,
-        tenant: Option<&TenantId>,
-    ) -> Option<Arc<DashMap<Arc<str>, RetainedRecord>>> {
+    fn try_tenant_map(&self, tenant: Option<&TenantId>) -> Option<TenantBucket> {
         self.tenants
             .get(&tenant.cloned())
             .map(|r| r.value().clone())
@@ -180,35 +199,47 @@ impl Default for DefaultRetainedStore {
 #[async_trait]
 impl RetainedStore for DefaultRetainedStore {
     async fn store(&self, tenant: Option<&TenantId>, topic: Arc<str>, payload: Bytes, qos: QoS) {
-        let inner = self.tenant_map(tenant);
-        inner.insert(topic, RetainedRecord { payload, qos });
+        let bucket = self.tenant_map(tenant);
+        let new_len = payload.len();
+        // `insert` returns the prior record (if this topic was already
+        // retained). Adjust the byte counter by the signed delta so an
+        // overwrite is accounted exactly, not double-counted.
+        let prev = bucket.entries.insert(topic, RetainedRecord { payload, qos });
+        let old_len = prev.map(|r| r.payload.len()).unwrap_or(0);
+        if new_len >= old_len {
+            bucket.bytes.fetch_add(new_len - old_len, Ordering::Relaxed);
+        } else {
+            bucket.bytes.fetch_sub(old_len - new_len, Ordering::Relaxed);
+        }
     }
 
     async fn remove(&self, tenant: Option<&TenantId>, topic: &str) {
-        let Some(inner) = self.try_tenant_map(tenant) else {
+        let Some(bucket) = self.try_tenant_map(tenant) else {
             return;
         };
         // Borrow-walk only THIS tenant's inner map to match the topic
         // against the owned `Arc<str>` key — at most O(per-tenant N),
         // not O(global N).
         let mut victim: Option<Arc<str>> = None;
-        for e in inner.iter() {
+        for e in bucket.entries.iter() {
             if e.key().as_ref() == topic {
                 victim = Some(e.key().clone());
                 break;
             }
         }
-        if let Some(k) = victim {
-            inner.remove(&k);
+        if let Some(k) = victim
+            && let Some((_, rec)) = bucket.entries.remove(&k)
+        {
+            bucket.bytes.fetch_sub(rec.payload.len(), Ordering::Relaxed);
         }
     }
 
     async fn matching(&self, tenant: Option<&TenantId>, filter: &str) -> Vec<RetainedEntry> {
-        let Some(inner) = self.try_tenant_map(tenant) else {
+        let Some(bucket) = self.try_tenant_map(tenant) else {
             return Vec::new();
         };
         let mut out = Vec::new();
-        for e in inner.iter() {
+        for e in bucket.entries.iter() {
             // spec §4.7.2 is enforced by `filter_matches` — wildcards in the
             // first position MUST NOT match `$`-prefixed topics, so a
             // subscribe `#` cannot harvest retained `$SYS` entries.
@@ -226,7 +257,15 @@ impl RetainedStore for DefaultRetainedStore {
     }
 
     async fn count(&self, tenant: Option<&TenantId>) -> usize {
-        self.try_tenant_map(tenant).map(|m| m.len()).unwrap_or(0)
+        self.try_tenant_map(tenant)
+            .map(|b| b.entries.len())
+            .unwrap_or(0)
+    }
+
+    async fn bytes(&self, tenant: Option<&TenantId>) -> usize {
+        self.try_tenant_map(tenant)
+            .map(|b| b.bytes.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 }
 
@@ -413,6 +452,62 @@ mod tests {
         assert_eq!(&b[0].payload[..], b"B");
         let none = s.matching(None, "x").await;
         assert!(none.is_empty());
+    }
+
+    // SAFETY_PROOF v5 T2(b) / #74(a) — per-tenant retained byte accounting
+    // backs `BrokerSafety::max_retained_bytes_per_tenant`.
+
+    #[tokio::test]
+    async fn bytes_accumulates_across_topics() {
+        let s = DefaultRetainedStore::new();
+        assert_eq!(s.bytes(None).await, 0);
+        s.store(None, Arc::from("a"), Bytes::from_static(b"hello"), QoS::AtMostOnce)
+            .await;
+        s.store(None, Arc::from("b"), Bytes::from_static(b"hi"), QoS::AtMostOnce)
+            .await;
+        assert_eq!(s.bytes(None).await, 7); // 5 + 2
+    }
+
+    #[tokio::test]
+    async fn bytes_tracks_overwrite_delta_not_sum() {
+        let s = DefaultRetainedStore::new();
+        s.store(None, Arc::from("x"), Bytes::from_static(b"1234"), QoS::AtMostOnce)
+            .await;
+        assert_eq!(s.bytes(None).await, 4);
+        // Overwrite same topic with a shorter payload → counter shrinks, not
+        // double-counts.
+        s.store(None, Arc::from("x"), Bytes::from_static(b"9"), QoS::AtMostOnce)
+            .await;
+        assert_eq!(s.bytes(None).await, 1);
+    }
+
+    #[tokio::test]
+    async fn bytes_decrements_on_remove() {
+        let s = DefaultRetainedStore::new();
+        s.store(None, Arc::from("x"), Bytes::from_static(b"abcd"), QoS::AtMostOnce)
+            .await;
+        s.store(None, Arc::from("y"), Bytes::from_static(b"ef"), QoS::AtMostOnce)
+            .await;
+        assert_eq!(s.bytes(None).await, 6);
+        s.remove(None, "x").await;
+        assert_eq!(s.bytes(None).await, 2);
+        // Removing the empty-payload way (clear) zeroes it out.
+        s.remove(None, "y").await;
+        assert_eq!(s.bytes(None).await, 0);
+    }
+
+    #[tokio::test]
+    async fn bytes_are_tenant_scoped() {
+        let s = DefaultRetainedStore::new();
+        let ta = ten("ta");
+        let tb = ten("tb");
+        s.store(ta.as_ref(), Arc::from("x"), Bytes::from_static(b"AAAA"), QoS::AtMostOnce)
+            .await;
+        s.store(tb.as_ref(), Arc::from("x"), Bytes::from_static(b"B"), QoS::AtMostOnce)
+            .await;
+        assert_eq!(s.bytes(ta.as_ref()).await, 4);
+        assert_eq!(s.bytes(tb.as_ref()).await, 1);
+        assert_eq!(s.bytes(None).await, 0);
     }
 
     #[test]

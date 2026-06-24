@@ -10,7 +10,7 @@
 //! `DashMap` for per-packet-id inflight tracking.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
 use hotaru_core::connection::ConnStream;
@@ -20,6 +20,7 @@ use crate::channel::MqttChannel;
 use crate::error::{MqttError, Violation};
 use crate::packet::{Packet, PublishPacket, incoming_from_packet};
 use crate::request::{IncomingPublish, PacketId, QoS, SubackCode};
+use crate::safety::DEFAULT_MAX_INFLIGHT_MESSAGES;
 
 /// One-shot ack delivery slot. Each pending outbound op (P::send) registers
 /// an `AckSlot` in `Session.pending_acks` keyed by allocated packet-id, then
@@ -64,6 +65,14 @@ pub struct MqttSession {
     /// Outbound QoS≥1 inflight publishes — held for retransmit and to allow
     /// `clean_session=false` resume. Indexed by our packet-id.
     pub(crate) outbound_inflight: DashMap<u16, PublishPacket>,
+    /// Client-side cap on simultaneously-outstanding ack-awaiting outbound
+    /// ops (QoS≥1 PUBLISH + SUBSCRIBE + UNSUBSCRIBE). Seeded with the
+    /// `MqttSafety` default and overridden by `handle_client` from the
+    /// operator-configured safety. Only consulted by the client send path
+    /// (`allocate_client_packet_id`); the broker enforces its own outbound
+    /// cap against `outbound_inflight` and never reads this field. Closes
+    /// SAFETY_PROOF F3 (client self-DoS via infallible packet-id allocation).
+    max_inflight: AtomicUsize,
 }
 
 impl MqttSession {
@@ -74,19 +83,24 @@ impl MqttSession {
             qos2_recv: DashMap::new(),
             pending_acks: DashMap::new(),
             outbound_inflight: DashMap::new(),
+            max_inflight: AtomicUsize::new(DEFAULT_MAX_INFLIGHT_MESSAGES),
         })
     }
 
-    /// Allocate the next outbound packet-id. Skips 0 (spec §2.3.1) and
-    /// any id currently held in `outbound_inflight`, walking up to the
-    /// full u16 space before giving up.
+    /// Allocate the next outbound packet-id. Skips 0 (spec §2.3.1) and any id
+    /// already in use — i.e. present in `outbound_inflight` (broker fanout
+    /// in-use set) **or** `pending_acks` (client ack-await in-use set) —
+    /// walking up to the full u16 space before giving up.
     ///
     /// SAFETY_PROOF G2 / second-audit G5 close: prior implementation
     /// wrapped at `u16::MAX` without consulting inflight; under deep
     /// inflight a colliding id could evict the existing entry and a
-    /// later ack would misroute. Returns `None` only when 65 535 ids are
-    /// genuinely in flight on this session — well past any sane
-    /// receive-maximum cap.
+    /// later ack would misroute. The `pending_acks` clause is the F3
+    /// follow-on: on the client, outbound QoS≥1 publishes are tracked via
+    /// ack slots (not `outbound_inflight`), so consulting only the latter
+    /// could hand out an id that is still awaiting its PUBACK/SUBACK and
+    /// silently evict the live waiter. Returns `None` only when all 65 535
+    /// ids are jointly held — well past any sane inflight cap.
     pub fn try_allocate_packet_id(&self) -> Option<u16> {
         for _ in 0..u16::MAX {
             let raw = self
@@ -94,11 +108,47 @@ impl MqttSession {
                 .fetch_add(1, Ordering::Relaxed)
                 .wrapping_add(1);
             let id = if raw == 0 { 1 } else { raw };
-            if !self.outbound_inflight.contains_key(&id) {
+            if !self.outbound_inflight.contains_key(&id) && !self.pending_acks.contains_key(&id) {
                 return Some(id);
             }
         }
         None
+    }
+
+    /// Client-side outbound allocation gate (SAFETY_PROOF F3 / #74(b)).
+    ///
+    /// Enforces `max_inflight` before handing out a packet-id, mirroring the
+    /// broker-side `max_inflight_messages` cap (#61): if the session already
+    /// has that many ack-awaiting outbound ops outstanding, or the u16 id
+    /// space is genuinely exhausted, returns [`MqttError::TooManyInflight`]
+    /// instead of the prior infallible `allocate_packet_id` panic. An
+    /// off-by-one race under concurrent sends is tolerated — the cap is a
+    /// soft bound and `try_allocate_packet_id` is the authoritative
+    /// collision gate.
+    pub fn allocate_client_packet_id(&self) -> Result<u16, MqttError> {
+        let limit = self.max_inflight();
+        if self.outstanding_ack_count() >= limit {
+            return Err(MqttError::TooManyInflight { limit });
+        }
+        self.try_allocate_packet_id()
+            .ok_or(MqttError::TooManyInflight { limit })
+    }
+
+    /// Count of outbound ops currently awaiting an ack (the client's
+    /// in-flight set). Backs the [`Self::allocate_client_packet_id`] cap.
+    pub fn outstanding_ack_count(&self) -> usize {
+        self.pending_acks.len()
+    }
+
+    /// Override the client outbound inflight cap. Called once by
+    /// `handle_client` from `MqttSafety.max_inflight_messages()`.
+    pub fn set_max_inflight(&self, n: usize) {
+        self.max_inflight.store(n.max(1), Ordering::Relaxed);
+    }
+
+    /// Current client outbound inflight cap.
+    pub fn max_inflight(&self) -> usize {
+        self.max_inflight.load(Ordering::Relaxed)
     }
 
     /// Back-compat wrapper used on hot fanout paths where the caller is
@@ -312,5 +362,72 @@ impl OnceLockBindInfo {
 impl Default for OnceLockBindInfo {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_slot() -> AckSlot {
+        let (tx, _rx) = oneshot::channel();
+        AckSlot::Puback(tx)
+    }
+
+    #[test]
+    fn default_inflight_cap_matches_safety_default() {
+        let s = MqttSession::new();
+        assert_eq!(s.max_inflight(), DEFAULT_MAX_INFLIGHT_MESSAGES);
+    }
+
+    #[test]
+    fn set_max_inflight_clamps_zero_to_one() {
+        let s = MqttSession::new();
+        s.set_max_inflight(0);
+        // A zero cap would deadlock the client (no op could ever allocate);
+        // clamp to 1 so at least one op is always permittable.
+        assert_eq!(s.max_inflight(), 1);
+    }
+
+    #[test]
+    fn client_allocator_rejects_over_inflight_cap() {
+        // SAFETY_PROOF F3 / #74(b): once `max_inflight` ack-awaiting ops are
+        // outstanding, the next client allocation fails closed instead of
+        // panicking (old infallible `allocate_packet_id`) or colliding.
+        let s = MqttSession::new();
+        s.set_max_inflight(3);
+        for i in 1..=3u16 {
+            s.install_ack_slot(i, dummy_slot());
+        }
+        assert!(matches!(
+            s.allocate_client_packet_id(),
+            Err(MqttError::TooManyInflight { limit: 3 })
+        ));
+        // Drain one ack → capacity frees up → allocation succeeds again.
+        let _ = s.take_ack_slot(1);
+        assert!(s.allocate_client_packet_id().is_ok());
+    }
+
+    #[test]
+    fn allocator_skips_ids_awaiting_acks() {
+        // The client tracks inflight via `pending_acks`, not
+        // `outbound_inflight`; the allocator must skip ids held there or it
+        // would evict a live ack waiter (F3 collision clause).
+        let s = MqttSession::new();
+        s.install_ack_slot(1, dummy_slot());
+        s.install_ack_slot(2, dummy_slot());
+        // Counter starts at 0: 0→1 (held), 1→2 (held), 2→3 (free).
+        let id = s.try_allocate_packet_id().expect("u16 space available");
+        assert_eq!(id, 3);
+    }
+
+    #[test]
+    fn outstanding_ack_count_tracks_pending_acks() {
+        let s = MqttSession::new();
+        assert_eq!(s.outstanding_ack_count(), 0);
+        s.install_ack_slot(7, dummy_slot());
+        assert_eq!(s.outstanding_ack_count(), 1);
+        let _ = s.take_ack_slot(7);
+        assert_eq!(s.outstanding_ack_count(), 0);
     }
 }

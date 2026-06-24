@@ -46,7 +46,10 @@ pub use crate::packet::MQTT_SPEC_MAX_PACKET_SIZE as SPEC_MAX_PACKET_SIZE;
 /// who legitimately exchange larger payloads raise it explicitly via
 /// [`MqttSafety::with_max_packet_size`] (clamped to [`SPEC_MAX_PACKET_SIZE`]).
 const DEFAULT_MAX_PACKET_SIZE: usize = 1024 * 1024;
-const DEFAULT_MAX_INFLIGHT_MESSAGES: usize = 20;
+/// Default outbound inflight cap. `pub(crate)` so `MqttSession` can seed its
+/// own pre-CONNECT guard with the same value before `handle_client` overrides
+/// it from the operator-configured `MqttSafety`.
+pub(crate) const DEFAULT_MAX_INFLIGHT_MESSAGES: usize = 20;
 const DEFAULT_MAX_QUEUED_MESSAGES: usize = 1000;
 const DEFAULT_RECEIVE_MAXIMUM_INBOUND: usize = 64;
 const DEFAULT_MAX_FILTERS_PER_SUBSCRIBE: usize = 64;

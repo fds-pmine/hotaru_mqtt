@@ -233,6 +233,14 @@ where
         .ok_or_else(|| MqttError::Configuration("reader already taken".into()))?;
 
     // 2. Send CONNECT
+    // Seed the client outbound inflight cap before any send (SAFETY_PROOF
+    // F3 / #74(b)). `send_publish`/`send_subscribe`/`send_unsubscribe` share
+    // this same session handle via `acquire_channel`, so setting it here is
+    // visible to every outbound op.
+    channel
+        .session()
+        .set_max_inflight(config.safety.max_inflight_messages());
+
     let connect = build_connect(&config);
     channel.send_packet(Packet::Connect(connect))?;
 
@@ -618,7 +626,7 @@ async fn send_publish<W: ConnStream>(
     req: PublishRequest,
 ) -> Result<MqttResponse, MqttError> {
     let packet_id = if req.qos != QoS::AtMostOnce {
-        Some(channel.session().allocate_packet_id())
+        Some(channel.session().allocate_client_packet_id()?)
     } else {
         None
     };
@@ -686,7 +694,7 @@ async fn send_subscribe<W: ConnStream>(
     channel: &MqttChannel<W>,
     filters: Vec<TopicFilter>,
 ) -> Result<MqttResponse, MqttError> {
-    let packet_id = channel.session().allocate_packet_id();
+    let packet_id = channel.session().allocate_client_packet_id()?;
     let (tx, rx) = oneshot::channel();
     channel
         .session()
@@ -716,7 +724,7 @@ async fn send_unsubscribe<W: ConnStream>(
     channel: &MqttChannel<W>,
     topics: Vec<Arc<str>>,
 ) -> Result<MqttResponse, MqttError> {
-    let packet_id = channel.session().allocate_packet_id();
+    let packet_id = channel.session().allocate_client_packet_id()?;
     let (tx, rx) = oneshot::channel();
     channel
         .session()

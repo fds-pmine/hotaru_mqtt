@@ -153,6 +153,17 @@ pub trait RetainedStore: Send + Sync + 'static {
     /// `$SYS/broker/retained messages/count`.
     async fn count(&self, tenant: Option<&TenantId>) -> usize;
 
+    /// Total retained-message *payload bytes* for the tenant. Backs the
+    /// `BrokerSafety::max_retained_bytes_per_tenant` cap (SAFETY_PROOF v5
+    /// T2(b) / #74(a)). Default returns 0 so stores that don't track byte
+    /// usage silently waive the cap — operators who need byte-budget DoS
+    /// hardening MUST override this on their custom store, or rely on
+    /// [`crate::DefaultRetainedStore`] which tracks it natively. Mirrors the
+    /// silent-waive contract of [`SessionStore::count`].
+    async fn bytes(&self, _tenant: Option<&TenantId>) -> usize {
+        0
+    }
+
     /// Bulk export — akari Value channel. Default impl returns empty Dict;
     /// in-memory / disk-backed stores may override to serialize the full
     /// retained-message set for backup or migration.
