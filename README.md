@@ -20,7 +20,7 @@ A sensor that only needs to PUBLISH / SUBSCRIBE depends on `hotaru_mqtt` alone. 
 - **MQTT 3.1.1 wire codec** — CONNECT / PUBLISH / SUBSCRIBE / UNSUBSCRIBE / PINGREQ / DISCONNECT + every ack.
 - **Broker** with hand-rolled topic-filter matching (spec §4.7.2 `$`-prefix guard), per-subscriber fanout via `MqttChannel`, last-will, self-fanout suppression, multi-protocol coexistence (HTTP + MQTT on one port).
 - **Per-connection FIFO fanout coordinator** on the server side and **per-endpoint FIFO dispatcher** on the client side — preserves spec §4.6 publisher ordering under chain latency.
-- **Pluggable hooks** — `Authenticator`, `AclChecker`, `TenantResolver`, `RetainedStore`, `SessionStore`. Default impls accept-all / allow-all / single-tenant for tests and dev.
+- **Pluggable hooks** — `Authenticator`, `AclChecker`, `TenantResolver`, `RetainedStore`, `SessionStore`. `Broker::new()` is secure-by-default (`DenyAllAuthenticator`); `Broker::insecure()` explicitly opts into accept-all / allow-all dev defaults.
 - **Client session** with clean-session toggle, keep-alive, last-will, credentials, initial subscriptions, fallback inbound handler.
 - **QoS 0 / 1 / 2** with packet-id tracking via `MqttSession` / `AckSlot`.
 - **Zero-copy payloads** on `bytes::Bytes`.
@@ -60,7 +60,11 @@ use tokio::net::{TcpListener, TcpStream};
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let broker = Broker::<TcpStream>::new();
+    // `Broker::new()` is secure-by-default: it denies every CONNECT until
+    // you install a real authenticator. For production, construct with
+    // `Broker::with_authenticator(Arc::new(my_auth))` before binding.
+    // This example uses the explicit dev/test posture instead.
+    let broker = Broker::<TcpStream>::insecure();
 
     let registry = Arc::new(
         ProtocolRegistryBuilder::new()
@@ -86,7 +90,13 @@ async fn main() -> std::io::Result<()> {
 }
 ```
 
-Swap the default authenticator out with `Broker::with_authenticator(Arc::new(MyAuth))` to gate CONNECT against your own credential store. Implement `AclChecker` / `TenantResolver` / `RetainedStore` / `SessionStore` for the rest of the policy surface.
+`Broker::new()` now refuses every CONNECT until a real authenticator is installed. Use `Broker::with_authenticator(Arc::new(MyAuth))` to gate CONNECT against your own credential store; use `Broker::insecure()` only for local experiments and tests. Implement `AclChecker` / `TenantResolver` / `RetainedStore` / `SessionStore` for the rest of the policy surface.
+
+## Safety defaults
+
+- `MqttSafety::new().max_packet_size()` defaults to **1 MiB** so an unauthenticated peer cannot force a 256 MiB pre-auth allocation. Operators that need larger payloads can opt up with `with_max_packet_size(...)`; values are clamped to `SPEC_MAX_PACKET_SIZE` (`268_435_455`).
+- Writer queues, QoS-2 inbound receive maximum, outbound inflight, connection count, retained count, subscriptions per client, and persistent sessions all have finite defaults via `MqttSafety` / `BrokerSafety`.
+- `Broker::new()` is fail-closed (`DenyAllAuthenticator`). `Broker::insecure()` is the explicit accept-all / allow-all development escape hatch.
 
 ## Client
 
@@ -145,7 +155,7 @@ Runs:
 | `broker`    | `Broker`, `SubscriberEntry`, `RetainedMessage`, filter matching with `$` guard. |
 | `protocol`  | `MqttServerProtocol`, `MQTT_SERVER` alias, per-connection FIFO fanout worker.   |
 | `traits`    | `Authenticator`, `AclChecker`, `TenantResolver`, `RetainedStore`, `SessionStore`. |
-| `defaults`  | `AcceptAllAuthenticator`, `AllowAllAclChecker`, `SingleTenantResolver`.         |
+| `defaults`  | `DenyAllAuthenticator`, explicit `AcceptAllAuthenticator` / `AllowAllAclChecker` dev defaults, `SingleTenantResolver`. |
 | `safety`    | `BrokerSafety` resource limits + `SlowConsumerPolicy`.                          |
 | `statics`   | `BROKER_STATICS_KEY` runtime statics constant.                                  |
 
