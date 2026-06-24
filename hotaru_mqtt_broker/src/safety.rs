@@ -28,6 +28,13 @@ pub struct BrokerSafety {
     /// the `RetainedStore::store` call (fanout still delivers).
     /// `None` = unlimited; default is 65_536.
     max_retained_messages_per_tenant: Option<usize>,
+    /// SAFETY_PROOF v5 T2(b) / #74(a): cap total retained-message *bytes*
+    /// per tenant. The count cap alone bounds entry *number* but not size —
+    /// 65_536 entries × the 1 MiB packet ceiling is ~64 GiB worst case. A
+    /// `retain=1` publish whose payload would push the tenant's retained
+    /// byte total past this cap skips the `store` call (fanout still
+    /// delivers). `None` = unlimited; default is 16 MiB.
+    max_retained_bytes_per_tenant: Option<usize>,
     /// SAFETY_PROOF v5 T2(c): cap total subscriptions per client. A
     /// SUBSCRIBE filter that would push the client past this cap gets
     /// `SubackCode::Failure` instead of `Granted`. `None` = unlimited;
@@ -84,6 +91,7 @@ const DEFAULT_MAX_QUEUED: usize = 1000;
 const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_RETAINED_PER_TENANT: usize = 65_536;
+const DEFAULT_MAX_RETAINED_BYTES_PER_TENANT: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_SUBS_PER_CLIENT: usize = 1_024;
 const DEFAULT_MAX_PERSISTENT_PER_TENANT: usize = 4_096;
 
@@ -117,6 +125,11 @@ impl BrokerSafety {
     pub fn max_retained_messages_per_tenant(&self) -> usize {
         self.max_retained_messages_per_tenant
             .unwrap_or(DEFAULT_MAX_RETAINED_PER_TENANT)
+    }
+
+    pub fn max_retained_bytes_per_tenant(&self) -> usize {
+        self.max_retained_bytes_per_tenant
+            .unwrap_or(DEFAULT_MAX_RETAINED_BYTES_PER_TENANT)
     }
 
     pub fn max_subscriptions_per_client(&self) -> usize {
@@ -158,6 +171,11 @@ impl BrokerSafety {
 
     pub fn with_max_retained_messages_per_tenant(mut self, n: usize) -> Self {
         self.max_retained_messages_per_tenant = Some(n);
+        self
+    }
+
+    pub fn with_max_retained_bytes_per_tenant(mut self, n: usize) -> Self {
+        self.max_retained_bytes_per_tenant = Some(n);
         self
     }
 
@@ -208,6 +226,7 @@ mod tests {
     fn v5_caps_have_sensible_secure_defaults() {
         let bs = BrokerSafety::new();
         assert_eq!(bs.max_retained_messages_per_tenant(), 65_536);
+        assert_eq!(bs.max_retained_bytes_per_tenant(), 16 * 1024 * 1024);
         assert_eq!(bs.max_subscriptions_per_client(), 1_024);
         assert_eq!(bs.max_persistent_sessions_per_tenant(), 4_096);
     }
@@ -216,9 +235,11 @@ mod tests {
     fn v5_caps_round_trip_through_builders() {
         let bs = BrokerSafety::new()
             .with_max_retained_messages_per_tenant(7)
+            .with_max_retained_bytes_per_tenant(99)
             .with_max_subscriptions_per_client(13)
             .with_max_persistent_sessions_per_tenant(21);
         assert_eq!(bs.max_retained_messages_per_tenant(), 7);
+        assert_eq!(bs.max_retained_bytes_per_tenant(), 99);
         assert_eq!(bs.max_subscriptions_per_client(), 13);
         assert_eq!(bs.max_persistent_sessions_per_tenant(), 21);
     }
