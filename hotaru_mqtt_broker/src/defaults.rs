@@ -46,6 +46,31 @@ impl Authenticator for AcceptAllAuthenticator {
 }
 
 // ============================================================================
+// DenyAllAuthenticator
+// ============================================================================
+
+/// Authenticator that rejects every CONNECT with `NotAuthorized`. This is the
+/// secure-by-default authenticator wired by [`crate::broker::Broker::new`]
+/// (attack-surface finding AS2): an operator who forgets to install a real
+/// authenticator gets a broker that refuses all clients rather than one that
+/// silently accepts every anonymous connection. Swap in a real
+/// [`Authenticator`] via `Broker::with_authenticator(...)`, or opt into the
+/// open dev defaults explicitly with `Broker::insecure()`.
+pub struct DenyAllAuthenticator;
+
+#[async_trait]
+impl Authenticator for DenyAllAuthenticator {
+    async fn authenticate(
+        &self,
+        _tenant: Option<&TenantId>,
+        _connect: &ConnectPacket,
+        _remote_addr: Option<SocketAddr>,
+    ) -> AuthResult {
+        AuthResult::reject(hotaru_mqtt::packet::ConnackReturnCode::NotAuthorized)
+    }
+}
+
+// ============================================================================
 // AllowAllAclChecker
 // ============================================================================
 

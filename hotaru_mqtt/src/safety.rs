@@ -32,8 +32,20 @@ pub struct MqttSafety {
 
 // ── Default constants ─────────────────────────────────────────────
 
-/// Spec §2.2.3 hard cap (4-byte VBI remaining-length max).
-const DEFAULT_MAX_PACKET_SIZE: usize = 268_435_455;
+/// Spec §2.2.3 hard cap (4-byte VBI remaining-length max). This is the
+/// absolute ceiling the wire format can express; it is NOT a safe default
+/// because a single 5-byte fixed header can declare a ~256 MiB body and
+/// force `read_packet` to `vec![0u8; remaining]` BEFORE authentication
+/// (attack-surface finding AS1). We therefore default well below it and
+/// only widen on explicit operator opt-in.
+pub use crate::packet::MQTT_SPEC_MAX_PACKET_SIZE as SPEC_MAX_PACKET_SIZE;
+
+/// Secure default packet-size cap (1 MiB). Chosen so an unconfigured
+/// `MqttSafety::new()` cannot be coerced into a multi-hundred-MiB
+/// per-connection allocation by an unauthenticated peer (AS1). Operators
+/// who legitimately exchange larger payloads raise it explicitly via
+/// [`MqttSafety::with_max_packet_size`] (clamped to [`SPEC_MAX_PACKET_SIZE`]).
+const DEFAULT_MAX_PACKET_SIZE: usize = 1024 * 1024;
 const DEFAULT_MAX_INFLIGHT_MESSAGES: usize = 20;
 const DEFAULT_MAX_QUEUED_MESSAGES: usize = 1000;
 const DEFAULT_RECEIVE_MAXIMUM_INBOUND: usize = 64;
@@ -46,6 +58,11 @@ impl MqttSafety {
 
     // ── Getters with secure defaults ────────────────────────────
 
+    /// Maximum declared remaining-length the codec will accept before
+    /// allocating the body buffer. Defaults to 1 MiB, NOT the spec hard
+    /// cap, to keep an unconfigured broker from being OOM-poked by an
+    /// unauthenticated peer (AS1). The spec ceiling is still enforced
+    /// upstream in `read_remaining_length`.
     pub fn max_packet_size(&self) -> usize {
         self.max_packet_size.unwrap_or(DEFAULT_MAX_PACKET_SIZE)
     }
@@ -78,7 +95,11 @@ impl MqttSafety {
     // ── Builder-style setters ───────────────────────────────────
 
     pub fn with_max_packet_size(mut self, n: usize) -> Self {
-        self.max_packet_size = Some(n);
+        // Values above the MQTT remaining-length wire ceiling cannot be
+        // expressed by a conforming packet. Clamp so `max_packet_size()`
+        // always advertises a meaningful cap while still allowing callers
+        // to opt all the way up to the spec maximum.
+        self.max_packet_size = Some(n.min(SPEC_MAX_PACKET_SIZE));
         self
     }
 
@@ -115,12 +136,22 @@ mod tests {
     #[test]
     fn defaults_are_secure() {
         let s = MqttSafety::new();
-        assert_eq!(s.max_packet_size(), 268_435_455);
+        // AS1: the secure default is 1 MiB, deliberately far below the spec
+        // hard cap so an unauthenticated peer cannot force a ~256 MiB
+        // pre-auth allocation on an unconfigured broker.
+        assert_eq!(s.max_packet_size(), 1024 * 1024);
+        assert!(s.max_packet_size() < SPEC_MAX_PACKET_SIZE);
         assert_eq!(s.max_inflight_messages(), 20);
         assert_eq!(s.max_queued_messages(), 1000);
         assert!(s.worker_idle_timeout().is_none());
         assert_eq!(s.receive_maximum_inbound(), 64);
         assert_eq!(s.max_filters_per_subscribe(), 64);
+    }
+
+    #[test]
+    fn max_packet_size_override_clamps_to_spec_ceiling() {
+        let s = MqttSafety::new().with_max_packet_size(usize::MAX);
+        assert_eq!(s.max_packet_size(), SPEC_MAX_PACKET_SIZE);
     }
 
     #[test]

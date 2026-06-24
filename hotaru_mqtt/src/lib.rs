@@ -50,7 +50,7 @@ pub use request::{
     Credentials, IncomingPublish, MqttRequest, MqttResponse, PacketId, PublishAck, PublishRequest,
     QoS, SubackCode, TopicFilter, WillMessage,
 };
-pub use safety::MqttSafety;
+pub use safety::{MqttSafety, SPEC_MAX_PACKET_SIZE};
 pub use session::{AckSlot, BindInfo, MqttSession, ack_inbound_publish_pre_chain};
 pub use topic::{
     is_dollar_prefixed_first_segment, parse_publish_topic, parse_subscribe_filter,

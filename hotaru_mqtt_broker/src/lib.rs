@@ -43,7 +43,7 @@ pub use auth::{
 pub use broker::{Broker, RetainedMessage, ShutdownReport, SubscriberEntry};
 pub use defaults::{
     AcceptAllAuthenticator, AllowAllAclChecker, DefaultRetainedStore, DefaultSessionStore,
-    SingleTenantResolver,
+    DenyAllAuthenticator, SingleTenantResolver,
 };
 pub use protocol::{DefaultMqttTransport, MQTT_SERVER, MqttServerProtocol};
 #[cfg(feature = "tls")]

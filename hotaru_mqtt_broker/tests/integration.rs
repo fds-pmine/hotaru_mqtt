@@ -32,7 +32,7 @@ use hotaru_mqtt_broker::{
 /// Spin up a broker on a random port via raw TCP accept loop. Returns the
 /// bound port plus the broker handle (for in-process assertions).
 async fn start_broker() -> (u16, Broker<TcpStream>) {
-    start_broker_with(Broker::<TcpStream>::new()).await
+    start_broker_with(Broker::<TcpStream>::insecure()).await
 }
 
 async fn start_broker_with(broker: Broker<TcpStream>) -> (u16, Broker<TcpStream>) {
@@ -127,7 +127,7 @@ fn connect_packet_persistent(client_id: &str) -> Packet {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn smoke_lib_constructible() {
-    let _broker = Broker::<TcpStream>::new();
+    let _broker = Broker::<TcpStream>::insecure();
     let _config = hotaru_mqtt::MqttClientConfig::new("test-client");
     let _server = MQTT_SERVER::new();
     let _client = hotaru_mqtt::MQTT::new();
@@ -157,7 +157,7 @@ impl TenantResolver for PrefixTenantResolver {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cross_tenant_fanout_is_blocked() {
-    let broker = Broker::<TcpStream>::new().with_tenant_resolver(Arc::new(PrefixTenantResolver));
+    let broker = Broker::<TcpStream>::insecure().with_tenant_resolver(Arc::new(PrefixTenantResolver));
     let (port, _broker) = start_broker_with(broker).await;
 
     // Subscriber in tenant `ta`, listening on the wildcard `#`.
@@ -212,7 +212,7 @@ async fn cross_tenant_fanout_is_blocked() {
 async fn same_tenant_fanout_still_works() {
     // Counter-positive control: with PrefixTenantResolver in place, two
     // clients in the SAME tenant DO see each other's traffic.
-    let broker = Broker::<TcpStream>::new().with_tenant_resolver(Arc::new(PrefixTenantResolver));
+    let broker = Broker::<TcpStream>::insecure().with_tenant_resolver(Arc::new(PrefixTenantResolver));
     let (port, _broker) = start_broker_with(broker).await;
 
     let (mut sub_r, mut sub_w) = connect_raw(port).await;
@@ -506,7 +506,7 @@ impl AclChecker for DenyBlockedPubOnSecretAcl {
 /// DoS retained state for topics it had no publish permission on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn acl_denied_publisher_cannot_modify_retained_store() {
-    let broker = Broker::<TcpStream>::new().with_acl_checker(Arc::new(DenyBlockedPubOnSecretAcl));
+    let broker = Broker::<TcpStream>::insecure().with_acl_checker(Arc::new(DenyBlockedPubOnSecretAcl));
     let (port, _broker) = start_broker_with(broker).await;
 
     // 1. allowed-pub seeds the retained store on `secret/z` with "original".
@@ -841,7 +841,7 @@ async fn reconnect_retransmits_unacked_qos1_with_dup() {
 async fn fanout_enforces_max_inflight_messages_per_subscriber() {
     // Cap inflight at 2 for an aggressive test. Use the default
     // SlowConsumerPolicy = DisconnectLaggard so QoS≥1 over-cap closes.
-    let broker = Broker::<TcpStream>::new()
+    let broker = Broker::<TcpStream>::insecure()
         .with_broker_safety(BrokerSafety::new().with_max_inflight_messages(2));
     let (port, _broker) = start_broker_with(broker).await;
 
@@ -958,7 +958,7 @@ impl AclChecker for DenyPubOnWillTopicAcl {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn will_publish_blocked_by_acl_at_dispatch() {
-    let broker = Broker::<TcpStream>::new().with_acl_checker(Arc::new(DenyPubOnWillTopicAcl));
+    let broker = Broker::<TcpStream>::insecure().with_acl_checker(Arc::new(DenyPubOnWillTopicAcl));
     let (port, _broker) = start_broker_with(broker).await;
 
     // Subscriber on the Will topic.
@@ -1021,7 +1021,7 @@ async fn will_publish_blocked_by_acl_at_dispatch() {
 /// this path: cap-check + fallible allocator + SlowConsumerPolicy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publish_sys_retained_respects_max_inflight_cap() {
-    let broker = Broker::<TcpStream>::new()
+    let broker = Broker::<TcpStream>::insecure()
         .with_broker_safety(BrokerSafety::new().with_max_inflight_messages(2));
     let (port, broker) = start_broker_with(broker).await;
 
@@ -1101,7 +1101,7 @@ async fn publish_sys_retained_respects_max_inflight_cap() {
 async fn takeover_closes_prior_session_and_releases_slot() {
     // Cap connections at 2 so we can verify the count without spinning
     // up tons of state.
-    let broker = Broker::<TcpStream>::new().with_broker_safety(
+    let broker = Broker::<TcpStream>::insecure().with_broker_safety(
         BrokerSafety::new()
             .with_max_connections(2)
             .with_shutdown_grace_period(Duration::from_millis(500)),
@@ -1212,7 +1212,7 @@ async fn client_cannot_publish_to_dollar_sys_even_non_retained() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_drains_active_sessions_within_grace_period() {
-    let broker = Broker::<TcpStream>::new().with_broker_safety(
+    let broker = Broker::<TcpStream>::insecure().with_broker_safety(
         BrokerSafety::new().with_shutdown_grace_period(Duration::from_millis(500)),
     );
     let (port, broker) = start_broker_with(broker).await;
@@ -1318,7 +1318,7 @@ async fn broker_rejects_empty_id_with_persistent_session() {
 async fn broker_rejects_connect_at_max_connections() {
     // Stage A P1.B: BrokerSafety.max_connections enforced before CONNACK.
     let broker =
-        Broker::<TcpStream>::new().with_broker_safety(BrokerSafety::new().with_max_connections(1));
+        Broker::<TcpStream>::insecure().with_broker_safety(BrokerSafety::new().with_max_connections(1));
     let (port, broker) = start_broker_with(broker).await;
 
     // First CONNECT — should succeed.
@@ -1365,6 +1365,28 @@ async fn connect_returns_connack() {
             assert_eq!(return_code, ConnackReturnCode::Accepted);
         }
         other => panic!("expected CONNACK, got {:?}", other),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn broker_new_denies_anonymous_connect_by_default() {
+    // AS2: `Broker::new()` is fail-closed (DenyAllAuthenticator). A plain
+    // CONNECT with no real authenticator installed MUST be refused with
+    // NotAuthorized rather than silently accepted.
+    let (port, _broker) = start_broker_with(Broker::<TcpStream>::new()).await;
+
+    let (mut reader, mut writer) = connect_raw(port).await;
+    send_packet(&mut writer, &connect_packet("denied-by-default")).await;
+
+    match read_packet(&mut reader).await {
+        Packet::Connack(ConnackPacket {
+            session_present,
+            return_code,
+        }) => {
+            assert!(!session_present);
+            assert_eq!(return_code, ConnackReturnCode::NotAuthorized);
+        }
+        other => panic!("expected CONNACK(NotAuthorized), got {:?}", other),
     }
 }
 
@@ -1667,7 +1689,7 @@ async fn self_fanout_suppression() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn broker_constructs_cleanly() {
-    let _broker = Broker::<TcpStream>::new();
+    let _broker = Broker::<TcpStream>::insecure();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1839,7 +1861,7 @@ async fn start_multi_protocol_broker() -> (u16, Broker<TcpStream>) {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let broker = Broker::<TcpStream>::new();
+    let broker = Broker::<TcpStream>::insecure();
 
     let registry: ProtocolEntryRegistry<hotaru_core::connection::tcp::TcpTransport> =
         ProtocolRegistryBuilder::new()

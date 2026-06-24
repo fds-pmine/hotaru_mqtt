@@ -28,7 +28,7 @@ use tracing::warn;
 
 use crate::defaults::{
     AcceptAllAuthenticator, AllowAllAclChecker, DefaultRetainedStore, DefaultSessionStore,
-    SingleTenantResolver, is_dollar_topic,
+    DenyAllAuthenticator, SingleTenantResolver, is_dollar_topic,
 };
 use crate::safety::BrokerSafety;
 use crate::traits::{
@@ -92,31 +92,52 @@ impl SubscriptionTree {
     }
 
     fn subscribe(&self, tenant: Option<TenantId>, client_id: Arc<str>, filter: Arc<str>, qos: QoS) {
+        // U4 correctness: write into the inner set while still holding the
+        // outer shard guard from `entry(...)`. This serialises a concurrent
+        // `subscribe` against the `remove_if` / `retain` reclaim paths below
+        // — they all contend on the same outer shard lock, so a reclaim can
+        // never observe an empty set, drop the bucket, and then lose a
+        // subscription a racing `subscribe` was about to add.
         let set = self
             .subs
             .entry((tenant, filter))
-            .or_insert_with(|| Arc::new(DashMap::new()))
-            .clone();
+            .or_insert_with(|| Arc::new(DashMap::new()));
         set.insert(client_id, qos);
     }
 
     fn unsubscribe(&self, tenant: &Option<TenantId>, client_id: &Arc<str>, filter: &str) {
         // DashMap key is (tenant, Arc<str>); we only have &str for the
-        // filter, so iterate the bucket the cheap way: lookup via owned Arc.
+        // filter, so reconstruct the owned key to look the bucket up.
         let key = (tenant.clone(), Arc::<str>::from(filter));
+        // U4: reclaim the outer (tenant, filter) entry once its inner set
+        // empties. Without this, a client that subscribes to many DISTINCT
+        // filters and unsubscribes leaves empty `Arc<DashMap>` shells behind
+        // forever, so `subs` grows without bound and `matching` — which is
+        // O(#filters) — slows every publish (a soft DoS). `remove_if` runs
+        // the emptiness check while holding the shard lock, so we never drop
+        // a bucket a concurrent `subscribe` just re-populated.
         if let Some(set) = self.subs.get(&key) {
             set.remove(client_id);
         }
+        self.subs.remove_if(&key, |_, set| set.is_empty());
     }
 
     /// Remove all subscriptions belonging to one client within a tenant
     /// (used on disconnect / clean_session=true).
     fn remove_client(&self, tenant: &Option<TenantId>, client_id: &Arc<str>) {
+        // First drop this client from every bucket within the tenant.
         for entry in self.subs.iter() {
             if &entry.key().0 == tenant {
                 entry.value().remove(client_id);
             }
         }
+        // U4: then reclaim any buckets this left empty. Done as a second
+        // pass via `retain` (the write path) so we don't remove entries
+        // while holding the read guard from the loop above. Only this
+        // tenant's now-empty buckets are dropped; other tenants' buckets
+        // are untouched (we never emptied them).
+        self.subs
+            .retain(|key, set| &key.0 != tenant || !set.is_empty());
     }
 
     /// Return (client_id, max_qos) for every subscription within `tenant`
@@ -136,6 +157,14 @@ impl SubscriptionTree {
             }
         }
         results
+    }
+
+    /// Number of distinct `(tenant, filter)` buckets currently tracked.
+    /// Used by the U4 leak-reclaim regression tests to assert empty buckets
+    /// are removed rather than accumulating.
+    #[cfg(test)]
+    fn filter_bucket_count(&self) -> usize {
+        self.subs.len()
     }
 }
 
@@ -241,25 +270,59 @@ impl<W: ConnStream> Default for Broker<W> {
 }
 
 impl<W: ConnStream> Broker<W> {
+    /// Construct a broker that is **secure by default** (attack-surface
+    /// finding AS2). The default authenticator is [`DenyAllAuthenticator`],
+    /// so a broker that is bound to the network without an explicit
+    /// `Broker::with_authenticator(...)` constructor call refuses every
+    /// CONNECT with `NotAuthorized` instead of silently accepting anonymous
+    /// clients.
+    ///
+    /// The ACL checker still defaults to [`AllowAllAclChecker`]: once a
+    /// client has authenticated, authorization is the operator's policy
+    /// choice, and a deny-all ACL would make even a correctly-authenticated
+    /// client unable to do anything. Install [`with_acl_checker`] for
+    /// per-topic authorization.
+    ///
+    /// For dev / tests / throwaway scaffolds that genuinely want the old
+    /// "accept everyone" behaviour, call [`Broker::insecure`] — it is named
+    /// to make the choice explicit and greppable in review.
+    ///
+    /// [`with_acl_checker`]: Broker::with_acl_checker
     pub fn new() -> Self {
-        // SAFETY_PROOF v6 F1: `Broker::new()` wires the test-only open
-        // defaults (`AcceptAllAuthenticator` + `AllowAllAclChecker`).
-        // These accept every client and permit every publish / subscribe.
-        // Deployments that reach the network MUST swap both via
-        // `with_authenticator` + `with_acl_checker` (and ideally a real
-        // `TenantResolver` too) BEFORE cloning the broker into runtime
-        // statics (per A4 builder-then-clone discipline). Emit a loud
-        // structured warn so the unsafe-default state is operator-visible
-        // at startup instead of being a silent documentation footnote.
-        // The warn is a one-shot at construction; configure your tracing
-        // subscriber to silence it for tests if needed.
+        Self::build(
+            Arc::new(DenyAllAuthenticator),
+            Arc::new(AllowAllAclChecker),
+            Arc::new(SingleTenantResolver),
+            Arc::new(DefaultRetainedStore::new()),
+            Arc::new(DefaultSessionStore::new()),
+            MqttSafety::new(),
+            BrokerSafety::new(),
+        )
+    }
+
+    /// Construct a broker with the **open** dev/test defaults:
+    /// [`AcceptAllAuthenticator`] + [`AllowAllAclChecker`]. Accepts every
+    /// client and permits every publish / subscribe.
+    ///
+    /// **DO NOT use on a network-reachable deployment.** Production code
+    /// MUST use [`Broker::new`] (deny-all) and install a real authenticator
+    /// via `Broker::with_authenticator(...)`. This constructor exists so
+    /// tests and local scaffolds opt into the insecure posture explicitly
+    /// rather than inheriting it silently from `new()` (attack-surface
+    /// finding AS2).
+    ///
+    /// A loud one-shot `warn!` fires at construction so the open posture is
+    /// operator-visible if it ever reaches a real process; silence it in
+    /// tests via your tracing subscriber if it is noisy.
+    pub fn insecure() -> Self {
         warn!(
             target: "hotaru_mqtt_broker",
             authenticator = "AcceptAllAuthenticator",
             acl_checker = "AllowAllAclChecker",
-            "Broker::new() initialized with test-only open defaults — \
-             replace via Broker::new().with_authenticator(...).with_acl_checker(...) \
-             before binding to a network. See SAFETY_PROOF v6 F1."
+            "Broker::insecure() initialized with open accept-all/allow-all \
+             defaults — every client is accepted and every publish/subscribe \
+             permitted. Use Broker::with_authenticator(...) before \
+             binding to a network. See SAFETY_PROOF AS2."
         );
         Self::build(
             Arc::new(AcceptAllAuthenticator),
@@ -1357,5 +1420,89 @@ mod tests {
         assert!(filter_matches("$SYS/broker/version", &sys));
         assert!(filter_matches("$SYS/#", &sys));
         assert!(filter_matches("$SYS/+/version", &sys));
+    }
+
+    #[test]
+    fn subs_map_shrinks_after_unsubscribe_all() {
+        // U4: subscribing to many DISTINCT filters then unsubscribing each
+        // must leave NO residual empty buckets. Pre-fix, `unsubscribe` only
+        // emptied the inner set and `subs` grew without bound.
+        let tree = SubscriptionTree::new();
+        let t = ten("t");
+        let alice: Arc<str> = Arc::from("alice");
+
+        for i in 0..100 {
+            tree.subscribe(
+                t.clone(),
+                alice.clone(),
+                Arc::from(format!("a/{i}").as_str()),
+                QoS::AtMostOnce,
+            );
+        }
+        assert_eq!(tree.filter_bucket_count(), 100);
+
+        for i in 0..100 {
+            tree.unsubscribe(&t, &alice, &format!("a/{i}"));
+        }
+        assert_eq!(
+            tree.filter_bucket_count(),
+            0,
+            "empty (tenant, filter) buckets must be reclaimed on unsubscribe"
+        );
+    }
+
+    #[test]
+    fn unsubscribe_keeps_bucket_with_other_subscribers() {
+        // U4 must NOT over-reclaim: a bucket with a remaining subscriber
+        // stays, and the still-subscribed client keeps matching.
+        let tree = SubscriptionTree::new();
+        let t = ten("t");
+        let alice: Arc<str> = Arc::from("alice");
+        let bob: Arc<str> = Arc::from("bob");
+        let filter: Arc<str> = Arc::from("shared/topic");
+
+        tree.subscribe(t.clone(), alice.clone(), filter.clone(), QoS::AtMostOnce);
+        tree.subscribe(t.clone(), bob.clone(), filter.clone(), QoS::AtMostOnce);
+        assert_eq!(tree.filter_bucket_count(), 1);
+
+        tree.unsubscribe(&t, &alice, "shared/topic");
+        assert_eq!(tree.filter_bucket_count(), 1, "bucket still has bob");
+        let m = tree.matching(&t, "shared/topic");
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].0.as_ref(), "bob");
+
+        tree.unsubscribe(&t, &bob, "shared/topic");
+        assert_eq!(tree.filter_bucket_count(), 0, "last subscriber gone → reclaim");
+    }
+
+    #[test]
+    fn remove_client_reclaims_empty_buckets_tenant_scoped() {
+        // U4: disconnect (remove_client) must reclaim buckets it empties,
+        // but only within the client's tenant and only when no other
+        // subscriber remains.
+        let tree = SubscriptionTree::new();
+        let ta = ten("ta");
+        let tb = ten("tb");
+        let alice: Arc<str> = Arc::from("alice");
+        let bob: Arc<str> = Arc::from("bob");
+
+        // Tenant A: alice alone on a/f1, alice+bob share a/shared.
+        tree.subscribe(ta.clone(), alice.clone(), Arc::from("a/f1"), QoS::AtMostOnce);
+        tree.subscribe(ta.clone(), alice.clone(), Arc::from("a/shared"), QoS::AtMostOnce);
+        tree.subscribe(ta.clone(), bob.clone(), Arc::from("a/shared"), QoS::AtMostOnce);
+        // Tenant B: a same-named alice on her own filter — must be untouched.
+        tree.subscribe(tb.clone(), alice.clone(), Arc::from("b/f1"), QoS::AtMostOnce);
+        // Buckets: a/f1, a/shared (alice+bob share one bucket), b/f1 = 3.
+        assert_eq!(tree.filter_bucket_count(), 3);
+
+        tree.remove_client(&ta, &alice);
+
+        // a/f1 emptied → reclaimed; a/shared kept (bob remains); b/f1 kept.
+        assert_eq!(tree.filter_bucket_count(), 2);
+        assert!(tree.matching(&ta, "a/f1").is_empty());
+        let shared = tree.matching(&ta, "a/shared");
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].0.as_ref(), "bob");
+        assert_eq!(tree.matching(&tb, "b/f1").len(), 1, "other tenant untouched");
     }
 }

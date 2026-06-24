@@ -26,7 +26,7 @@ use hotaru_mqtt_broker::{BROKER_STATICS_KEY, Broker, MQTT_SERVER};
 async fn start_broker() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let broker = Broker::<TcpStream>::new();
+    let broker = Broker::<TcpStream>::insecure();
 
     let registry: ProtocolEntryRegistry<hotaru_core::connection::tcp::TcpTransport> =
         ProtocolRegistryBuilder::new()
