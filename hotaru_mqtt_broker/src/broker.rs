@@ -10,7 +10,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -66,6 +66,12 @@ pub struct SubscriberEntry<W: ConnStream> {
     /// Username from the CONNECT packet, used by `AclChecker` for
     /// per-action authorization. None when CONNECT carried no creds.
     pub username: Option<Arc<str>>,
+    /// V3 — monotonic generation id assigned by `register_session` from
+    /// `BrokerInner.next_connection_id`. `unregister_session` compares
+    /// against this so a late-running prior `handle_server` exit cannot
+    /// remove (or wipe / will-fire) the session a takeover has already
+    /// installed in this slot.
+    pub connection_id: u64,
 }
 
 /// Composite key for every broker-internal state container. Two tenants
@@ -253,6 +259,11 @@ struct BrokerInner<W: ConnStream> {
     /// `broker_safety.max_connections()` before accepting CONNECT; the
     /// handle_server loop decrements via `release_connection` on exit.
     active_connections: AtomicUsize,
+    /// V3 — broker-wide monotonic counter for `SubscriberEntry.connection_id`.
+    /// Wraps in u64 space (never reached at any realistic broker uptime), so
+    /// the generation guard in `unregister_session` is collision-free for
+    /// the lifetime of the process.
+    next_connection_id: AtomicU64,
 }
 
 impl<W: ConnStream> Clone for Broker<W> {
@@ -411,6 +422,7 @@ impl<W: ConnStream> Broker<W> {
                 safety,
                 broker_safety,
                 active_connections: AtomicUsize::new(0),
+                next_connection_id: AtomicU64::new(0),
             }),
         }
     }
@@ -532,7 +544,7 @@ impl<W: ConnStream> Broker<W> {
         channel: MqttChannel<W>,
         will: Option<WillMessage>,
         clean_session: bool,
-    ) -> bool {
+    ) -> (bool, u64) {
         let key = (tenant.clone(), client_id.clone());
         // Takeover semantics (spec §3.1.4-2 + SAFETY_PROOF v3 U2): the
         // prior session for `(tenant, client_id)` MUST terminate "as soon
@@ -543,8 +555,20 @@ impl<W: ConnStream> Broker<W> {
         // prior loop's `select!` wakes on its `shutdown` notify and exits.
         // The prior loop runs through to `release_connection()` at its
         // own scope exit; this code path MUST NOT double-release.
+        //
+        // V3 — prev's cleanup (Will dispatch + persistent save + sub
+        // teardown) runs SYNCHRONOUSLY here, BEFORE the new entry is
+        // installed. Without this, prev's eventual `unregister_session`
+        // call (now generation-guarded) would no-op and prev's Will would
+        // never fire — §3.1.2.5 requires the Will to publish whenever the
+        // network connection closes non-gracefully, and takeover closes
+        // prev non-gracefully by construction. Doing prev's persistent
+        // save here also means the very next clean_session=false load
+        // below can pick up prev's freshly-stashed state instead of an
+        // older snapshot (intent of §3.1.2.4).
         if let Some((_, prev)) = self.inner.sessions.remove(&key) {
             prev.channel.close();
+            self.cleanup_session_state(&client_id, prev, false).await;
         }
 
         let mut session_present = false;
@@ -571,6 +595,10 @@ impl<W: ConnStream> Broker<W> {
             session_present = true;
         }
 
+        let connection_id = self
+            .inner
+            .next_connection_id
+            .fetch_add(1, Ordering::Relaxed);
         self.inner.sessions.insert(
             key,
             SubscriberEntry {
@@ -580,10 +608,11 @@ impl<W: ConnStream> Broker<W> {
                 clean_session,
                 tenant,
                 username,
+                connection_id,
             },
         );
 
-        session_present
+        (session_present, connection_id)
     }
 
     /// Look up the tenant for a registered `(tenant, client_id)` key. With
@@ -606,22 +635,48 @@ impl<W: ConnStream> Broker<W> {
     ///   §3.1.2.4) + persist the [`MqttSession`] handle so a later
     ///   reconnect with the same `client_id` can resume outbound inflight
     ///   and QoS-2 inbound half-state.
+    ///
+    /// V3 — `connection_id` is the value `register_session` returned for
+    /// this connection. The slot is removed ONLY if the entry there still
+    /// carries that id; a later-registered session (from a takeover) has
+    /// a fresh id and is left untouched. The takeover path inside
+    /// `register_session` already ran the prior connection's cleanup
+    /// synchronously, so this no-op branch is the correct outcome.
     pub async fn unregister_session(
         &self,
         tenant: &Option<TenantId>,
         client_id: &Arc<str>,
+        connection_id: u64,
         graceful: bool,
     ) {
         let key = (tenant.clone(), client_id.clone());
-        let Some((_, entry)) = self.inner.sessions.remove(&key) else {
+        let removed = self
+            .inner
+            .sessions
+            .remove_if(&key, |_, entry| entry.connection_id == connection_id);
+        let Some((_, entry)) = removed else {
             return;
         };
+        self.cleanup_session_state(client_id, entry, graceful).await;
+    }
 
-        // Capture tenant + flag BEFORE the entry is dropped. The Will's
-        // publisher username is snapshotted here (SAFETY_PROOF G5 /
-        // second-audit G6) so the downstream ACL check on Will dispatch
-        // sees the same identity the broker authenticated at CONNECT,
-        // even though `sessions[(t,c)]` is already gone.
+    /// V3 — extracted session teardown shared by `unregister_session`
+    /// (normal disconnect / read-loop error) and `register_session`'s
+    /// takeover path. The `entry` argument has already been removed from
+    /// `self.inner.sessions`; this function performs persistent-state
+    /// handling, subscription cleanup, session wipe (clean-session only),
+    /// and Will dispatch.
+    ///
+    /// The Will's publisher username is the entry's captured username, so
+    /// the downstream ACL check sees the same identity the broker
+    /// authenticated at CONNECT (SAFETY_PROOF G5 / second-audit G6) even
+    /// though `sessions[(t,c)]` is already gone by the time this runs.
+    async fn cleanup_session_state(
+        &self,
+        client_id: &Arc<str>,
+        entry: SubscriberEntry<W>,
+        graceful: bool,
+    ) {
         let session_tenant = entry.tenant.clone();
         let clean_session = entry.clean_session;
         let persisted_session = entry.channel.session().clone();
@@ -1095,10 +1150,7 @@ impl<W: ConnStream> Broker<W> {
                     session.try_allocate_packet_id()
                 };
                 match id_opt {
-                    Some(id) => {
-                        session.stash_outbound_inflight(id, packet.clone());
-                        Some(id)
-                    }
+                    Some(id) => Some(id),
                     None => {
                         // No packet-id available (cap reached or u16 space
                         // exhausted). Apply the slow-consumer policy to
@@ -1129,6 +1181,23 @@ impl<W: ConnStream> Broker<W> {
                 retain: false,
                 packet_id,
             };
+
+            // V1 — stash the SUBSCRIBER-shaped packet (adjusted), not the
+            // publisher's original. A reconnect retransmit of the stashed
+            // entry must match what we already sent: subscriber-allocated
+            // packet_id, downgraded `effective_qos`, and `retain=false`
+            // (the current-delivery copy is never retain=1 per §3.3.1.3).
+            // Stashing `packet.clone()` previously sent the publisher's
+            // packet_id / qos / retain on retransmit, leaving subscriber
+            // ACKs unable to clear the entry and possibly tripping the
+            // inflight cap. `$SYS` and retained-replay paths already do
+            // this correctly.
+            if let Some(id) = packet_id {
+                entry
+                    .channel
+                    .session()
+                    .stash_outbound_inflight(id, adjusted.clone());
+            }
 
             // P3.D: apply slow-consumer policy when the subscriber's cmd_tx
             // is full. W policy §2 covers ChannelClosed (transient) silently;

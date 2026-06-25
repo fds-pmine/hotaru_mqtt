@@ -2071,3 +2071,266 @@ async fn publisher_ordering_preserved_under_load() {
         }
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// V1 — fanout MUST stash the SUBSCRIBER-shaped (adjusted) packet, not
+// the publisher's original
+// ──────────────────────────────────────────────────────────────────────
+
+/// V1 regression — broker fanout MUST stash the adjusted PUBLISH (the
+/// subscriber-shaped one with `retain=0` per §3.3.1-9 and the broker-
+/// allocated subscriber packet_id), not the publisher's original. Prior
+/// to the fix `stash_outbound_inflight(id, packet.clone())` retained the
+/// publisher's flags, so a reconnect retransmit of an unacked QoS-1
+/// `retain=1` publish re-sent it with `retain=1`, violating MQTT-3.3.1-9
+/// (current-delivery and its retransmits must carry `retain=0` regardless
+/// of how the publisher set it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v1_retransmit_uses_stashed_adjusted_packet_retain_zero() {
+    let (port, _broker) = start_broker().await;
+
+    // Persistent subscriber at QoS 1.
+    let (mut sr1, mut sw1) = connect_raw(port).await;
+    send_packet(&mut sw1, &connect_packet_persistent("v1-sub")).await;
+    let _ = read_packet(&mut sr1).await; // CONNACK
+    send_packet(
+        &mut sw1,
+        &Packet::Subscribe(SubscribePacket {
+            packet_id: 1,
+            subscriptions: vec![TopicSubscription {
+                topic: Arc::from("v1/topic"),
+                qos: QoS::AtLeastOnce,
+            }],
+        }),
+    )
+    .await;
+    let _ = read_packet(&mut sr1).await; // SUBACK
+
+    // Publisher sends QoS-1 retain=1 — the trigger for the original bug.
+    let (mut pr, mut pw) = connect_raw(port).await;
+    send_packet(&mut pw, &connect_packet("v1-pub")).await;
+    let _ = read_packet(&mut pr).await; // CONNACK
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    send_packet(
+        &mut pw,
+        &Packet::Publish(PublishPacket {
+            topic: Arc::from("v1/topic"),
+            payload: bytes::Bytes::from_static(b"retained-q1"),
+            dup: false,
+            qos: QoS::AtLeastOnce,
+            packet_id: Some(7),
+            retain: true,
+        }),
+    )
+    .await;
+    let _ = read_packet(&mut pr).await; // PUBACK
+
+    // First delivery — current-delivery is already retain=0 (existed
+    // pre-fix via `adjusted` on the send side). Don't ACK.
+    match read_packet(&mut sr1).await {
+        Packet::Publish(p) => {
+            assert_eq!(p.topic.as_ref(), "v1/topic");
+            assert!(!p.retain, "current delivery MUST be retain=0");
+            assert!(!p.dup, "first delivery has dup=0");
+        }
+        other => panic!("expected first PUBLISH, got {other:?}"),
+    }
+
+    // Drop the TCP without PUBACK, reconnect persistent, verify the
+    // retransmit also carries retain=0 (the stashed adjusted's flag).
+    drop(sw1);
+    drop(sr1);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let (mut sr2, mut sw2) = connect_raw(port).await;
+    send_packet(&mut sw2, &connect_packet_persistent("v1-sub")).await;
+    match read_packet(&mut sr2).await {
+        Packet::Connack(c) => assert!(
+            c.session_present,
+            "persistent reconnect MUST report session_present=1"
+        ),
+        other => panic!("expected CONNACK, got {other:?}"),
+    }
+
+    match read_packet(&mut sr2).await {
+        Packet::Publish(p) => {
+            assert_eq!(p.topic.as_ref(), "v1/topic");
+            assert_eq!(&p.payload[..], b"retained-q1");
+            assert_eq!(p.qos, QoS::AtLeastOnce);
+            assert!(p.dup, "retransmitted PUBLISH MUST have dup=1");
+            assert!(
+                !p.retain,
+                "V1 — retransmit MUST carry retain=0 (stashed adjusted, \
+                 not publisher's original retain=1)"
+            );
+        }
+        other => panic!("expected retransmitted PUBLISH, got {other:?}"),
+    }
+
+    drop(pw);
+    drop(pr);
+    drop(sw2);
+    drop(sr2);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// V3 — takeover unregister generation race + Will hoist
+// ──────────────────────────────────────────────────────────────────────
+
+/// V3 regression #1 — after a takeover, the prior `handle_server` loop's
+/// `unregister_session` MUST be a no-op (generation guard). Prior to the
+/// fix the prior loop's unguarded `remove(&key)` deleted the NEW session
+/// and wiped its subscription / inflight state, so any publish landing
+/// on the new session was silently dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v3_takeover_does_not_wipe_new_session_after_prior_unregister() {
+    let (port, _broker) = start_broker().await;
+
+    // Connection #1 — takes the slot.
+    let (_sr1, mut sw1) = connect_raw(port).await;
+    send_packet(&mut sw1, &connect_packet("v3-race-sub")).await;
+    // We don't drain sr1's CONNACK — the read half drops naturally.
+
+    // Connection #2 — same client_id. register_session removes prev and
+    // closes prev's channel; prev's loop wakes via shutdown notify and
+    // (pre-fix) would race with our SUBSCRIBE + the publisher's PUBLISH.
+    let (mut sr2, mut sw2) = connect_raw(port).await;
+    send_packet(&mut sw2, &connect_packet("v3-race-sub")).await;
+    let _ = read_packet(&mut sr2).await; // CONNACK on NEW
+
+    // Subscribe on the NEW session.
+    send_packet(
+        &mut sw2,
+        &Packet::Subscribe(SubscribePacket {
+            packet_id: 1,
+            subscriptions: vec![TopicSubscription {
+                topic: Arc::from("v3/race/topic"),
+                qos: QoS::AtMostOnce,
+            }],
+        }),
+    )
+    .await;
+    let _ = read_packet(&mut sr2).await; // SUBACK
+
+    // Sleep long enough for prev's loop to wake, exit, and call
+    // unregister_session. Pre-fix this is when the bug fires: prev's
+    // remove(&key) deletes the NEW session entry and the
+    // `clean_session=true` cleanup also calls remove_client on the
+    // NEW session's subscriptions.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Publisher fires a message — NEW subscriber MUST receive it.
+    let (_, mut pw) = connect_raw(port).await;
+    send_packet(&mut pw, &connect_packet("v3-race-pub")).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    send_packet(
+        &mut pw,
+        &Packet::Publish(PublishPacket {
+            topic: Arc::from("v3/race/topic"),
+            payload: bytes::Bytes::from_static(b"survived"),
+            dup: false,
+            qos: QoS::AtMostOnce,
+            packet_id: None,
+            retain: false,
+        }),
+    )
+    .await;
+
+    match timeout(
+        Duration::from_secs(2),
+        codec::read_packet(&mut sr2, usize::MAX),
+    )
+    .await
+    {
+        Ok(Ok(Packet::Publish(p))) => {
+            assert_eq!(p.topic.as_ref(), "v3/race/topic");
+            assert_eq!(&p.payload[..], b"survived");
+        }
+        other => panic!(
+            "NEW session MUST still be subscribed after prev's late \
+             unregister_session — generation guard regressed; got {other:?}"
+        ),
+    }
+
+    drop(sw1);
+    drop(sw2);
+    drop(sr2);
+    drop(pw);
+}
+
+/// V3 regression #2 — takeover closes the prior network connection
+/// (spec §3.1.4-2); §3.1.2.5 then requires the Will to fire. Pre-fix
+/// the prior loop's unregister_session would fire the Will (correctly)
+/// as a side effect of deleting the new session (incorrectly). With
+/// the V3 generation guard the prior unregister is a no-op, so the
+/// Will dispatch is hoisted into `register_session`'s takeover path.
+/// This test pins that the Will still reaches a subscriber.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v3_takeover_fires_prior_session_will() {
+    let (port, _broker) = start_broker().await;
+
+    // Will-observer.
+    let (mut wr, mut ww) = connect_raw(port).await;
+    send_packet(&mut ww, &connect_packet("v3-will-rx")).await;
+    let _ = read_packet(&mut wr).await; // CONNACK
+    send_packet(
+        &mut ww,
+        &Packet::Subscribe(SubscribePacket {
+            packet_id: 1,
+            subscriptions: vec![TopicSubscription {
+                topic: Arc::from("v3/will"),
+                qos: QoS::AtMostOnce,
+            }],
+        }),
+    )
+    .await;
+    let _ = read_packet(&mut wr).await; // SUBACK
+
+    // Connection #1 — same client_id `v3-will-victim`, carries a Will.
+    let (mut r1, mut w1) = connect_raw(port).await;
+    let connect_with_will = Packet::Connect(ConnectPacket {
+        client_id: Arc::from("v3-will-victim"),
+        clean_session: true,
+        keep_alive: 60,
+        username: None,
+        password: None,
+        will: Some(hotaru_mqtt::WillPacket {
+            topic: Arc::from("v3/will"),
+            payload: bytes::Bytes::from_static(b"taken-over"),
+            qos: QoS::AtMostOnce,
+            retain: false,
+        }),
+    });
+    send_packet(&mut w1, &connect_with_will).await;
+    let _ = read_packet(&mut r1).await; // CONNACK
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    // Connection #2 — same client_id, takeover. No Will of its own.
+    let (mut r2, mut w2) = connect_raw(port).await;
+    send_packet(&mut w2, &connect_packet("v3-will-victim")).await;
+    let _ = read_packet(&mut r2).await; // CONNACK
+
+    // The Will-observer MUST see the prior session's Will, dispatched
+    // from `register_session`'s takeover path (V3 hoist).
+    match timeout(
+        Duration::from_secs(2),
+        codec::read_packet(&mut wr, usize::MAX),
+    )
+    .await
+    {
+        Ok(Ok(Packet::Publish(p))) => {
+            assert_eq!(p.topic.as_ref(), "v3/will");
+            assert_eq!(&p.payload[..], b"taken-over");
+        }
+        other => panic!(
+            "Will MUST fire on takeover-driven close (V3 hoist); got {other:?}"
+        ),
+    }
+
+    drop(ww);
+    drop(wr);
+    drop(w1);
+    drop(r1);
+    drop(w2);
+    drop(r2);
+}

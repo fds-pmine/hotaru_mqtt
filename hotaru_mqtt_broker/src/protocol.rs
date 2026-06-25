@@ -314,7 +314,7 @@ where
     //    resolved in step 2a; all broker-internal maps key on
     //    `(tenant, client_id)` so cross-tenant fanout / ACL / Will
     //    delivery is structurally constrained.
-    let session_present = broker
+    let (session_present, connection_id) = broker
         .register_session(
             tenant.clone(),
             client_id.clone(),
@@ -344,7 +344,9 @@ where
         session_present,
         return_code: ConnackReturnCode::Accepted,
     })) {
-        broker.unregister_session(&tenant, &client_id, false).await;
+        broker
+            .unregister_session(&tenant, &client_id, connection_id, false)
+            .await;
         broker.release_connection();
         return Err(e);
     }
@@ -446,7 +448,7 @@ where
         "session exiting"
     );
     broker
-        .unregister_session(&tenant, &client_id, graceful)
+        .unregister_session(&tenant, &client_id, connection_id, graceful)
         .await;
     broker.release_connection();
     if let Some(e) = terminal_error {

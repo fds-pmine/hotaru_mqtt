@@ -542,6 +542,23 @@ impl<W: ConnStream, TS: TransportSpec<Wire = W>> EndpointDispatcher<W, TS> {
     }
 }
 
+impl<W: ConnStream, TS: TransportSpec<Wire = W>> Drop for EndpointDispatcher<W, TS> {
+    // V2 — workers hold `Arc<EndpointQueueMap>` clones (they need it to
+    // self-remove from the map on idle-timeout exit). That keeps the map
+    // alive after this dispatcher drops, so the per-endpoint `Sender`
+    // stored in the map at the worker's key never drops, and the
+    // worker's `rx.recv()` never returns `None`. With the default
+    // `MqttSafety::worker_idle_timeout() == None` that becomes a
+    // permanent task leak per `(client, endpoint)`. Clearing the map on
+    // dispatcher drop releases every Sender; each worker then sees `rx`
+    // closed and exits its loop cleanly. `fallback_queue` is an owned
+    // `OnceLock<Sender>` on the dispatcher itself, so it already drops
+    // naturally — no special-casing needed.
+    fn drop(&mut self) {
+        self.endpoint_queues.clear();
+    }
+}
+
 async fn endpoint_worker<W, TS>(
     mut rx: mpsc::Receiver<(IncomingPublish, Arc<UrlNode<MqttContext<TS>, TS>>)>,
     channel: MqttChannel<W>,
