@@ -12,6 +12,7 @@ categories = ["network-programming"]
 [dependencies]
 hotaru_mqtt = { path = "../hotaru_mqtt", version = "0.8.3-rc1" }
 hotaru_core = { workspace = true }
+hotaru_io_tokio = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 dashmap = { workspace = true }

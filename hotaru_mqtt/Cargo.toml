@@ -11,6 +11,7 @@ categories = ["network-programming", "embedded"]
 
 [dependencies]
 hotaru_core = { workspace = true }
+hotaru_io_tokio = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 dashmap = { workspace = true }
