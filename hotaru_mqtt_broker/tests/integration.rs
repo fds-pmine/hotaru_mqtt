@@ -12,8 +12,10 @@ use hotaru_core::app::common::RuntimeConfig;
 use hotaru_core::executable::registry::ProtocolEntryRegistry;
 use hotaru_core::executable::{ProtocolEntryBuilder, ProtocolRegistryBuilder};
 use hotaru_core::extensions::Locals;
-use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use hotaru_core::connection::HotaruWrite;
+use hotaru_io_tokio::{TcpStream, TokioIo};
+use tokio::io::BufReader;
+use tokio::net::{TcpListener, TcpStream as RawTcpStream};
 use tokio::time::timeout;
 
 use hotaru_mqtt::{
@@ -39,7 +41,7 @@ async fn start_broker_with(broker: Broker<TcpStream>) -> (u16, Broker<TcpStream>
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
 
-    let registry: ProtocolEntryRegistry<hotaru_core::connection::tcp::TcpTransport> =
+    let registry: ProtocolEntryRegistry<hotaru_io_tokio::TcpTransport> =
         ProtocolRegistryBuilder::new()
             .protocol(ProtocolEntryBuilder::new(MQTT_SERVER::new()))
             .build();
@@ -60,7 +62,7 @@ async fn start_broker_with(broker: Broker<TcpStream>) -> (u16, Broker<TcpStream>
                     let registry = registry.clone();
                     let runtime = runtime.clone();
                     tokio::spawn(async move {
-                        registry.serve(runtime, stream).await;
+                        registry.serve(runtime, TcpStream::new(stream)).await;
                     });
                 }
                 Err(_) => break,
@@ -75,21 +77,21 @@ async fn start_broker_with(broker: Broker<TcpStream>) -> (u16, Broker<TcpStream>
 async fn connect_raw(
     port: u16,
 ) -> (
-    BufReader<tokio::net::tcp::OwnedReadHalf>,
-    tokio::net::tcp::OwnedWriteHalf,
+    TokioIo<BufReader<tokio::net::tcp::OwnedReadHalf>>,
+    TokioIo<tokio::net::tcp::OwnedWriteHalf>,
 ) {
-    let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let stream = RawTcpStream::connect(("127.0.0.1", port)).await.unwrap();
     let (r, w) = stream.into_split();
-    (BufReader::new(r), w)
+    (TokioIo::new(BufReader::new(r)), TokioIo::new(w))
 }
 
-async fn send_packet(writer: &mut tokio::net::tcp::OwnedWriteHalf, packet: &Packet) {
+async fn send_packet(writer: &mut TokioIo<tokio::net::tcp::OwnedWriteHalf>, packet: &Packet) {
     let bytes = codec::encode_packet(packet).expect("encode_packet (test fixture)");
     writer.write_all(&bytes).await.unwrap();
     writer.flush().await.unwrap();
 }
 
-async fn read_packet(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Packet {
+async fn read_packet(reader: &mut TokioIo<BufReader<tokio::net::tcp::OwnedReadHalf>>) -> Packet {
     timeout(
         Duration::from_secs(5),
         codec::read_packet(reader, usize::MAX),
@@ -1863,7 +1865,7 @@ async fn start_multi_protocol_broker() -> (u16, Broker<TcpStream>) {
     let port = listener.local_addr().unwrap().port();
     let broker = Broker::<TcpStream>::insecure();
 
-    let registry: ProtocolEntryRegistry<hotaru_core::connection::tcp::TcpTransport> =
+    let registry: ProtocolEntryRegistry<hotaru_io_tokio::TcpTransport> =
         ProtocolRegistryBuilder::new()
             .protocol(ProtocolEntryBuilder::new(HTTP::server(
                 HttpSafety::default(),
@@ -1887,7 +1889,7 @@ async fn start_multi_protocol_broker() -> (u16, Broker<TcpStream>) {
                     let registry = registry.clone();
                     let runtime = runtime.clone();
                     tokio::spawn(async move {
-                        registry.serve(runtime, stream).await;
+                        registry.serve(runtime, TcpStream::new(stream)).await;
                     });
                 }
                 Err(_) => break,
