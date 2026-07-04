@@ -10,12 +10,10 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use hotaru_core::app::common::RuntimeConfig;
-use hotaru_core::connection::{ConnStream, TransportSpec};
+use hotaru_core::connection::{ConnStream, HotaruRead, HotaruWrite, TransportSpec};
 use hotaru_core::protocol::{Channel as _, CtxError, Protocol, ProtocolFlow, ProtocolRole};
 use hotaru_core::url::UrlRoot;
-use tokio::io::BufReader;
 use tokio::time::timeout;
 
 use crate::traits::TenantId;
@@ -57,9 +55,9 @@ const KEEP_ALIVE_DISABLED_READ_TIMEOUT: Duration = Duration::from_secs(30 * 24 *
 // MqttServerProtocol
 // ----------------------------------------------------------------------------
 
-pub type DefaultMqttTransport = hotaru_core::connection::tcp::TcpTransport;
+pub type DefaultMqttTransport = hotaru_io_tokio::TcpTransport;
 #[allow(non_camel_case_types)]
-pub type MQTT_SERVER = MqttServerProtocol<tokio::net::TcpStream, DefaultMqttTransport>;
+pub type MQTT_SERVER = MqttServerProtocol<hotaru_io_tokio::TcpStream, DefaultMqttTransport>;
 
 /// MQTT-server over TLS (gated by `tls` feature). Mirrors core's `MQTTS`.
 #[cfg(feature = "tls")]
@@ -72,7 +70,7 @@ pub type MqttTlsServerProtocol =
 pub type MQTTS_SERVER = MqttTlsServerProtocol;
 
 pub struct MqttServerProtocol<
-    W: ConnStream = tokio::net::TcpStream,
+    W: ConnStream = hotaru_io_tokio::TcpStream,
     TS: TransportSpec<Wire = W> = DefaultMqttTransport,
 > {
     _w: PhantomData<fn() -> W>,
@@ -103,11 +101,13 @@ impl<W: ConnStream, TS: TransportSpec<Wire = W>> MqttServerProtocol<W, TS> {
     }
 }
 
-#[async_trait]
 impl<W, TS> Protocol for MqttServerProtocol<W, TS>
 where
     W: ConnStream,
     TS: TransportSpec<Wire = W>,
+    MqttError: From<<TS as TransportSpec>::IoError>,
+    W::ReadHalf: HotaruRead<Error = std::io::Error>,
+    W::WriteHalf: HotaruWrite<Error = std::io::Error>,
 {
     type Wire = W;
     type TS = TS;
@@ -153,8 +153,8 @@ where
 
     fn open_channel(
         self,
-        reader: BufReader<<<Self::TS as TransportSpec>::Wire as ConnStream>::ReadHalf>,
-        writer: <<Self::TS as TransportSpec>::Wire as ConnStream>::WriteHalf,
+        reader: <<<Self::TS as TransportSpec>::Wire as ConnStream>::ReadHalf as HotaruRead>::Buffered,
+        writer: <<<Self::TS as TransportSpec>::Wire as ConnStream>::WriteHalf as HotaruWrite>::Buffered,
         meta: <<Self::TS as TransportSpec>::Wire as ConnStream>::Meta,
     ) -> Self::Channel {
         MqttChannel::new(
@@ -209,6 +209,7 @@ async fn handle_server<W, TS>(
 where
     W: ConnStream,
     TS: TransportSpec<Wire = W>,
+    W::ReadHalf: HotaruRead<Error = std::io::Error>,
 {
     let broker = runtime
         .get_static::<Broker<W>>(BROKER_STATICS_KEY)

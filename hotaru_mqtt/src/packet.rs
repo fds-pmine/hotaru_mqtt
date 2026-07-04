@@ -6,7 +6,6 @@
 //! `Packet` is the framework's `Message` type for `MqttProtocol`. Encoding
 //! and decoding live in `codec.rs`; this module is plain data definitions.
 
-use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
@@ -17,6 +16,7 @@ use zeroize::Zeroizing;
 use hotaru_core::protocol::Message;
 
 use crate::codec::{decode_packet_from_bytes, encode_packet};
+use crate::error::MqttError;
 use crate::request::{IncomingPublish, PacketId, QoS, SubackCode};
 
 #[derive(Debug, Clone)]
@@ -275,15 +275,15 @@ impl std::fmt::Display for ConnackReturnCode {
 
 impl Message for Packet {
     type BytesMut = BytesMut;
+    type Error = MqttError;
 
-    fn encode(&self, buf: &mut Self::BytesMut) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let bytes =
-            encode_packet(self).map_err(|e| -> Box<dyn Error + Send + Sync> { Box::new(e) })?;
+    fn encode(&self, buf: &mut Self::BytesMut) -> Result<(), MqttError> {
+        let bytes = encode_packet(self)?;
         buf.extend_from_slice(&bytes);
         Ok(())
     }
 
-    fn decode(buf: &mut Self::BytesMut) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
+    fn decode(buf: &mut Self::BytesMut) -> Result<Option<Self>, MqttError> {
         // The `Message::decode` framework hook lacks an `MqttSafety`
         // handle, so we fall back to the spec hard cap (§2.2.3). The
         // per-connection read path in `protocol.rs` uses `read_packet`
