@@ -13,7 +13,8 @@ use hotaru_core::app::common::RuntimeConfig;
 use hotaru_core::executable::registry::ProtocolEntryRegistry;
 use hotaru_core::executable::{ProtocolEntryBuilder, ProtocolRegistryBuilder};
 use hotaru_core::extensions::Locals;
-use tokio::net::{TcpListener, TcpStream};
+use hotaru_io_tokio::TcpStream;
+use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -28,7 +29,7 @@ async fn start_broker() -> u16 {
     let port = listener.local_addr().unwrap().port();
     let broker = Broker::<TcpStream>::insecure();
 
-    let registry: ProtocolEntryRegistry<hotaru_core::connection::tcp::TcpTransport> =
+    let registry: ProtocolEntryRegistry<hotaru_io_tokio::TcpTransport> =
         ProtocolRegistryBuilder::new()
             .protocol(ProtocolEntryBuilder::new(MQTT_SERVER::new()))
             .build();
@@ -49,7 +50,7 @@ async fn start_broker() -> u16 {
                     let registry = registry.clone();
                     let runtime = runtime.clone();
                     tokio::spawn(async move {
-                        registry.serve(runtime, stream).await;
+                        registry.serve(runtime, TcpStream::new(stream)).await;
                     });
                 }
                 Err(_) => break,
