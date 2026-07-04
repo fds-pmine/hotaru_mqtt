@@ -7,11 +7,10 @@
 //! Encode path writes through `write_all(&payload[..])` — `Bytes` derefs to
 //! `&[u8]` with zero overhead.
 
-use std::error::Error;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use hotaru_core::connection::{HotaruRead, HotaruWrite};
 use zeroize::Zeroizing;
 
 use crate::error::{CodecError, MqttError, Violation};
@@ -34,7 +33,7 @@ use crate::request::{QoS, SubackCode};
 /// so a malicious peer cannot OOM the process by declaring a 256 MiB body.
 /// Pass `usize::MAX` to disable (spec hard cap of 268_435_455 still applies
 /// via `read_remaining_length`).
-pub async fn read_packet<R: AsyncRead + Unpin>(
+pub async fn read_packet<R: HotaruRead<Error = std::io::Error> + Unpin + Send>(
     reader: &mut R,
     max_size: usize,
 ) -> Result<Packet, MqttError> {
@@ -71,7 +70,7 @@ pub async fn read_packet<R: AsyncRead + Unpin>(
 pub fn decode_packet_from_bytes(
     buf: &mut BytesMut,
     max_size: usize,
-) -> Result<Option<Packet>, Box<dyn Error + Send + Sync>> {
+) -> Result<Option<Packet>, MqttError> {
     if buf.len() < 2 {
         return Ok(None);
     }
@@ -86,10 +85,10 @@ pub fn decode_packet_from_bytes(
     };
 
     if remaining > max_size {
-        return Err(Box::new(MqttError::from(Violation::PacketTooLarge {
+        return Err(MqttError::from(Violation::PacketTooLarge {
             len: remaining,
             max: max_size,
-        })));
+        }));
     }
 
     let header_len = 1 + rl_bytes;
@@ -100,8 +99,7 @@ pub fn decode_packet_from_bytes(
 
     let packet_bytes = buf.split_to(total);
     let body = &packet_bytes[header_len..];
-    let packet = parse_packet(first, packet_type, remaining, body)
-        .map_err(|e| -> Box<dyn Error + Send + Sync> { Box::new(e) })?;
+    let packet = parse_packet(first, packet_type, remaining, body)?;
     Ok(Some(packet))
 }
 
@@ -133,7 +131,7 @@ pub fn encode_packet(packet: &Packet) -> Result<Vec<u8>, MqttError> {
 
 /// Write a packet to an async writer. Used by the writer actor for control
 /// packets.
-pub async fn write_packet<W: AsyncWrite + Unpin>(
+pub async fn write_packet<W: HotaruWrite<Error = std::io::Error> + Unpin + Send>(
     writer: &mut W,
     packet: &Packet,
 ) -> Result<(), MqttError> {
@@ -145,7 +143,7 @@ pub async fn write_packet<W: AsyncWrite + Unpin>(
 /// Optimized write path for PUBLISH: writes the header in one syscall, then
 /// the payload `Bytes` directly with `write_all(&payload[..])` — no copy
 /// from `Bytes` to intermediate buffer.
-pub async fn write_publish_packet<W: AsyncWrite + Unpin>(
+pub async fn write_publish_packet<W: HotaruWrite<Error = std::io::Error> + Unpin + Send>(
     writer: &mut W,
     packet: &PublishPacket,
 ) -> Result<(), MqttError> {
@@ -181,7 +179,9 @@ pub async fn write_publish_packet<W: AsyncWrite + Unpin>(
 // Internal: remaining length
 // ============================================================================
 
-async fn read_remaining_length<R: AsyncRead + Unpin>(reader: &mut R) -> Result<usize, MqttError> {
+async fn read_remaining_length<R: HotaruRead<Error = std::io::Error> + Unpin + Send>(
+    reader: &mut R,
+) -> Result<usize, MqttError> {
     let mut result = 0usize;
     let mut multiplier = 1usize;
     for i in 0..4 {
@@ -986,10 +986,8 @@ mod tests {
         let wire = build_publish_wire(0x08, b"a", None, b"x");
         let mut buf = BytesMut::from(&wire[..]);
         let err = decode_packet_from_bytes(&mut buf, usize::MAX)
-            .expect_err("DUP+QoS0 must be rejected")
-            .downcast::<MqttError>()
-            .unwrap();
-        assert_eq!(must_violation(*err), Violation::DupSetOnQos0);
+            .expect_err("DUP+QoS0 must be rejected");
+        assert_eq!(must_violation(err), Violation::DupSetOnQos0);
     }
 
     #[test]
@@ -998,10 +996,8 @@ mod tests {
         let wire = build_publish_wire(0x02, b"a", Some(0), b"x");
         let mut buf = BytesMut::from(&wire[..]);
         let err = decode_packet_from_bytes(&mut buf, usize::MAX)
-            .expect_err("packet_id=0 on QoS>0 must be rejected")
-            .downcast::<MqttError>()
-            .unwrap();
-        assert_eq!(must_violation(*err), Violation::PacketIdZero);
+            .expect_err("packet_id=0 on QoS>0 must be rejected");
+        assert_eq!(must_violation(err), Violation::PacketIdZero);
     }
 
     #[test]
@@ -1010,10 +1006,8 @@ mod tests {
         let wire = build_publish_wire(0x00, b"", None, b"x");
         let mut buf = BytesMut::from(&wire[..]);
         let err = decode_packet_from_bytes(&mut buf, usize::MAX)
-            .expect_err("empty topic must be rejected")
-            .downcast::<MqttError>()
-            .unwrap();
-        assert_eq!(must_violation(*err), Violation::EmptyPublishTopic);
+            .expect_err("empty topic must be rejected");
+        assert_eq!(must_violation(err), Violation::EmptyPublishTopic);
     }
 
     #[test]
@@ -1022,10 +1016,8 @@ mod tests {
         let wire = [0x20, 0x02, 0x02, 0x00];
         let mut buf = BytesMut::from(&wire[..]);
         let err = decode_packet_from_bytes(&mut buf, usize::MAX)
-            .expect_err("CONNACK reserved bits must be rejected")
-            .downcast::<MqttError>()
-            .unwrap();
-        assert_eq!(must_violation(*err), Violation::ConnackReservedBits);
+            .expect_err("CONNACK reserved bits must be rejected");
+        assert_eq!(must_violation(err), Violation::ConnackReservedBits);
     }
 
     #[test]
@@ -1034,10 +1026,8 @@ mod tests {
         let wire = [0x20, 0x02, 0x01, 0x05];
         let mut buf = BytesMut::from(&wire[..]);
         let err = decode_packet_from_bytes(&mut buf, usize::MAX)
-            .expect_err("SessionPresent + error code must be rejected")
-            .downcast::<MqttError>()
-            .unwrap();
-        assert_eq!(must_violation(*err), Violation::SessionPresentWithError);
+            .expect_err("SessionPresent + error code must be rejected");
+        assert_eq!(must_violation(err), Violation::SessionPresentWithError);
     }
 
     #[test]
@@ -1046,10 +1036,8 @@ mod tests {
         let wire = build_publish_wire(0x00, b"a/+/b", None, b"x");
         let mut buf = BytesMut::from(&wire[..]);
         let err = decode_packet_from_bytes(&mut buf, usize::MAX)
-            .expect_err("wildcard topic must be rejected")
-            .downcast::<MqttError>()
-            .unwrap();
-        assert_eq!(must_violation(*err), Violation::WildcardInPublishTopic);
+            .expect_err("wildcard topic must be rejected");
+        assert_eq!(must_violation(err), Violation::WildcardInPublishTopic);
     }
 
     /// Build a SUBSCRIBE wire frame with explicit fixed-header low nibble.
@@ -1082,10 +1070,8 @@ mod tests {
         let wire = build_subscribe_wire(0x00, b"a/b");
         let mut buf = BytesMut::from(&wire[..]);
         let err = decode_packet_from_bytes(&mut buf, usize::MAX)
-            .expect_err("SUBSCRIBE low-nibble 0000 must be rejected")
-            .downcast::<MqttError>()
-            .unwrap();
-        assert_eq!(must_violation(*err), Violation::SubscribeReservedBits);
+            .expect_err("SUBSCRIBE low-nibble 0000 must be rejected");
+        assert_eq!(must_violation(err), Violation::SubscribeReservedBits);
 
         // 0010 is the spec-required value — must succeed.
         let wire_ok = build_subscribe_wire(0x02, b"a/b");
@@ -1098,10 +1084,8 @@ mod tests {
         let wire = build_unsubscribe_wire(0x04, b"a/b");
         let mut buf = BytesMut::from(&wire[..]);
         let err = decode_packet_from_bytes(&mut buf, usize::MAX)
-            .expect_err("UNSUBSCRIBE non-0010 must be rejected")
-            .downcast::<MqttError>()
-            .unwrap();
-        assert_eq!(must_violation(*err), Violation::UnsubscribeReservedBits);
+            .expect_err("UNSUBSCRIBE non-0010 must be rejected");
+        assert_eq!(must_violation(err), Violation::UnsubscribeReservedBits);
     }
 
     #[test]
@@ -1110,10 +1094,8 @@ mod tests {
         let wire = build_publish_wire(0x00, b"a\0b", None, b"x");
         let mut buf = BytesMut::from(&wire[..]);
         let err = decode_packet_from_bytes(&mut buf, usize::MAX)
-            .expect_err("U+0000 in UTF-8 string must be rejected")
-            .downcast::<MqttError>()
-            .unwrap();
-        assert_eq!(must_violation(*err), Violation::Utf8NullCharacter);
+            .expect_err("U+0000 in UTF-8 string must be rejected");
+        assert_eq!(must_violation(err), Violation::Utf8NullCharacter);
     }
 
     // ── Stage A P2.B: CONNECT strict validation ──────────────────────
@@ -1140,10 +1122,8 @@ mod tests {
         let wire = build_connect_wire(0x01, b"cid");
         let mut buf = BytesMut::from(&wire[..]);
         let err = decode_packet_from_bytes(&mut buf, usize::MAX)
-            .expect_err("reserved bit must be rejected")
-            .downcast::<MqttError>()
-            .unwrap();
-        assert_eq!(must_violation(*err), Violation::ReservedHeaderBits);
+            .expect_err("reserved bit must be rejected");
+        assert_eq!(must_violation(err), Violation::ReservedHeaderBits);
     }
 
     #[test]
@@ -1152,10 +1132,8 @@ mod tests {
         let wire = build_connect_wire(0x18, b"cid");
         let mut buf = BytesMut::from(&wire[..]);
         let err = decode_packet_from_bytes(&mut buf, usize::MAX)
-            .expect_err("will QoS without will flag must be rejected")
-            .downcast::<MqttError>()
-            .unwrap();
-        assert_eq!(must_violation(*err), Violation::ReservedHeaderBits);
+            .expect_err("will QoS without will flag must be rejected");
+        assert_eq!(must_violation(err), Violation::ReservedHeaderBits);
     }
 
     #[test]
@@ -1164,10 +1142,8 @@ mod tests {
         let wire = build_connect_wire(0x20, b"cid");
         let mut buf = BytesMut::from(&wire[..]);
         let err = decode_packet_from_bytes(&mut buf, usize::MAX)
-            .expect_err("will retain without will flag must be rejected")
-            .downcast::<MqttError>()
-            .unwrap();
-        assert_eq!(must_violation(*err), Violation::ReservedHeaderBits);
+            .expect_err("will retain without will flag must be rejected");
+        assert_eq!(must_violation(err), Violation::ReservedHeaderBits);
     }
 
     #[test]
@@ -1176,10 +1152,8 @@ mod tests {
         let wire = build_connect_wire(0x40, b"cid");
         let mut buf = BytesMut::from(&wire[..]);
         let err = decode_packet_from_bytes(&mut buf, usize::MAX)
-            .expect_err("password without username must be rejected")
-            .downcast::<MqttError>()
-            .unwrap();
-        assert_eq!(must_violation(*err), Violation::ReservedHeaderBits);
+            .expect_err("password without username must be rejected");
+        assert_eq!(must_violation(err), Violation::ReservedHeaderBits);
     }
 
     #[tokio::test]
@@ -1187,7 +1161,7 @@ mod tests {
         // 5-byte declared body but max_size = 4 → reject without allocating.
         let mut wire = vec![0x30, 0x05];
         wire.extend_from_slice(&[0u8; 5]);
-        let mut reader = &wire[..];
+        let mut reader = hotaru_io_tokio::TokioIo::new(std::io::Cursor::new(wire));
         let err = read_packet(&mut reader, 4)
             .await
             .expect_err("oversize must be rejected");
