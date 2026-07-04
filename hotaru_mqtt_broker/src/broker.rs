@@ -743,6 +743,7 @@ impl<W: ConnStream> Broker<W> {
 
         if !graceful && let Some(will) = entry.will {
             let will_packet = PublishPacket {
+                properties: Default::default(),
                 topic: will.topic,
                 payload: will.payload,
                 dup: false,
@@ -914,6 +915,7 @@ impl<W: ConnStream> Broker<W> {
                             session.stash_outbound_inflight(
                                 id,
                                 PublishPacket {
+                                    properties: Default::default(),
                                     topic: r.topic.clone(),
                                     payload: r.payload.clone(),
                                     dup: false,
@@ -936,6 +938,10 @@ impl<W: ConnStream> Broker<W> {
                     None
                 };
                 let replay = PublishPacket {
+                    // Deferred: RetainedStore entries don't carry v5
+                    // properties yet, so retained replays deliver without
+                    // them (tracked in the v5 PR notes).
+                    properties: Default::default(),
                     topic: r.topic,
                     payload: r.payload,
                     dup: false,
@@ -1174,6 +1180,9 @@ impl<W: ConnStream> Broker<W> {
             };
 
             let adjusted = PublishPacket {
+                // v5 §3.3.2.3: Response Topic / Correlation Data / Content
+                // Type / User Properties are forwarded unaltered.
+                properties: packet.properties.clone(),
                 topic: packet.topic.clone(),
                 payload: packet.payload.clone(),
                 dup: false,
@@ -1278,6 +1287,7 @@ impl<W: ConnStream> Broker<W> {
                         session.stash_outbound_inflight(
                             id,
                             PublishPacket {
+                                properties: Default::default(),
                                 topic: topic.clone(),
                                 payload: payload.clone(),
                                 dup: false,
@@ -1301,6 +1311,7 @@ impl<W: ConnStream> Broker<W> {
                 None
             };
             let p = PublishPacket {
+                properties: Default::default(),
                 topic: topic.clone(),
                 payload: payload.clone(),
                 dup: false,

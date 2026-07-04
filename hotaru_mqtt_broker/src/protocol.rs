@@ -23,7 +23,8 @@ use hotaru_mqtt::codec::read_packet;
 use hotaru_mqtt::context::MqttContext;
 use hotaru_mqtt::error::{MqttError, TimeoutKind, Violation};
 use hotaru_mqtt::packet::{
-    ConnackPacket, ConnackReturnCode, Packet, PublishPacket, SubackPacket, incoming_from_packet,
+    ConnackPacket, ConnackReturnCode, Packet, ProtocolVersion, PublishPacket, SubackPacket,
+    incoming_from_packet,
 };
 use hotaru_mqtt::request::{QoS, TopicFilter, WillMessage};
 use hotaru_mqtt::session::BindInfo;
@@ -225,16 +226,23 @@ where
         .await
         .ok_or_else(|| MqttError::Configuration("reader already taken".into()))?;
 
-    // 1. Read CONNECT with timeout
+    // 1. Read CONNECT with timeout. The version argument only shapes
+    //    non-CONNECT frames; CONNECT itself carries its protocol level,
+    //    so the pre-handshake default is fine for either client kind.
     let connect_packet = timeout(
         CONNECT_RECEIVE_TIMEOUT,
-        read_packet(&mut reader, max_packet_size),
+        read_packet(&mut reader, max_packet_size, ProtocolVersion::default()),
     )
     .await
     .map_err(|_| MqttError::Timeout(TimeoutKind::ConnectReceive))??;
     let Packet::Connect(connect) = connect_packet else {
         return Err(Violation::ExpectedConnect.into());
     };
+
+    // Negotiate the session's wire version from CONNECT (v5 §3.1.2.2).
+    // Must happen before any reply so CONNACK is encoded in-kind.
+    let version = connect.version;
+    channel.set_protocol_version(version);
 
     // spec §3.1.3.1: empty client_id requires clean_session=true; broker then
     // assigns a unique identifier. If clean_session=false + empty id,
@@ -246,6 +254,7 @@ where
             "rejecting CONNECT: empty client_id requires clean_session=1"
         );
         let _ = channel.send_packet(Packet::Connack(ConnackPacket {
+            properties: Default::default(),
             session_present: false,
             return_code: ConnackReturnCode::IdentifierRejected,
         }));
@@ -265,6 +274,7 @@ where
             "rejecting CONNECT: max_connections reached"
         );
         let _ = channel.send_packet(Packet::Connack(ConnackPacket {
+            properties: Default::default(),
             session_present: false,
             return_code: ConnackReturnCode::ServerUnavailable,
         }));
@@ -288,6 +298,7 @@ where
             "authentication rejected"
         );
         let _ = channel.send_packet(Packet::Connack(ConnackPacket {
+            properties: Default::default(),
             session_present: false,
             return_code: auth.return_code,
         }));
@@ -342,6 +353,7 @@ where
 
     // 4. Send CONNACK
     if let Err(e) = channel.send_packet(Packet::Connack(ConnackPacket {
+        properties: Default::default(),
         session_present,
         return_code: ConnackReturnCode::Accepted,
     })) {
@@ -407,7 +419,7 @@ where
             break;
         }
         tokio::select! {
-            packet = timeout(read_timeout, read_packet(&mut reader, max_packet_size)) => {
+            packet = timeout(read_timeout, read_packet(&mut reader, max_packet_size, version)) => {
                 match packet {
                     Err(_) => break,                              // keep-alive timeout
                     Ok(Err(MqttError::Io(_))) => break,           // wire closed
@@ -585,7 +597,12 @@ where
                 .into());
             }
             broker.unsubscribe(tenant, client_id, &u.topics).await;
-            channel.send_packet(Packet::Unsuback(u.packet_id))?;
+            channel.send_packet(Packet::Unsuback(
+                hotaru_mqtt::packet::UnsubackPacket {
+                    packet_id: u.packet_id,
+                    reason_codes: vec![0x00; u.topics.len()],
+                },
+            ))?;
             Ok(())
         }
         Packet::Pingreq => {
@@ -610,6 +627,9 @@ where
             // from this same client.
             if let Some(stored) = channel.session().take_qos2_inbound(id) {
                 let publish = PublishPacket {
+                    // Forward the publisher's v5 properties through the
+                    // QoS 2 release path (stash carries them).
+                    properties: stored.properties.clone(),
                     topic: stored.topic.clone(),
                     payload: stored.payload.clone(),
                     dup: false,

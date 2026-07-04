@@ -19,8 +19,8 @@ use tokio::net::{TcpListener, TcpStream as RawTcpStream};
 use tokio::time::timeout;
 
 use hotaru_mqtt::{
-    ConnackPacket, ConnackReturnCode, ConnectPacket, Packet, PublishPacket, QoS, SubackPacket,
-    SubscribePacket, TopicSubscription, codec,
+    ConnackPacket, ConnackReturnCode, ConnectPacket, Packet, ProtocolVersion, PublishPacket, QoS,
+    SubackPacket, SubscribePacket, TopicSubscription, codec,
 };
 use hotaru_mqtt_broker::{
     AclChecker, AclDecision, BROKER_STATICS_KEY, Broker, BrokerSafety, MQTT_SERVER, TenantId,
@@ -86,7 +86,7 @@ async fn connect_raw(
 }
 
 async fn send_packet(writer: &mut TokioIo<tokio::net::tcp::OwnedWriteHalf>, packet: &Packet) {
-    let bytes = codec::encode_packet(packet).expect("encode_packet (test fixture)");
+    let bytes = codec::encode_packet(packet, ProtocolVersion::V311).expect("encode_packet (test fixture)");
     writer.write_all(&bytes).await.unwrap();
     writer.flush().await.unwrap();
 }
@@ -94,7 +94,7 @@ async fn send_packet(writer: &mut TokioIo<tokio::net::tcp::OwnedWriteHalf>, pack
 async fn read_packet(reader: &mut TokioIo<BufReader<tokio::net::tcp::OwnedReadHalf>>) -> Packet {
     timeout(
         Duration::from_secs(5),
-        codec::read_packet(reader, usize::MAX),
+        codec::read_packet(reader, usize::MAX, ProtocolVersion::V311),
     )
     .await
     .expect("read_packet timeout")
@@ -103,6 +103,8 @@ async fn read_packet(reader: &mut TokioIo<BufReader<tokio::net::tcp::OwnedReadHa
 
 fn connect_packet(client_id: &str) -> Packet {
     Packet::Connect(ConnectPacket {
+        properties: Default::default(),
+        version: Default::default(),
         client_id: Arc::from(client_id),
         clean_session: true,
         keep_alive: 60,
@@ -114,6 +116,8 @@ fn connect_packet(client_id: &str) -> Packet {
 
 fn connect_packet_persistent(client_id: &str) -> Packet {
     Packet::Connect(ConnectPacket {
+        properties: Default::default(),
+        version: Default::default(),
         client_id: Arc::from(client_id),
         clean_session: false,
         keep_alive: 60,
@@ -187,6 +191,7 @@ async fn cross_tenant_fanout_is_blocked() {
     send_packet(
         &mut pub_w,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("secret/cross-tenant"),
             payload: bytes::Bytes::from_static(b"should-not-leak"),
             dup: false,
@@ -201,7 +206,7 @@ async fn cross_tenant_fanout_is_blocked() {
     // that would betray the isolation invariant.
     let leaked = timeout(
         Duration::from_millis(300),
-        codec::read_packet(&mut sub_r, usize::MAX),
+        codec::read_packet(&mut sub_r, usize::MAX, ProtocolVersion::V311),
     )
     .await;
     assert!(
@@ -238,6 +243,7 @@ async fn same_tenant_fanout_still_works() {
     send_packet(
         &mut pub_w,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("greet/world"),
             payload: bytes::Bytes::from_static(b"hello"),
             dup: false,
@@ -272,6 +278,7 @@ async fn retained_message_replayed_on_subscribe() {
     send_packet(
         &mut pw,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("status/online"),
             payload: bytes::Bytes::from_static(b"true"),
             dup: false,
@@ -323,6 +330,7 @@ async fn retained_empty_payload_clears_store() {
     send_packet(
         &mut pw,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("status/x"),
             payload: bytes::Bytes::from_static(b"v1"),
             dup: false,
@@ -336,6 +344,7 @@ async fn retained_empty_payload_clears_store() {
     send_packet(
         &mut pw,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("status/x"),
             payload: bytes::Bytes::new(),
             dup: false,
@@ -367,7 +376,7 @@ async fn retained_empty_payload_clears_store() {
 
     let leak = timeout(
         Duration::from_millis(200),
-        codec::read_packet(&mut sr, usize::MAX),
+        codec::read_packet(&mut sr, usize::MAX, ProtocolVersion::V311),
     )
     .await;
     assert!(
@@ -427,6 +436,7 @@ async fn dollar_topic_retain_from_client_is_silently_dropped() {
     send_packet(
         &mut pw,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("$SYS/poison/attempt"),
             payload: bytes::Bytes::from_static(b"BAD"),
             dup: false,
@@ -460,7 +470,7 @@ async fn dollar_topic_retain_from_client_is_silently_dropped() {
 
     let leak = timeout(
         Duration::from_millis(200),
-        codec::read_packet(&mut sr, usize::MAX),
+        codec::read_packet(&mut sr, usize::MAX, ProtocolVersion::V311),
     )
     .await;
     assert!(
@@ -518,6 +528,7 @@ async fn acl_denied_publisher_cannot_modify_retained_store() {
     send_packet(
         &mut aw,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("secret/z"),
             payload: bytes::Bytes::from_static(b"original"),
             dup: false,
@@ -537,6 +548,7 @@ async fn acl_denied_publisher_cannot_modify_retained_store() {
     send_packet(
         &mut bw,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("secret/z"),
             payload: bytes::Bytes::from_static(b"MUTATED"),
             dup: false,
@@ -550,6 +562,7 @@ async fn acl_denied_publisher_cannot_modify_retained_store() {
     send_packet(
         &mut bw,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("secret/z"),
             payload: bytes::Bytes::new(),
             dup: false,
@@ -661,6 +674,7 @@ async fn reconnect_with_clean_session_false_preserves_subscriptions() {
     send_packet(
         &mut pw,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("p7/topic"),
             payload: bytes::Bytes::from_static(b"resumed-delivery"),
             dup: false,
@@ -726,6 +740,7 @@ async fn reconnect_with_clean_session_true_resets_state() {
     send_packet(
         &mut pw,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("p7/reset"),
             payload: bytes::Bytes::from_static(b"should-not-arrive"),
             dup: false,
@@ -738,7 +753,7 @@ async fn reconnect_with_clean_session_true_resets_state() {
 
     let leak = timeout(
         Duration::from_millis(250),
-        codec::read_packet(&mut sr2, usize::MAX),
+        codec::read_packet(&mut sr2, usize::MAX, ProtocolVersion::V311),
     )
     .await;
     assert!(
@@ -778,6 +793,7 @@ async fn reconnect_retransmits_unacked_qos1_with_dup() {
     send_packet(
         &mut pw,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("p7/inflight"),
             payload: bytes::Bytes::from_static(b"unacked"),
             dup: false,
@@ -874,6 +890,7 @@ async fn fanout_enforces_max_inflight_messages_per_subscriber() {
         send_packet(
             &mut pw,
             &Packet::Publish(PublishPacket {
+                properties: Default::default(),
                 topic: Arc::from("g7/topic"),
                 payload: bytes::Bytes::from(format!("msg-{i}").into_bytes()),
                 dup: false,
@@ -895,7 +912,7 @@ async fn fanout_enforces_max_inflight_messages_per_subscriber() {
     for _ in 0..2 {
         match timeout(
             Duration::from_secs(2),
-            codec::read_packet(&mut sr, usize::MAX),
+            codec::read_packet(&mut sr, usize::MAX, ProtocolVersion::V311),
         )
         .await
         {
@@ -911,7 +928,7 @@ async fn fanout_enforces_max_inflight_messages_per_subscriber() {
     // Past the cap, the channel MUST be closed (DisconnectLaggard).
     let closed = timeout(
         Duration::from_secs(2),
-        codec::read_packet(&mut sr, usize::MAX),
+        codec::read_packet(&mut sr, usize::MAX, ProtocolVersion::V311),
     )
     .await;
     assert!(
@@ -984,12 +1001,15 @@ async fn will_publish_blocked_by_acl_at_dispatch() {
     // abruptly drops the TCP connection (no DISCONNECT) → Will fires.
     let (_wr, mut ww) = connect_raw(port).await;
     let connect_with_will = Packet::Connect(ConnectPacket {
+        properties: Default::default(),
+        version: Default::default(),
         client_id: Arc::from("g5-will-pub"),
         clean_session: true,
         keep_alive: 60,
         username: Some(Arc::from("alice")),
         password: None,
         will: Some(hotaru_mqtt::WillPacket {
+            properties: Default::default(),
             topic: Arc::from("g5/forbidden"),
             payload: bytes::Bytes::from_static(b"last-words"),
             qos: QoS::AtMostOnce,
@@ -1004,7 +1024,7 @@ async fn will_publish_blocked_by_acl_at_dispatch() {
     // that topic for the dying client. Give the broker plenty of time.
     let leak = timeout(
         Duration::from_millis(400),
-        codec::read_packet(&mut sr, usize::MAX),
+        codec::read_packet(&mut sr, usize::MAX, ProtocolVersion::V311),
     )
     .await;
     assert!(
@@ -1066,7 +1086,7 @@ async fn publish_sys_retained_respects_max_inflight_cap() {
     for _ in 0..2 {
         match timeout(
             Duration::from_secs(2),
-            codec::read_packet(&mut sr, usize::MAX),
+            codec::read_packet(&mut sr, usize::MAX, ProtocolVersion::V311),
         )
         .await
         {
@@ -1082,7 +1102,7 @@ async fn publish_sys_retained_respects_max_inflight_cap() {
 
     let closed = timeout(
         Duration::from_secs(2),
-        codec::read_packet(&mut sr, usize::MAX),
+        codec::read_packet(&mut sr, usize::MAX, ProtocolVersion::V311),
     )
     .await;
     assert!(
@@ -1134,7 +1154,7 @@ async fn takeover_closes_prior_session_and_releases_slot() {
     // slot-leak fix.
     let _ = timeout(
         Duration::from_millis(200),
-        codec::read_packet(&mut r1, usize::MAX),
+        codec::read_packet(&mut r1, usize::MAX, ProtocolVersion::V311),
     )
     .await;
     drop(w1);
@@ -1186,6 +1206,7 @@ async fn client_cannot_publish_to_dollar_sys_even_non_retained() {
     send_packet(
         &mut aw,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("$SYS/broker/version"),
             payload: bytes::Bytes::from_static(b"0wned"),
             dup: false,
@@ -1199,7 +1220,7 @@ async fn client_cannot_publish_to_dollar_sys_even_non_retained() {
     // Monitor MUST NOT see the spoofed payload.
     let leak = timeout(
         Duration::from_millis(300),
-        codec::read_packet(&mut sr, usize::MAX),
+        codec::read_packet(&mut sr, usize::MAX, ProtocolVersion::V311),
     )
     .await;
     assert!(
@@ -1271,7 +1292,7 @@ async fn broker_drops_connection_on_malformed_subscribe_header() {
     // Broker should close the wire — the next read times out / returns EOF.
     let next = timeout(
         Duration::from_secs(2),
-        codec::read_packet(&mut reader, usize::MAX),
+        codec::read_packet(&mut reader, usize::MAX, ProtocolVersion::V311),
     )
     .await;
     match next {
@@ -1298,6 +1319,8 @@ async fn broker_rejects_empty_id_with_persistent_session() {
 
     let (mut reader, mut writer) = connect_raw(port).await;
     let bad_connect = Packet::Connect(ConnectPacket {
+        properties: Default::default(),
+        version: Default::default(),
         client_id: Arc::from(""),
         clean_session: false,
         keep_alive: 60,
@@ -1362,6 +1385,7 @@ async fn connect_returns_connack() {
         Packet::Connack(ConnackPacket {
             session_present,
             return_code,
+            ..
         }) => {
             assert!(!session_present);
             assert_eq!(return_code, ConnackReturnCode::Accepted);
@@ -1384,6 +1408,7 @@ async fn broker_new_denies_anonymous_connect_by_default() {
         Packet::Connack(ConnackPacket {
             session_present,
             return_code,
+            ..
         }) => {
             assert!(!session_present);
             assert_eq!(return_code, ConnackReturnCode::NotAuthorized);
@@ -1451,6 +1476,7 @@ async fn publish_q0_fanout_to_subscriber() {
     send_packet(
         &mut pub_writer,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("hello/world"),
             payload: bytes::Bytes::from_static(b"greetings"),
             dup: false,
@@ -1497,6 +1523,7 @@ async fn publish_q1_round_trip_with_puback() {
     send_packet(
         &mut pub_writer,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("q1/topic"),
             payload: bytes::Bytes::from_static(b"q1-payload"),
             dup: false,
@@ -1550,6 +1577,7 @@ async fn wildcard_plus_matches() {
     send_packet(
         &mut pub_writer,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("a/b/c"),
             payload: bytes::Bytes::from_static(b"hit"),
             dup: false,
@@ -1598,7 +1626,7 @@ async fn unsubscribe_stops_delivery() {
     )
     .await;
     match read_packet(&mut sub_reader).await {
-        Packet::Unsuback(id) => assert_eq!(id, 2),
+        Packet::Unsuback(u) => assert_eq!(u.packet_id, 2),
         other => panic!("expected UNSUBACK, got {:?}", other),
     }
 
@@ -1607,6 +1635,7 @@ async fn unsubscribe_stops_delivery() {
     send_packet(
         &mut pub_writer,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("u/topic"),
             payload: bytes::Bytes::from_static(b"should not arrive"),
             dup: false,
@@ -1619,7 +1648,7 @@ async fn unsubscribe_stops_delivery() {
 
     let waited = timeout(
         Duration::from_millis(300),
-        codec::read_packet(&mut sub_reader, usize::MAX),
+        codec::read_packet(&mut sub_reader, usize::MAX, ProtocolVersion::V311),
     )
     .await;
     assert!(
@@ -1667,6 +1696,7 @@ async fn self_fanout_suppression() {
     send_packet(
         &mut writer,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("self/topic"),
             payload: bytes::Bytes::from_static(b"echo"),
             dup: false,
@@ -1679,7 +1709,7 @@ async fn self_fanout_suppression() {
 
     let waited = timeout(
         Duration::from_millis(300),
-        codec::read_packet(&mut reader, usize::MAX),
+        codec::read_packet(&mut reader, usize::MAX, ProtocolVersion::V311),
     )
     .await;
     assert!(
@@ -1720,6 +1750,7 @@ async fn publish_q2_full_handshake() {
     send_packet(
         &mut pub_writer,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("q2/topic"),
             payload: bytes::Bytes::from_static(b"q2-payload"),
             dup: false,
@@ -1786,6 +1817,7 @@ async fn wildcard_hash_matches() {
     send_packet(
         &mut pub_writer,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("sensors/floor/3/temp"),
             payload: bytes::Bytes::from_static(b"deep"),
             dup: false,
@@ -1833,6 +1865,7 @@ async fn fanout_to_multiple_subscribers() {
     send_packet(
         &mut pub_writer,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("broadcast/topic"),
             payload: bytes::Bytes::from_static(b"to all"),
             dup: false,
@@ -1942,6 +1975,7 @@ async fn external_broker_publish_reaches_mqtt_subscriber() {
             &None,
             &Arc::from("http-bridge"),
             PublishPacket {
+                properties: Default::default(),
                 topic: Arc::from("aiot/event"),
                 payload: bytes::Bytes::from_static(b"from-http"),
                 dup: false,
@@ -1986,12 +2020,15 @@ async fn will_message_fires_on_abrupt_disconnect() {
 
     let (mut pub_reader, mut pub_writer) = connect_raw(port).await;
     let will_connect = Packet::Connect(ConnectPacket {
+        properties: Default::default(),
+        version: Default::default(),
         client_id: Arc::from("crash-client"),
         clean_session: true,
         keep_alive: 60,
         username: None,
         password: None,
         will: Some(hotaru_mqtt::WillPacket {
+            properties: Default::default(),
             topic: Arc::from("lwt/topic"),
             payload: bytes::Bytes::from_static(b"gone"),
             qos: QoS::AtMostOnce,
@@ -2045,6 +2082,7 @@ async fn publisher_ordering_preserved_under_load() {
         send_packet(
             &mut pub_writer,
             &Packet::Publish(PublishPacket {
+                properties: Default::default(),
                 topic: Arc::from("seq/test"),
                 payload: bytes::Bytes::from(format!("{}", i)),
                 dup: false,
@@ -2116,6 +2154,7 @@ async fn v1_retransmit_uses_stashed_adjusted_packet_retain_zero() {
     send_packet(
         &mut pw,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("v1/topic"),
             payload: bytes::Bytes::from_static(b"retained-q1"),
             dup: false,
@@ -2228,6 +2267,7 @@ async fn v3_takeover_does_not_wipe_new_session_after_prior_unregister() {
     send_packet(
         &mut pw,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("v3/race/topic"),
             payload: bytes::Bytes::from_static(b"survived"),
             dup: false,
@@ -2240,7 +2280,7 @@ async fn v3_takeover_does_not_wipe_new_session_after_prior_unregister() {
 
     match timeout(
         Duration::from_secs(2),
-        codec::read_packet(&mut sr2, usize::MAX),
+        codec::read_packet(&mut sr2, usize::MAX, ProtocolVersion::V311),
     )
     .await
     {
@@ -2291,12 +2331,15 @@ async fn v3_takeover_fires_prior_session_will() {
     // Connection #1 — same client_id `v3-will-victim`, carries a Will.
     let (mut r1, mut w1) = connect_raw(port).await;
     let connect_with_will = Packet::Connect(ConnectPacket {
+        properties: Default::default(),
+        version: Default::default(),
         client_id: Arc::from("v3-will-victim"),
         clean_session: true,
         keep_alive: 60,
         username: None,
         password: None,
         will: Some(hotaru_mqtt::WillPacket {
+            properties: Default::default(),
             topic: Arc::from("v3/will"),
             payload: bytes::Bytes::from_static(b"taken-over"),
             qos: QoS::AtMostOnce,
@@ -2316,7 +2359,7 @@ async fn v3_takeover_fires_prior_session_will() {
     // from `register_session`'s takeover path (V3 hoist).
     match timeout(
         Duration::from_secs(2),
-        codec::read_packet(&mut wr, usize::MAX),
+        codec::read_packet(&mut wr, usize::MAX, ProtocolVersion::V311),
     )
     .await
     {
@@ -2335,4 +2378,161 @@ async fn v3_takeover_fires_prior_session_will() {
     drop(r1);
     drop(w2);
     drop(r2);
+}
+
+// ----------------------------------------------------------------------------
+// MQTT 5.0 negotiation and cross-version fanout
+// ----------------------------------------------------------------------------
+
+fn connect_packet_v5(client_id: &str) -> Packet {
+    Packet::Connect(ConnectPacket {
+        version: ProtocolVersion::V5,
+        properties: Default::default(),
+        client_id: Arc::from(client_id),
+        clean_session: true,
+        keep_alive: 60,
+        username: None,
+        password: None,
+        will: None,
+    })
+}
+
+async fn send_packet_v5(writer: &mut TokioIo<tokio::net::tcp::OwnedWriteHalf>, packet: &Packet) {
+    let bytes =
+        codec::encode_packet(packet, ProtocolVersion::V5).expect("encode_packet v5 (fixture)");
+    writer.write_all(&bytes).await.unwrap();
+    writer.flush().await.unwrap();
+}
+
+async fn read_packet_v5(reader: &mut TokioIo<BufReader<tokio::net::tcp::OwnedReadHalf>>) -> Packet {
+    timeout(
+        Duration::from_secs(5),
+        codec::read_packet(reader, usize::MAX, ProtocolVersion::V5),
+    )
+    .await
+    .expect("read_packet v5 timeout")
+    .expect("read_packet v5 error")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v5_connect_returns_v5_connack() {
+    let (port, _broker) = start_broker().await;
+    let (mut r, mut w) = connect_raw(port).await;
+
+    send_packet_v5(&mut w, &connect_packet_v5("v5-client")).await;
+    match read_packet_v5(&mut r).await {
+        Packet::Connack(ack) => {
+            assert!(!ack.session_present);
+            assert_eq!(ack.return_code, ConnackReturnCode::Accepted);
+        }
+        other => panic!("expected v5 CONNACK, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v5_pubsub_roundtrip_forwards_properties() {
+    let (port, _broker) = start_broker().await;
+
+    // Subscriber on v5.
+    let (mut sr, mut sw) = connect_raw(port).await;
+    send_packet_v5(&mut sw, &connect_packet_v5("v5-sub")).await;
+    let _ = read_packet_v5(&mut sr).await; // CONNACK
+    send_packet_v5(
+        &mut sw,
+        &Packet::Subscribe(SubscribePacket {
+            packet_id: 1,
+            subscriptions: vec![TopicSubscription {
+                topic: Arc::from("rob/arm"),
+                qos: QoS::AtMostOnce,
+            }],
+        }),
+    )
+    .await;
+    let _ = read_packet_v5(&mut sr).await; // SUBACK
+
+    // Publisher on v5 sends properties that §3.3.2.3 says must be
+    // forwarded unaltered.
+    let (mut pr, mut pw) = connect_raw(port).await;
+    send_packet_v5(&mut pw, &connect_packet_v5("v5-pub")).await;
+    let _ = read_packet_v5(&mut pr).await; // CONNACK
+    let props = hotaru_mqtt::Properties {
+        response_topic: Some(Arc::from("rob/replies")),
+        correlation_data: Some(bytes::Bytes::from_static(b"c1")),
+        content_type: Some(Arc::from("application/cbor")),
+        user_properties: vec![(Arc::from("trace"), Arc::from("42"))],
+        ..Default::default()
+    };
+    send_packet_v5(
+        &mut pw,
+        &Packet::Publish(PublishPacket {
+            topic: Arc::from("rob/arm"),
+            payload: bytes::Bytes::from_static(b"lift"),
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            packet_id: None,
+            properties: props.clone(),
+        }),
+    )
+    .await;
+
+    match read_packet_v5(&mut sr).await {
+        Packet::Publish(p) => {
+            assert_eq!(p.topic.as_ref(), "rob/arm");
+            assert_eq!(&p.payload[..], b"lift");
+            assert_eq!(p.properties, props, "v5 properties must forward unaltered");
+        }
+        other => panic!("expected forwarded PUBLISH, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v3_publisher_reaches_v5_subscriber() {
+    let (port, _broker) = start_broker().await;
+
+    // Subscriber negotiates v5; its wire frames are v5-shaped.
+    let (mut sr, mut sw) = connect_raw(port).await;
+    send_packet_v5(&mut sw, &connect_packet_v5("v5-sub-x")).await;
+    let _ = read_packet_v5(&mut sr).await;
+    send_packet_v5(
+        &mut sw,
+        &Packet::Subscribe(SubscribePacket {
+            packet_id: 1,
+            subscriptions: vec![TopicSubscription {
+                topic: Arc::from("mix/t"),
+                qos: QoS::AtMostOnce,
+            }],
+        }),
+    )
+    .await;
+    let _ = read_packet_v5(&mut sr).await;
+
+    // Publisher stays on plain v3.1.1.
+    let (mut pr, mut pw) = connect_raw(port).await;
+    send_packet(&mut pw, &connect_packet("v3-pub-x")).await;
+    let _ = read_packet(&mut pr).await;
+    send_packet(
+        &mut pw,
+        &Packet::Publish(PublishPacket {
+            topic: Arc::from("mix/t"),
+            payload: bytes::Bytes::from_static(b"hi"),
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            packet_id: None,
+            properties: Default::default(),
+        }),
+    )
+    .await;
+
+    // The broker must deliver to each session in that session's own
+    // wire version: the subscriber reads a valid v5 PUBLISH frame.
+    match read_packet_v5(&mut sr).await {
+        Packet::Publish(p) => {
+            assert_eq!(p.topic.as_ref(), "mix/t");
+            assert_eq!(&p.payload[..], b"hi");
+            assert!(p.properties.is_empty());
+        }
+        other => panic!("expected PUBLISH, got {other:?}"),
+    }
 }

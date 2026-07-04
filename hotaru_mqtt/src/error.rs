@@ -113,6 +113,21 @@ pub enum Violation {
         count: usize,
         max: usize,
     },
+    // ── MQTT 5.0 (v5 spec §2.2.2 / §3.3.2.3.4 / §3.15) ───────────────────
+    /// A non-repeatable v5 property appeared more than once in one block —
+    /// v5 spec: "It is a Protocol Error to include [it] more than once."
+    DuplicateProperty(u8),
+    /// v5 property value is structurally invalid (e.g. Subscription
+    /// Identifier of 0, which the spec forbids).
+    MalformedProperty(u8),
+    /// v5 property identifier not defined by the spec (§2.2.2.2 table).
+    UnknownProperty(u8),
+    /// Peer sent a Topic Alias but we never advertise a non-zero Topic
+    /// Alias Maximum, so the effective maximum is 0 — v5 §3.3.2.3.4.
+    TopicAliasNotAccepted,
+    /// AUTH packet received, but no Authentication Method was negotiated
+    /// on CONNECT — v5 §4.12: enhanced auth must be agreed first.
+    UnexpectedAuthPacket,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
