@@ -86,6 +86,11 @@ pub struct IncomingPublish {
     pub retain: bool,
     pub dup: bool,
     pub packet_id: Option<PacketId>,
+    /// MQTT 5.0 properties carried by the wire PUBLISH (response topic,
+    /// correlation data, user properties, …). Empty for v3.1.1 peers.
+    /// Rides the inbound stash so QoS 2 release and endpoint dispatch
+    /// both see what the publisher sent.
+    pub properties: crate::properties::Properties,
 }
 
 impl IncomingPublish {

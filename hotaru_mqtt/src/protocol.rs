@@ -243,6 +243,12 @@ where
         .session()
         .set_max_inflight(config.safety.max_inflight_messages());
 
+    // Record the wire version before any traffic: the writer actor
+    // encodes CONNECT (and everything after) with it, and reads below
+    // parse with it.
+    let version = config.protocol_version;
+    channel.set_protocol_version(version);
+
     let connect = build_connect(&config);
     channel.send_packet(Packet::Connect(connect))?;
 
@@ -251,7 +257,7 @@ where
     // 3. Wait for CONNACK with timeout
     let connack_packet = timeout(
         config.connect_timeout,
-        read_packet(&mut reader, max_packet_size),
+        read_packet(&mut reader, max_packet_size, version),
     )
     .await
     .map_err(|_| MqttError::Timeout(TimeoutKind::Connack))??;
@@ -318,7 +324,7 @@ where
             break;
         }
         tokio::select! {
-            inbound = read_packet(&mut reader, max_packet_size) => {
+            inbound = read_packet(&mut reader, max_packet_size, version) => {
                 match inbound {
                     Ok(p) => {
                         if dispatch_client_inbound(
@@ -404,8 +410,8 @@ where
             fire_suback(&channel, s);
             Ok(false)
         }
-        Packet::Unsuback(id) => {
-            fire_unsuback(&channel, id);
+        Packet::Unsuback(u) => {
+            fire_unsuback(&channel, u.packet_id);
             Ok(false)
         }
         Packet::Pingresp => Ok(false),
@@ -651,6 +657,7 @@ async fn send_publish<W: ConnStream>(
     };
 
     let packet = PublishPacket {
+        properties: Default::default(),
         topic: req.topic,
         payload: req.payload,
         dup: false,
@@ -806,6 +813,8 @@ fn fire_unsuback<W: ConnStream>(channel: &MqttChannel<W>, id: u16) {
 
 fn build_connect(config: &MqttClientConfig) -> ConnectPacket {
     ConnectPacket {
+        version: config.protocol_version,
+        properties: Default::default(),
         client_id: config.client_id.clone(),
         clean_session: config.clean_session,
         keep_alive: config.keep_alive_secs,
@@ -823,6 +832,7 @@ fn build_connect(config: &MqttClientConfig) -> ConnectPacket {
             payload: w.payload.clone(),
             qos: w.qos,
             retain: w.retain,
+            properties: Default::default(),
         }),
     }
 }

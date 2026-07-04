@@ -18,6 +18,7 @@ pub mod codec;
 pub mod context;
 pub mod error;
 pub mod packet;
+pub mod properties;
 pub mod protocol;
 pub mod request;
 pub mod safety;
@@ -37,9 +38,11 @@ pub use hotaru_tls::{
     TlsOutbound, TlsOutboundTarget, TlsStream, TlsTransport,
 };
 pub use packet::{
-    ConnackPacket, ConnackReturnCode, ConnectPacket, Packet, PublishPacket, SubackPacket,
-    SubscribePacket, TopicSubscription, UnsubscribePacket, WillPacket, incoming_from_packet,
+    ConnackPacket, ConnackReturnCode, ConnectPacket, Packet, ProtocolVersion, PublishPacket,
+    SubackPacket, SubscribePacket, TopicSubscription, UnsubackPacket, UnsubscribePacket,
+    WillPacket, incoming_from_packet,
 };
+pub use properties::Properties;
 pub use protocol::{
     CLIENT_CONFIG_STATICS_KEY, DefaultInboundHandler, DefaultMqttTransport, MQTT,
     MqttClientProtocol,

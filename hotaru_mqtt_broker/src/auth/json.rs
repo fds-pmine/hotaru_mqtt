@@ -377,6 +377,8 @@ mod tests {
 
     fn connect_with(username: Option<&str>, password: Option<&[u8]>) -> ConnectPacket {
         ConnectPacket {
+            properties: Default::default(),
+            version: Default::default(),
             client_id: Arc::from("cid"),
             clean_session: true,
             keep_alive: 60,
