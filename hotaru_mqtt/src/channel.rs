@@ -14,9 +14,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
+use event_listener::Event;
+use hotaru_core::app::runtime::{AsyncMutexCap, Either, RuntimeSpec};
 use hotaru_core::connection::{ConnMeta, ConnStream, HotaruRead, HotaruWrite};
 use hotaru_core::protocol::{Channel, ProtocolRole};
-use tokio::sync::{Mutex, Notify, mpsc};
+use hotaru_rt_tokio::TokioRuntime;
 
 use crate::codec::{write_packet, write_publish_packet};
 use crate::error::MqttError;
@@ -51,16 +53,16 @@ pub enum WriteCmd {
 // MqttChannel
 // ----------------------------------------------------------------------------
 
-pub struct MqttChannel<W: ConnStream> {
+pub struct MqttChannel<W: ConnStream, Rt: RuntimeSpec = TokioRuntime> {
     // ── Physical wire ───────────────────────────────────────────
-    reader: Arc<Mutex<Option<<W::ReadHalf as HotaruRead>::Buffered>>>,
+    reader: Arc<Rt::AsyncMutex<Option<<W::ReadHalf as HotaruRead>::Buffered>>>,
     /// Writer actor's input — **bounded** (capacity from caller's `MqttSafety`).
     /// `pub(crate)`; downstream protocol implementations drive it via the
     /// public `send_cmd` / `send_packet` / `send_publish` methods, never
     /// touch the sender directly. Full queue → `MqttError::Backpressure`
     /// (P1.B); slow-consumer policy that translates that into drop-vs-
     /// disconnect lives in `hotaru_mqtt_broker` and gets wired in P3.
-    pub(crate) cmd_tx: mpsc::Sender<WriteCmd>,
+    pub(crate) cmd_tx: async_channel::Sender<WriteCmd>,
 
     // ── Connection metadata ─────────────────────────────────────
     connection_id: u64,
@@ -79,10 +81,14 @@ pub struct MqttChannel<W: ConnStream> {
 
     // ── Lifecycle signals ───────────────────────────────────────
     open: Arc<AtomicBool>,
-    shutdown: Arc<Notify>,
+    /// Close broadcast. `event_listener::Event` replaces `tokio::sync::Notify`:
+    /// executor-independent, same register-then-notify discipline. Every
+    /// wait site pairs `listen()` with an `open` re-check to close the
+    /// lost-wakeup window (close() flips `open` before notifying).
+    shutdown: Arc<Event>,
 }
 
-impl<W: ConnStream> Clone for MqttChannel<W> {
+impl<W: ConnStream, Rt: RuntimeSpec> Clone for MqttChannel<W, Rt> {
     fn clone(&self) -> Self {
         Self {
             reader: self.reader.clone(),
@@ -99,7 +105,7 @@ impl<W: ConnStream> Clone for MqttChannel<W> {
     }
 }
 
-impl<W: ConnStream> Channel for MqttChannel<W> {
+impl<W: ConnStream, Rt: RuntimeSpec> Channel for MqttChannel<W, Rt> {
     fn is_open(&self) -> bool {
         self.open.load(Ordering::Acquire)
     }
@@ -110,14 +116,14 @@ impl<W: ConnStream> Channel for MqttChannel<W> {
             return;
         }
         // Notify writer actor to exit (drains in-flight commands first).
-        self.shutdown.notify_waiters();
+        self.shutdown.notify(usize::MAX);
         // MVP: tear down session inflight on channel close. M phase
         // (clean_session=false) will skip this so session can rebind.
         self.session.abandon();
     }
 }
 
-impl<W: ConnStream> MqttChannel<W> {
+impl<W: ConnStream, Rt: RuntimeSpec> MqttChannel<W, Rt> {
     /// Construct a new channel, spawn its writer actor, and stash the reader
     /// for `take_reader`. Called from `Protocol::open_channel` implementations
     /// in any downstream protocol crate, client or server.
@@ -135,14 +141,15 @@ impl<W: ConnStream> MqttChannel<W> {
     where
         W::WriteHalf: HotaruWrite<Error = std::io::Error>,
     {
-        let (cmd_tx, cmd_rx) = mpsc::channel(cmd_buffer_size.max(1));
+        let (cmd_tx, cmd_rx) = async_channel::bounded(cmd_buffer_size.max(1));
         let open = Arc::new(AtomicBool::new(true));
-        let shutdown = Arc::new(Notify::new());
+        let shutdown = Arc::new(Event::new());
         let session = MqttSession::new();
         let version = Arc::new(AtomicU8::new(ProtocolVersion::default().level()));
 
-        // Spawn the writer actor — single owner of W::WriteHalf.
-        tokio::spawn(writer_actor::<W>(
+        // Spawn the writer actor — single owner of W::WriteHalf. Spawned
+        // through the runtime spec, never a concrete executor.
+        Rt::spawn_detached(writer_actor::<W, Rt>(
             writer,
             cmd_rx,
             shutdown.clone(),
@@ -151,7 +158,7 @@ impl<W: ConnStream> MqttChannel<W> {
         ));
 
         Self {
-            reader: Arc::new(Mutex::new(Some(reader))),
+            reader: Arc::new(Rt::AsyncMutex::new(Some(reader))),
             cmd_tx,
             connection_id: next_connection_id(),
             role,
@@ -234,7 +241,7 @@ impl<W: ConnStream> MqttChannel<W> {
     }
 
     fn try_send(&self, cmd: WriteCmd) -> Result<(), MqttError> {
-        use mpsc::error::TrySendError;
+        use async_channel::TrySendError;
         match self.cmd_tx.try_send(cmd) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => Err(MqttError::Backpressure),
@@ -242,10 +249,11 @@ impl<W: ConnStream> MqttChannel<W> {
         }
     }
 
-    /// Shared `Notify` that fires on `close()`. `handle_*` loops `.await`
-    /// `notified()` on this to break early. Exposed `pub` so downstream
-    /// dispatchers can react to channel shutdown.
-    pub fn shutdown_signal(&self) -> Arc<Notify> {
+    /// Shared close `Event` that fires on `close()`. `handle_*` loops
+    /// `listen().await` on this to break early (always re-checking
+    /// `is_open` after `listen()` to avoid the lost-wakeup window).
+    /// Exposed `pub` so downstream dispatchers can react to shutdown.
+    pub fn shutdown_signal(&self) -> Arc<Event> {
         self.shutdown.clone()
     }
 }
@@ -254,10 +262,10 @@ impl<W: ConnStream> MqttChannel<W> {
 // Writer actor task
 // ----------------------------------------------------------------------------
 
-async fn writer_actor<W: ConnStream>(
+async fn writer_actor<W: ConnStream, Rt: RuntimeSpec>(
     mut writer: <W::WriteHalf as HotaruWrite>::Buffered,
-    mut cmd_rx: mpsc::Receiver<WriteCmd>,
-    shutdown: Arc<Notify>,
+    cmd_rx: async_channel::Receiver<WriteCmd>,
+    shutdown: Arc<Event>,
     open: Arc<AtomicBool>,
     version: Arc<AtomicU8>,
 ) where
@@ -265,31 +273,76 @@ async fn writer_actor<W: ConnStream>(
 {
     loop {
         let ver = ProtocolVersion::from_level(version.load(Ordering::Acquire)).unwrap_or_default();
-        tokio::select! {
-            cmd = cmd_rx.recv() => {
+        // Register the listener BEFORE re-checking `open`: close() flips
+        // `open` first and notifies second, so either we observe the flag
+        // here or the listener catches the notification — no lost wakeup.
+        let closed = shutdown.listen();
+        if !open.load(Ordering::Acquire) {
+            drain_queued::<W, Rt>(&mut writer, &cmd_rx, ver).await;
+            break;
+        }
+        match Rt::select2(cmd_rx.recv(), closed).await {
+            Either::Left(cmd) => {
                 match cmd {
                     // 0.8.3: the write half is the transport's Buffered form
                     // (`into_buf_write`), so bytes sit in the buffer until
                     // flushed. Flush after each packet to keep the pre-0.8.3
                     // unbuffered-write semantics (acks must hit the wire now).
-                    Some(WriteCmd::Packet(p)) => {
+                    Ok(WriteCmd::Packet(p)) => {
                         if write_packet(&mut writer, &p, ver).await.is_err() { break; }
                         if writer.flush().await.is_err() { break; }
                     }
-                    Some(WriteCmd::Publish(p)) => {
+                    Ok(WriteCmd::Publish(p)) => {
                         if write_publish_packet(&mut writer, &p, ver).await.is_err() { break; }
                         if writer.flush().await.is_err() { break; }
                     }
-                    Some(WriteCmd::Flush) => {
+                    Ok(WriteCmd::Flush) => {
                         let _ = writer.flush().await;  // W policy §1: shutdown-ish path
                     }
-                    Some(WriteCmd::Shutdown) | None => break,
+                    // Err(_) = every sender dropped — same end-of-stream
+                    // semantics as tokio's `recv() == None`.
+                    Ok(WriteCmd::Shutdown) | Err(_) => break,
                 }
             }
-            _ = shutdown.notified() => break,
+            Either::Right(()) => {
+                // close() contract: "drains in-flight commands first".
+                // The refusal path (send CONNACK-refused, then close())
+                // depends on this — commands queued before the close
+                // still reach the wire.
+                drain_queued::<W, Rt>(&mut writer, &cmd_rx, ver).await;
+                break;
+            }
         }
     }
     // Mark channel closed (idempotent with Channel::close).
     open.store(false, Ordering::Release);
     let _ = writer.shutdown().await; // W policy §1: shutdown path
+}
+
+/// Best-effort drain of commands already queued at close() time. Stops on
+/// the first write error or an explicit `Shutdown` command; never blocks
+/// (only `try_recv`, so nothing enqueued after this point is honoured).
+async fn drain_queued<W: ConnStream, Rt: RuntimeSpec>(
+    writer: &mut <W::WriteHalf as HotaruWrite>::Buffered,
+    cmd_rx: &async_channel::Receiver<WriteCmd>,
+    ver: ProtocolVersion,
+) where
+    W::WriteHalf: HotaruWrite<Error = std::io::Error>,
+{
+    while let Ok(cmd) = cmd_rx.try_recv() {
+        match cmd {
+            WriteCmd::Packet(p) => {
+                if write_packet(writer, &p, ver).await.is_err() { return; }
+                if writer.flush().await.is_err() { return; }
+            }
+            WriteCmd::Publish(p) => {
+                if write_publish_packet(writer, &p, ver).await.is_err() { return; }
+                if writer.flush().await.is_err() { return; }
+            }
+            WriteCmd::Flush => {
+                let _ = writer.flush().await;
+            }
+            WriteCmd::Shutdown => return,
+        }
+    }
 }

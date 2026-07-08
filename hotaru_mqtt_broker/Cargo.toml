@@ -13,7 +13,10 @@ categories = ["network-programming"]
 hotaru_mqtt = { path = "../hotaru_mqtt", version = "0.8.3-rc1" }
 hotaru_core = { workspace = true }
 hotaru_io_tokio = { workspace = true }
-tokio = { workspace = true }
+hotaru_rt_tokio = { workspace = true }
+async-channel = { workspace = true }
+futures-channel = { workspace = true }
+event-listener = { workspace = true }
 async-trait = { workspace = true }
 dashmap = { workspace = true }
 bytes = { workspace = true }
