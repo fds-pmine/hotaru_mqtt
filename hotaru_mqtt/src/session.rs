@@ -5,7 +5,7 @@
 //! `clean_session=false` resume will later allow an old session to be
 //! re-bound to a new channel (see `SessionStore`).
 //!
-//! All concurrency primitives are chosen per the "实用无锁" constraint:
+//! All concurrency primitives are chosen per the "pragmatic lock-free" constraint:
 //! `AtomicU16` for the packet-id counter, `OnceLock` for the one-time bind,
 //! `DashMap` for per-packet-id inflight tracking.
 
@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
 use hotaru_core::connection::ConnStream;
-use tokio::sync::oneshot;
+use futures_channel::oneshot;
 
 use crate::channel::MqttChannel;
 use crate::error::{MqttError, Violation};
@@ -296,8 +296,8 @@ impl MqttSession {
 ///
 /// Lives on the session module so any protocol implementation (client or
 /// downstream server) can reuse it without duplicating QoS bookkeeping.
-pub fn ack_inbound_publish_pre_chain<W: ConnStream>(
-    channel: &MqttChannel<W>,
+pub fn ack_inbound_publish_pre_chain<W: ConnStream, Rt: hotaru_core::app::runtime::RuntimeSpec>(
+    channel: &MqttChannel<W, Rt>,
     publish: &PublishPacket,
     receive_max: usize,
 ) -> Result<(), MqttError> {

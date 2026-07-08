@@ -13,8 +13,9 @@ use std::time::Duration;
 use hotaru_core::app::common::RuntimeConfig;
 use hotaru_core::connection::{ConnStream, HotaruRead, HotaruWrite, TransportSpec};
 use hotaru_core::protocol::{Channel as _, CtxError, Protocol, ProtocolFlow, ProtocolRole};
+use hotaru_core::app::runtime::{Either, RuntimeSpec};
 use hotaru_core::url::UrlRoot;
-use tokio::time::timeout;
+use hotaru_rt_tokio::TokioRuntime;
 
 use crate::traits::TenantId;
 use hotaru_mqtt::ack_inbound_publish_pre_chain;
@@ -28,7 +29,6 @@ use hotaru_mqtt::packet::{
 };
 use hotaru_mqtt::request::{QoS, TopicFilter, WillMessage};
 use hotaru_mqtt::session::BindInfo;
-use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::broker::Broker;
@@ -73,49 +73,58 @@ pub type MQTTS_SERVER = MqttTlsServerProtocol;
 pub struct MqttServerProtocol<
     W: ConnStream = hotaru_io_tokio::TcpStream,
     TS: TransportSpec<Wire = W> = DefaultMqttTransport,
+    Rt: RuntimeSpec = TokioRuntime,
 > {
     _w: PhantomData<fn() -> W>,
     _ts: PhantomData<fn() -> TS>,
+    _rt: PhantomData<fn() -> Rt>,
 }
 
-impl<W: ConnStream, TS: TransportSpec<Wire = W>> Clone for MqttServerProtocol<W, TS> {
+impl<W: ConnStream, TS: TransportSpec<Wire = W>, Rt: RuntimeSpec> Clone
+    for MqttServerProtocol<W, TS, Rt>
+{
     fn clone(&self) -> Self {
         Self {
             _w: PhantomData,
             _ts: PhantomData,
+            _rt: PhantomData,
         }
     }
 }
 
-impl<W: ConnStream, TS: TransportSpec<Wire = W>> Default for MqttServerProtocol<W, TS> {
+impl<W: ConnStream, TS: TransportSpec<Wire = W>, Rt: RuntimeSpec> Default
+    for MqttServerProtocol<W, TS, Rt>
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<W: ConnStream, TS: TransportSpec<Wire = W>> MqttServerProtocol<W, TS> {
+impl<W: ConnStream, TS: TransportSpec<Wire = W>, Rt: RuntimeSpec> MqttServerProtocol<W, TS, Rt> {
     pub fn new() -> Self {
         Self {
             _w: PhantomData,
             _ts: PhantomData,
+            _rt: PhantomData,
         }
     }
 }
 
-impl<W, TS> Protocol for MqttServerProtocol<W, TS>
+impl<W, TS, Rt> Protocol for MqttServerProtocol<W, TS, Rt>
 where
     W: ConnStream,
     TS: TransportSpec<Wire = W>,
+    Rt: RuntimeSpec,
     MqttError: From<<TS as TransportSpec>::IoError>,
     W::ReadHalf: HotaruRead<Error = std::io::Error>,
     W::WriteHalf: HotaruWrite<Error = std::io::Error>,
 {
     type Wire = W;
     type TS = TS;
-    type Channel = MqttChannel<W>;
+    type Channel = MqttChannel<W, Rt>;
     type Stream = ();
     type Message = Packet;
-    type Context = MqttContext<TS>;
+    type Context = MqttContext<TS, Rt>;
 
     fn name(&self) -> &'static str {
         "mqtt-server"
@@ -202,18 +211,19 @@ where
 // handle_server — per-connection session loop
 // ============================================================================
 
-async fn handle_server<W, TS>(
-    channel: &MqttChannel<W>,
+async fn handle_server<W, TS, Rt>(
+    channel: &MqttChannel<W, Rt>,
     runtime: Arc<RuntimeConfig>,
-    root: Arc<UrlRoot<MqttContext<TS>, TS>>,
+    root: Arc<UrlRoot<MqttContext<TS, Rt>, TS>>,
 ) -> Result<ProtocolFlow, MqttError>
 where
     W: ConnStream,
     TS: TransportSpec<Wire = W>,
+    Rt: RuntimeSpec,
     W::ReadHalf: HotaruRead<Error = std::io::Error>,
 {
     let broker = runtime
-        .get_static::<Broker<W>>(BROKER_STATICS_KEY)
+        .get_static::<Broker<W, Rt>>(BROKER_STATICS_KEY)
         .ok_or_else(|| MqttError::Configuration("Broker not registered".into()))?;
 
     // P6: idempotent `$SYS/broker/*` initialization on first connection.
@@ -229,7 +239,7 @@ where
     // 1. Read CONNECT with timeout. The version argument only shapes
     //    non-CONNECT frames; CONNECT itself carries its protocol level,
     //    so the pre-handshake default is fine for either client kind.
-    let connect_packet = timeout(
+    let connect_packet = Rt::timeout(
         CONNECT_RECEIVE_TIMEOUT,
         read_packet(&mut reader, max_packet_size, ProtocolVersion::default()),
     )
@@ -391,8 +401,8 @@ where
     // returns, `fanout_tx` drops, the worker drains remaining items and
     // exits.
     let (fanout_tx, fanout_rx) =
-        mpsc::channel::<PublishPacket>(broker.safety().max_queued_messages().max(1));
-    let _worker = tokio::spawn(fanout_worker::<W, TS>(
+        async_channel::bounded::<PublishPacket>(broker.safety().max_queued_messages().max(1));
+    Rt::spawn_detached(fanout_worker::<W, TS, Rt>(
         fanout_rx,
         channel.clone(),
         broker.clone(),
@@ -418,8 +428,20 @@ where
         if !channel.is_open() {
             break;
         }
-        tokio::select! {
-            packet = timeout(read_timeout, read_packet(&mut reader, max_packet_size, version)) => {
+        // Lost-wakeup discipline (see channel.rs): register the shutdown
+        // listener before the is_open re-check above ran? The check sits
+        // at loop top; re-listen here then re-check once more.
+        let closed = shutdown.listen();
+        if !channel.is_open() {
+            break;
+        }
+        match Rt::select2(
+            Rt::timeout(read_timeout, read_packet(&mut reader, max_packet_size, version)),
+            closed,
+        )
+        .await
+        {
+            Either::Left(packet) => {
                 match packet {
                     Err(_) => break,                              // keep-alive timeout
                     Ok(Err(MqttError::Io(_))) => break,           // wire closed
@@ -446,7 +468,7 @@ where
                     }
                 }
             }
-            _ = shutdown.notified() => break,
+            Either::Right(()) => break,
         }
     }
 
@@ -474,19 +496,20 @@ where
 // fanout_worker — per-connection FIFO publish drainer (spec §4.6)
 // ============================================================================
 
-async fn fanout_worker<W, TS>(
-    mut rx: mpsc::Receiver<PublishPacket>,
-    channel: MqttChannel<W>,
-    broker: Broker<W>,
+async fn fanout_worker<W, TS, Rt>(
+    rx: async_channel::Receiver<PublishPacket>,
+    channel: MqttChannel<W, Rt>,
+    broker: Broker<W, Rt>,
     tenant: Option<TenantId>,
     client_id: Arc<str>,
     runtime: Arc<RuntimeConfig>,
-    root: Arc<UrlRoot<MqttContext<TS>, TS>>,
+    root: Arc<UrlRoot<MqttContext<TS, Rt>, TS>>,
 ) where
     W: ConnStream,
     TS: TransportSpec<Wire = W>,
+    Rt: RuntimeSpec,
 {
-    while let Some(publish) = rx.recv().await {
+    while let Ok(publish) = rx.recv().await {
         let fanout_packet = run_server_chain_then_decide_fanout(
             channel.clone(),
             publish,
@@ -500,16 +523,17 @@ async fn fanout_worker<W, TS>(
     }
 }
 
-async fn dispatch_server_inbound<W>(
-    channel: MqttChannel<W>,
-    broker: Broker<W>,
+async fn dispatch_server_inbound<W, Rt>(
+    channel: MqttChannel<W, Rt>,
+    broker: Broker<W, Rt>,
     tenant: &Option<TenantId>,
     client_id: &Arc<str>,
     packet: Packet,
-    fanout_tx: &mpsc::Sender<PublishPacket>,
+    fanout_tx: &async_channel::Sender<PublishPacket>,
 ) -> Result<(), MqttError>
 where
     W: ConnStream,
+    Rt: RuntimeSpec,
 {
     match packet {
         Packet::Publish(publish) => {
@@ -529,7 +553,7 @@ where
             // QoS 0 / 1: chain + fanout run on the coordinator worker, in
             // strict arrival order (spec §4.6). Bounded queue (F8): on
             // overflow, apply the broker's `SlowConsumerPolicy`.
-            use tokio::sync::mpsc::error::TrySendError;
+            use async_channel::TrySendError;
             let qos_for_policy = publish.qos;
             match fanout_tx.try_send(publish) {
                 Ok(_) | Err(TrySendError::Closed(_)) => {}
@@ -637,7 +661,7 @@ where
                     retain: stored.retain,
                     packet_id: Some(id),
                 };
-                use tokio::sync::mpsc::error::TrySendError;
+                use async_channel::TrySendError;
                 let qos_for_policy = publish.qos;
                 match fanout_tx.try_send(publish) {
                     Ok(_) | Err(TrySendError::Closed(_)) => {}
@@ -664,15 +688,16 @@ where
 /// if the chain didn't suppress it. Sequential (await), unlike client-side
 /// which fires-and-forgets, because the chain may mutate the packet before
 /// broker fanout (O.4 — chain first, then fanout).
-async fn run_server_chain_then_decide_fanout<W, TS>(
-    channel: MqttChannel<W>,
+async fn run_server_chain_then_decide_fanout<W, TS, Rt>(
+    channel: MqttChannel<W, Rt>,
     publish: PublishPacket,
     _runtime: Arc<RuntimeConfig>,
-    root: Arc<UrlRoot<MqttContext<TS>, TS>>,
+    root: Arc<UrlRoot<MqttContext<TS, Rt>, TS>>,
 ) -> Option<PublishPacket>
 where
     W: ConnStream,
     TS: TransportSpec<Wire = W>,
+    Rt: RuntimeSpec,
 {
     let topic = publish.topic.clone();
     let segments: Vec<&str> = topic.split('/').collect();
@@ -681,7 +706,7 @@ where
     let mut current = publish;
 
     while let Some(node) = cursor.find_next(&segments) {
-        let mut ctx = MqttContext::<TS>::default();
+        let mut ctx = MqttContext::<TS, Rt>::default();
         ctx.set_incoming(incoming_from_packet(&current));
         ctx.install_channel(channel.clone());
         ctx.set_endpoint(node.clone());

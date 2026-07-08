@@ -20,6 +20,13 @@ hotaru_core = { path = "../hotaru/hotaru_core", version = "0.8.3" }
 hotaru_tls = { path = "../hotaru/hotaru_tls", version = "0.8.2" }
 hotaru_http = { path = "../hotaru/hotaru_http", version = "0.8.3" }
 hotaru_io_tokio = { path = "../hotaru/hotaru_io_tokio", version = "0.8.3" }
+hotaru_rt_tokio = { path = "../hotaru/hotaru_rt_tokio", version = "0.8.3" }
+# Runtime-agnostic sync primitives (executor-independent, no_std-capable):
+# async-channel replaces tokio mpsc (same try_send(&self) + bounded semantics),
+# futures-channel provides oneshot, event-listener replaces Notify.
+async-channel = "2"
+futures-channel = { version = "0.3", default-features = false, features = ["alloc"] }
+event-listener = "5"
 tokio = { version = "1.28", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 async-trait = "0.1.88"
 dashmap = "6"

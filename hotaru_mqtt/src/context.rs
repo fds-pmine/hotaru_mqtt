@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use hotaru_core::app::runtime::RuntimeSpec;
 use hotaru_core::connection::TransportSpec;
 use hotaru_core::extensions::{Locals, Params};
 use hotaru_core::protocol::{ProtocolRole, RequestContext};
@@ -23,7 +24,10 @@ use crate::channel::MqttChannel;
 use crate::error::MqttError;
 use crate::request::{IncomingPublish, MqttRequest, MqttResponse, PublishAck, PublishRequest};
 
-pub struct MqttContext<TS: TransportSpec = hotaru_io_tokio::TcpTransport> {
+pub struct MqttContext<
+    TS: TransportSpec = hotaru_io_tokio::TcpTransport,
+    Rt: RuntimeSpec = hotaru_rt_tokio::TokioRuntime,
+> {
     /// `run!` path: injected by `RequestContext::inject_request`.
     pub request: MqttRequest,
 
@@ -37,7 +41,7 @@ pub struct MqttContext<TS: TransportSpec = hotaru_io_tokio::TcpTransport> {
     /// Channel installed by `Protocol::install_channel` (called from
     /// `Client::request_fn` after `acquire_channel`, or directly by
     /// `handle_*` for inbound dispatch).
-    channel: Option<MqttChannel<TS::Wire>>,
+    channel: Option<MqttChannel<TS::Wire, Rt>>,
 
     /// Whether the inbound publish should continue past the chain into any
     /// downstream propagation (re-publish, gateway, etc.). Endpoint code
@@ -46,13 +50,13 @@ pub struct MqttContext<TS: TransportSpec = hotaru_io_tokio::TcpTransport> {
     propagate: bool,
 
     /// For endpoint URL captures (named segments via `<id>`).
-    endpoint: Option<Arc<UrlNode<MqttContext<TS>, TS>>>,
+    endpoint: Option<Arc<UrlNode<MqttContext<TS, Rt>, TS>>>,
 
     pub params: Params,
     pub locals: Locals,
 }
 
-impl<TS: TransportSpec> Default for MqttContext<TS> {
+impl<TS: TransportSpec, Rt: RuntimeSpec> Default for MqttContext<TS, Rt> {
     fn default() -> Self {
         Self {
             request: MqttRequest::Publish(PublishRequest::default()),
@@ -67,14 +71,14 @@ impl<TS: TransportSpec> Default for MqttContext<TS> {
     }
 }
 
-impl<TS: TransportSpec> MqttContext<TS> {
+impl<TS: TransportSpec, Rt: RuntimeSpec> MqttContext<TS, Rt> {
     // ── Channel + slot accessors (pub for downstream protocol implementations) ──
 
-    pub fn install_channel(&mut self, ch: MqttChannel<TS::Wire>) {
+    pub fn install_channel(&mut self, ch: MqttChannel<TS::Wire, Rt>) {
         self.channel = Some(ch);
     }
 
-    pub fn channel(&self) -> Option<&MqttChannel<TS::Wire>> {
+    pub fn channel(&self) -> Option<&MqttChannel<TS::Wire, Rt>> {
         self.channel.as_ref()
     }
 
@@ -82,7 +86,7 @@ impl<TS: TransportSpec> MqttContext<TS> {
         self.incoming = Some(p);
     }
 
-    pub fn set_endpoint(&mut self, node: Arc<UrlNode<MqttContext<TS>, TS>>) {
+    pub fn set_endpoint(&mut self, node: Arc<UrlNode<MqttContext<TS, Rt>, TS>>) {
         self.endpoint = Some(node);
     }
 
@@ -96,9 +100,9 @@ impl<TS: TransportSpec> MqttContext<TS> {
     /// This is the public face of the per-slot setters so downstream protocol
     /// implementations don't need to compose them one at a time.
     pub fn for_inbound_dispatch(
-        channel: MqttChannel<TS::Wire>,
+        channel: MqttChannel<TS::Wire, Rt>,
         incoming: IncomingPublish,
-        endpoint: Arc<UrlNode<MqttContext<TS>, TS>>,
+        endpoint: Arc<UrlNode<MqttContext<TS, Rt>, TS>>,
     ) -> Self {
         let mut ctx = Self::default();
         ctx.install_channel(channel);
@@ -143,11 +147,11 @@ impl<TS: TransportSpec> MqttContext<TS> {
     }
 }
 
-impl<TS: TransportSpec> RequestContext for MqttContext<TS> {
+impl<TS: TransportSpec, Rt: RuntimeSpec> RequestContext for MqttContext<TS, Rt> {
     type Request = MqttRequest;
     type Response = MqttResponse;
     type Error = MqttError;
-    type Channel = MqttChannel<TS::Wire>;
+    type Channel = MqttChannel<TS::Wire, Rt>;
 
     fn handle_error(&mut self) {
         // MQTT has no "500 error response" concept. Suppress downstream
