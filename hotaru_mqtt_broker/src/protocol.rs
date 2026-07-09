@@ -116,8 +116,8 @@ where
     TS: TransportSpec<Wire = W>,
     Rt: RuntimeSpec,
     MqttError: From<<TS as TransportSpec>::IoError>,
-    W::ReadHalf: HotaruRead<Error = std::io::Error>,
-    W::WriteHalf: HotaruWrite<Error = std::io::Error>,
+    W::ReadHalf: HotaruRead,
+    W::WriteHalf: HotaruWrite,
 {
     type Wire = W;
     type TS = TS;
@@ -220,7 +220,7 @@ where
     W: ConnStream,
     TS: TransportSpec<Wire = W>,
     Rt: RuntimeSpec,
-    W::ReadHalf: HotaruRead<Error = std::io::Error>,
+    W::ReadHalf: HotaruRead,
 {
     let broker = runtime
         .get_static::<Broker<W, Rt>>(BROKER_STATICS_KEY)

@@ -17,7 +17,13 @@ use crate::packet::ConnackReturnCode;
 
 #[derive(Debug)]
 pub enum MqttError {
-    Io(std::io::Error),
+    /// A wire error from the underlying transport, kept abstract so the codec
+    /// is not pinned to one backend: it holds tokio's `std::io::Error`,
+    /// embassy's `EmbeddedIoError`, or any other `HotaruRead`/`HotaruWrite`
+    /// error (the framework bounds that associated type to
+    /// `core::error::Error + Send + Sync + 'static`). Boxed via `alloc`, so it
+    /// stays available under `no_std`.
+    Io(Box<dyn core::error::Error + Send + Sync>),
     ChannelClosed,
     AckTimeout,
     Timeout(TimeoutKind),
@@ -178,10 +184,21 @@ impl fmt::Display for MqttError {
     }
 }
 
+impl MqttError {
+    /// Wrap any backend wire error (tokio `std::io::Error`, embassy
+    /// `EmbeddedIoError`, …) into the abstract `Io` variant. Codec/channel
+    /// call sites use `.map_err(MqttError::io)?` instead of a concrete
+    /// `From<std::io::Error>`, which is what lets one MQTT crate serve every
+    /// `HotaruRead`/`HotaruWrite` backend.
+    pub fn io<E: core::error::Error + Send + Sync + 'static>(e: E) -> Self {
+        Self::Io(Box::new(e))
+    }
+}
+
 impl std::error::Error for MqttError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(e) => Some(e),
+            Self::Io(e) => Some(e.as_ref()),
             _ => None,
         }
     }
@@ -189,7 +206,7 @@ impl std::error::Error for MqttError {
 
 impl From<std::io::Error> for MqttError {
     fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
+        Self::io(e)
     }
 }
 

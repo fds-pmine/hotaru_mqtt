@@ -34,13 +34,13 @@ use crate::request::{QoS, SubackCode};
 /// so a malicious peer cannot OOM the process by declaring a 256 MiB body.
 /// Pass `usize::MAX` to disable (spec hard cap of 268_435_455 still applies
 /// via `read_remaining_length`).
-pub async fn read_packet<R: HotaruRead<Error = std::io::Error> + Unpin + Send>(
+pub async fn read_packet<R: HotaruRead + Unpin + Send>(
     reader: &mut R,
     max_size: usize,
     version: ProtocolVersion,
 ) -> Result<Packet, MqttError> {
     let mut header_byte = [0u8; 1];
-    reader.read_exact(&mut header_byte).await?;
+    reader.read_exact(&mut header_byte).await.map_err(MqttError::io)?;
     let first = header_byte[0];
 
     let raw_type = first >> 4;
@@ -56,7 +56,7 @@ pub async fn read_packet<R: HotaruRead<Error = std::io::Error> + Unpin + Send>(
         .into());
     }
     let mut body = vec![0u8; remaining];
-    reader.read_exact(&mut body).await?;
+    reader.read_exact(&mut body).await.map_err(MqttError::io)?;
 
     parse_packet(first, packet_type, remaining, &body, version)
 }
@@ -141,20 +141,20 @@ pub fn encode_packet(packet: &Packet, version: ProtocolVersion) -> Result<Vec<u8
 
 /// Write a packet to an async writer. Used by the writer actor for control
 /// packets.
-pub async fn write_packet<W: HotaruWrite<Error = std::io::Error> + Unpin + Send>(
+pub async fn write_packet<W: HotaruWrite + Unpin + Send>(
     writer: &mut W,
     packet: &Packet,
     version: ProtocolVersion,
 ) -> Result<(), MqttError> {
     let buf = encode_packet(packet, version)?;
-    writer.write_all(&buf).await?;
+    writer.write_all(&buf).await.map_err(MqttError::io)?;
     Ok(())
 }
 
 /// Optimized write path for PUBLISH: writes the header in one syscall, then
 /// the payload `Bytes` directly with `write_all(&payload[..])` — no copy
 /// from `Bytes` to intermediate buffer.
-pub async fn write_publish_packet<W: HotaruWrite<Error = std::io::Error> + Unpin + Send>(
+pub async fn write_publish_packet<W: HotaruWrite + Unpin + Send>(
     writer: &mut W,
     packet: &PublishPacket,
     version: ProtocolVersion,
@@ -192,8 +192,8 @@ pub async fn write_publish_packet<W: HotaruWrite<Error = std::io::Error> + Unpin
     }
     header.extend_from_slice(&props);
 
-    writer.write_all(&header).await?;
-    writer.write_all(&packet.payload[..]).await?;
+    writer.write_all(&header).await.map_err(MqttError::io)?;
+    writer.write_all(&packet.payload[..]).await.map_err(MqttError::io)?;
     Ok(())
 }
 
@@ -201,14 +201,14 @@ pub async fn write_publish_packet<W: HotaruWrite<Error = std::io::Error> + Unpin
 // Internal: remaining length
 // ============================================================================
 
-async fn read_remaining_length<R: HotaruRead<Error = std::io::Error> + Unpin + Send>(
+async fn read_remaining_length<R: HotaruRead + Unpin + Send>(
     reader: &mut R,
 ) -> Result<usize, MqttError> {
     let mut result = 0usize;
     let mut multiplier = 1usize;
     for i in 0..4 {
         let mut byte = [0u8; 1];
-        reader.read_exact(&mut byte).await?;
+        reader.read_exact(&mut byte).await.map_err(MqttError::io)?;
         result += (byte[0] & 0x7F) as usize * multiplier;
         multiplier *= 128;
         if byte[0] & 0x80 == 0 {

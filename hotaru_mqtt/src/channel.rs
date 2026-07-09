@@ -139,7 +139,7 @@ impl<W: ConnStream, Rt: RuntimeSpec> MqttChannel<W, Rt> {
         cmd_buffer_size: usize,
     ) -> Self
     where
-        W::WriteHalf: HotaruWrite<Error = std::io::Error>,
+        W::WriteHalf: HotaruWrite,
     {
         let (cmd_tx, cmd_rx) = async_channel::bounded(cmd_buffer_size.max(1));
         let open = Arc::new(AtomicBool::new(true));
@@ -269,7 +269,7 @@ async fn writer_actor<W: ConnStream, Rt: RuntimeSpec>(
     open: Arc<AtomicBool>,
     version: Arc<AtomicU8>,
 ) where
-    W::WriteHalf: HotaruWrite<Error = std::io::Error>,
+    W::WriteHalf: HotaruWrite,
 {
     loop {
         let ver = ProtocolVersion::from_level(version.load(Ordering::Acquire)).unwrap_or_default();
@@ -327,7 +327,7 @@ async fn drain_queued<W: ConnStream, Rt: RuntimeSpec>(
     cmd_rx: &async_channel::Receiver<WriteCmd>,
     ver: ProtocolVersion,
 ) where
-    W::WriteHalf: HotaruWrite<Error = std::io::Error>,
+    W::WriteHalf: HotaruWrite,
 {
     while let Ok(cmd) = cmd_rx.try_recv() {
         match cmd {
