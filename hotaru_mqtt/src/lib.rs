@@ -11,6 +11,14 @@
 // SAFETY_PROOF M1 enforcement — any future PR introducing `unsafe` must
 // explicitly justify it by lifting this lint (and updating the proof).
 #![forbid(unsafe_code)]
+// no_std port: without the `std` feature the crate builds on `core` +
+// `alloc` only (heap required — packets, topic strings, queues). Runtime
+// and IO come from whatever `RuntimeSpec` / `ConnStream` backend the
+// embedding application supplies (e.g. hotaru_rt_embassy + a follow-up
+// embedded transport).
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
 
 pub mod channel;
 pub mod client;
@@ -18,6 +26,7 @@ pub mod codec;
 pub mod context;
 pub mod error;
 pub mod packet;
+mod pmap;
 pub mod properties;
 pub mod protocol;
 pub mod request;
@@ -43,10 +52,9 @@ pub use packet::{
     WillPacket, incoming_from_packet,
 };
 pub use properties::Properties;
-pub use protocol::{
-    CLIENT_CONFIG_STATICS_KEY, DefaultInboundHandler, DefaultMqttTransport, MQTT,
-    MqttClientProtocol,
-};
+pub use protocol::{CLIENT_CONFIG_STATICS_KEY, DefaultInboundHandler, MqttClientProtocol};
+#[cfg(feature = "std")]
+pub use protocol::{DefaultMqttTransport, MQTT};
 #[cfg(feature = "tls")]
 pub use protocol::{MQTTS, MqttTlsProtocol};
 pub use request::{

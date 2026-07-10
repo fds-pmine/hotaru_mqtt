@@ -11,13 +11,13 @@ categories = ["network-programming", "embedded"]
 
 [dependencies]
 hotaru_core = { workspace = true }
-hotaru_io_tokio = { workspace = true }
-hotaru_rt_tokio = { workspace = true }
+hotaru_io_tokio = { workspace = true, optional = true }
+hotaru_rt_tokio = { workspace = true, optional = true }
 async-channel = { workspace = true }
 futures-channel = { workspace = true }
 event-listener = { workspace = true }
+once_cell = { workspace = true }
 async-trait = { workspace = true }
-dashmap = { workspace = true }
 bytes = { workspace = true }
 bitflags = { workspace = true }
 zeroize = { workspace = true }
@@ -25,8 +25,28 @@ zeroize = { workspace = true }
 hotaru_tls = { workspace = true, optional = true }
 
 [features]
-default = []
-tls = ["dep:hotaru_tls"]
+# `std` (on by default) = the tokio-backed profile every current consumer
+# uses: parking_lot sync, TCP defaults (`MQTT`, `DefaultMqttTransport`),
+# `From<std::io::Error>`. Turning it off gives a `core + alloc` build where
+# the application names its own RuntimeSpec / ConnStream backend.
+# Platform/spawn axes mirror hotaru_core: pick exactly one of std/embedded
+# and one of spawn_send/spawn_local.
+default = ["std", "spawn_send"]
+std = [
+    "hotaru_core/std",
+    "hotaru_core/full",
+    "dep:hotaru_io_tokio",
+    "dep:hotaru_rt_tokio",
+    "async-channel/std",
+    "event-listener/std",
+    "futures-channel/std",
+    "bytes/std",
+    "once_cell/std",
+]
+embedded = ["hotaru_core/embedded"]
+spawn_send = ["hotaru_core/spawn_send"]
+spawn_local = ["hotaru_core/spawn_local"]
+tls = ["std", "dep:hotaru_tls"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

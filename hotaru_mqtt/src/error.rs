@@ -9,7 +9,8 @@
 //! MQTT-level error recovery means "reconnect", which is a user-level
 //! concern, not a framework retry.
 
-use std::fmt;
+use alloc::{boxed::Box, string::String};
+use core::fmt;
 
 use hotaru_core::protocol::DefaultProtocolError;
 
@@ -195,8 +196,8 @@ impl MqttError {
     }
 }
 
-impl std::error::Error for MqttError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for MqttError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e.as_ref()),
             _ => None,
@@ -204,6 +205,9 @@ impl std::error::Error for MqttError {
     }
 }
 
+/// std-only convenience: lets tokio-backend call sites keep using `?` on
+/// `std::io::Error`. no_std backends go through [`MqttError::io`] instead.
+#[cfg(feature = "std")]
 impl From<std::io::Error> for MqttError {
     fn from(e: std::io::Error) -> Self {
         Self::io(e)

@@ -7,9 +7,12 @@
 //! Encode path writes through `write_all(&payload[..])` — `Bytes` derefs to
 //! `&[u8]` with zero overhead.
 
-use std::sync::Arc;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use alloc::vec;
 
 use bytes::{Bytes, BytesMut};
+use hotaru_core::marker::MaybeSend;
 use hotaru_core::connection::{HotaruRead, HotaruWrite};
 use zeroize::Zeroizing;
 
@@ -34,7 +37,7 @@ use crate::request::{QoS, SubackCode};
 /// so a malicious peer cannot OOM the process by declaring a 256 MiB body.
 /// Pass `usize::MAX` to disable (spec hard cap of 268_435_455 still applies
 /// via `read_remaining_length`).
-pub async fn read_packet<R: HotaruRead + Unpin + Send>(
+pub async fn read_packet<R: HotaruRead + Unpin + MaybeSend>(
     reader: &mut R,
     max_size: usize,
     version: ProtocolVersion,
@@ -141,7 +144,7 @@ pub fn encode_packet(packet: &Packet, version: ProtocolVersion) -> Result<Vec<u8
 
 /// Write a packet to an async writer. Used by the writer actor for control
 /// packets.
-pub async fn write_packet<W: HotaruWrite + Unpin + Send>(
+pub async fn write_packet<W: HotaruWrite + Unpin + MaybeSend>(
     writer: &mut W,
     packet: &Packet,
     version: ProtocolVersion,
@@ -154,7 +157,7 @@ pub async fn write_packet<W: HotaruWrite + Unpin + Send>(
 /// Optimized write path for PUBLISH: writes the header in one syscall, then
 /// the payload `Bytes` directly with `write_all(&payload[..])` — no copy
 /// from `Bytes` to intermediate buffer.
-pub async fn write_publish_packet<W: HotaruWrite + Unpin + Send>(
+pub async fn write_publish_packet<W: HotaruWrite + Unpin + MaybeSend>(
     writer: &mut W,
     packet: &PublishPacket,
     version: ProtocolVersion,
@@ -201,7 +204,7 @@ pub async fn write_publish_packet<W: HotaruWrite + Unpin + Send>(
 // Internal: remaining length
 // ============================================================================
 
-async fn read_remaining_length<R: HotaruRead + Unpin + Send>(
+async fn read_remaining_length<R: HotaruRead + Unpin + MaybeSend>(
     reader: &mut R,
 ) -> Result<usize, MqttError> {
     let mut result = 0usize;
@@ -924,7 +927,7 @@ pub(crate) fn read_arc_str(body: &[u8], cursor: &mut usize) -> Result<Arc<str>, 
         return Err(CodecError::UnexpectedEof.into());
     }
     let bytes = &body[*cursor..*cursor + len];
-    let s = std::str::from_utf8(bytes).map_err(|_| CodecError::InvalidUtf8)?;
+    let s = core::str::from_utf8(bytes).map_err(|_| CodecError::InvalidUtf8)?;
     // spec §1.5.3: MQTT UTF-8 strings MUST NOT contain U+0000.
     if s.contains('\0') {
         return Err(Violation::Utf8NullCharacter.into());

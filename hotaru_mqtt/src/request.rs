@@ -4,7 +4,8 @@
 //! / `Response`. All three outpoint operations (`Publish` / `Subscribe` /
 //! `Unsubscribe`) go through this enum via `run!(...)`.
 
-use std::sync::Arc;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use bytes::Bytes;
 
@@ -174,8 +175,8 @@ pub struct Credentials {
     pub password: Bytes,
 }
 
-impl std::fmt::Debug for Credentials {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Credentials")
             .field("username", &self.username)
             .field(

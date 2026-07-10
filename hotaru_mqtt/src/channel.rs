@@ -11,13 +11,14 @@
 //! by whoever takes it first (typically the `Protocol::handle` loop).
 
 use core::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use event_listener::Event;
 use hotaru_core::app::runtime::{AsyncMutexCap, Either, RuntimeSpec};
 use hotaru_core::connection::{ConnMeta, ConnStream, HotaruRead, HotaruWrite};
 use hotaru_core::protocol::{Channel, ProtocolRole};
+#[cfg(feature = "std")]
 use hotaru_rt_tokio::TokioRuntime;
 
 use crate::codec::{write_packet, write_publish_packet};
@@ -29,10 +30,14 @@ use crate::session::MqttSession;
 // Connection-id global counter (Q decision: u64 + AtomicU64)
 // ----------------------------------------------------------------------------
 
-static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(1);
+// `AtomicUsize` instead of `AtomicU64`: 32-bit no_std targets (thumbv7em,
+// ESP) have no native 64-bit atomics. The public id stays `u64`; on 32-bit
+// targets the counter wraps after ~4e9 connections, far past any embedded
+// session count.
+static CONNECTION_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
 pub fn next_connection_id() -> u64 {
-    CONNECTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+    CONNECTION_COUNTER.fetch_add(1, Ordering::Relaxed) as u64
 }
 
 // ----------------------------------------------------------------------------
@@ -53,7 +58,13 @@ pub enum WriteCmd {
 // MqttChannel
 // ----------------------------------------------------------------------------
 
-pub struct MqttChannel<W: ConnStream, Rt: RuntimeSpec = TokioRuntime> {
+// Ergonomic Tokio default only exists when the tokio runtime is compiled
+// in; a no_std build names its runtime explicitly.
+pub struct MqttChannel<
+    W: ConnStream,
+    #[cfg(feature = "std")] Rt: RuntimeSpec = TokioRuntime,
+    #[cfg(not(feature = "std"))] Rt: RuntimeSpec,
+> {
     // ── Physical wire ───────────────────────────────────────────
     reader: Arc<Rt::AsyncMutex<Option<<W::ReadHalf as HotaruRead>::Buffered>>>,
     /// Writer actor's input — **bounded** (capacity from caller's `MqttSafety`).

@@ -6,8 +6,10 @@
 //! `Packet` is the framework's `Message` type for `MqttProtocol`. Encoding
 //! and decoding live in `codec.rs`; this module is plain data definitions.
 
-use std::fmt;
-use std::sync::Arc;
+use core::fmt;
+use alloc::string::ToString;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use bitflags::bitflags;
 use bytes::{Bytes, BytesMut};
@@ -365,8 +367,8 @@ impl TryFrom<u8> for ConnackReturnCode {
     }
 }
 
-impl std::fmt::Display for ConnackReturnCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for ConnackReturnCode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Accepted => write!(f, "Accepted"),
             Self::UnacceptableProtocolVersion => write!(f, "Unacceptable Protocol Version"),

@@ -12,7 +12,8 @@
 //! (e.g. `codec::parse_publish` rejects `topic_alias` because we never
 //! advertise a non-zero Topic Alias Maximum).
 
-use std::sync::Arc;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use bytes::Bytes;
 

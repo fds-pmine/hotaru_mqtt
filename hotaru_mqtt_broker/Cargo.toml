@@ -10,16 +10,19 @@ keywords = ["mqtt", "hotaru", "broker", "iot", "pubsub"]
 categories = ["network-programming"]
 
 [dependencies]
-hotaru_mqtt = { path = "../hotaru_mqtt", version = "0.8.3-rc1" }
-hotaru_core = { workspace = true }
+# The broker is a std-only crate (it runs on the server / desktop initiator,
+# never on the embedded robot), so it re-enables the std features that the
+# workspace declarations leave off for hotaru_mqtt's no_std build.
+hotaru_mqtt = { path = "../hotaru_mqtt", version = "0.8.3-rc1", features = ["std", "spawn_send"] }
+hotaru_core = { workspace = true, features = ["std", "spawn_send", "full"] }
 hotaru_io_tokio = { workspace = true }
 hotaru_rt_tokio = { workspace = true }
-async-channel = { workspace = true }
-futures-channel = { workspace = true }
-event-listener = { workspace = true }
+async-channel = { workspace = true, features = ["std"] }
+futures-channel = { workspace = true, features = ["std"] }
+event-listener = { workspace = true, features = ["std"] }
 async-trait = { workspace = true }
 dashmap = { workspace = true }
-bytes = { workspace = true }
+bytes = { workspace = true, features = ["std"] }
 tracing = { workspace = true }
 
 # Stage A P2.C — password hashing (PBKDF2-SHA512 default).

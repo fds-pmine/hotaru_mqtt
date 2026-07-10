@@ -8,20 +8,24 @@
 //! The server-side counterpart (`MqttServerProtocol`) and its broker live in
 //! a separate downstream crate so client / sensor builds don't pay for them.
 
-use std::marker::PhantomData;
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::time::Duration;
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::marker::PhantomData;
+use core::time::Duration;
 
 use async_trait::async_trait;
-use dashmap::DashMap;
 use futures_channel::oneshot;
 use hotaru_core::app::common::RuntimeConfig;
 use hotaru_core::app::runtime::{Either, RuntimeSpec};
 use hotaru_core::connection::{ConnStream, HotaruRead, HotaruWrite, TransportSpec};
 use hotaru_core::protocol::{Channel as _, CtxError, Protocol, ProtocolFlow, ProtocolRole};
 use hotaru_core::url::{UrlNode, UrlRoot};
+#[cfg(feature = "std")]
 use hotaru_rt_tokio::TokioRuntime;
+use once_cell::race::OnceBox;
+
+use crate::pmap::PMap;
 
 use crate::channel::MqttChannel;
 use crate::client::MqttClientConfig;
@@ -58,7 +62,9 @@ const INITIAL_CMD_BUFFER_SIZE: usize = 1000;
 // MqttClientProtocol
 // ----------------------------------------------------------------------------
 
+#[cfg(feature = "std")]
 pub type DefaultMqttTransport = hotaru_io_tokio::TcpTransport;
+#[cfg(feature = "std")]
 pub type MQTT = MqttClientProtocol<hotaru_io_tokio::TcpStream, DefaultMqttTransport>;
 
 /// MQTT over TLS (gated by `tls` feature). Mirrors `hotaru_http::HTTPS`.
@@ -70,15 +76,22 @@ pub type MqttTlsProtocol = MqttClientProtocol<hotaru_tls::TlsStream, hotaru_tls:
 #[allow(non_camel_case_types)]
 pub type MQTTS = MqttTlsProtocol;
 
+// Ergonomic defaults (bare `MqttClientProtocol` = TCP + Tokio) only exist
+// when the tokio backends are compiled in; a no_std build always names its
+// wire / transport / runtime explicitly.
 pub struct MqttClientProtocol<
-    W: ConnStream = hotaru_io_tokio::TcpStream,
-    TS: TransportSpec<Wire = W> = DefaultMqttTransport,
-    Rt: RuntimeSpec = TokioRuntime,
+    #[cfg(feature = "std")] W: ConnStream = hotaru_io_tokio::TcpStream,
+    #[cfg(not(feature = "std"))] W: ConnStream,
+    #[cfg(feature = "std")] TS: TransportSpec<Wire = W> = DefaultMqttTransport,
+    #[cfg(not(feature = "std"))] TS: TransportSpec<Wire = W>,
+    #[cfg(feature = "std")] Rt: RuntimeSpec = TokioRuntime,
+    #[cfg(not(feature = "std"))] Rt: RuntimeSpec,
 > {
     /// Shared session channel slot. Cloned across protocol clones via `Arc`.
     /// First `open_channel` calls `set`; subsequent `acquire_channel` calls
-    /// `get` and clones.
-    session_channel: Arc<OnceLock<MqttChannel<W, Rt>>>,
+    /// `get` and clones. `OnceBox` (lock-free, no_std) replaces
+    /// `std::sync::OnceLock` — same set-once semantics.
+    session_channel: Arc<OnceBox<MqttChannel<W, Rt>>>,
     _ts: PhantomData<fn() -> TS>,
 }
 
@@ -104,7 +117,7 @@ impl<W: ConnStream, TS: TransportSpec<Wire = W>, Rt: RuntimeSpec> Default
 impl<W: ConnStream, TS: TransportSpec<Wire = W>, Rt: RuntimeSpec> MqttClientProtocol<W, TS, Rt> {
     pub fn new() -> Self {
         Self {
-            session_channel: Arc::new(OnceLock::new()),
+            session_channel: Arc::new(OnceBox::new()),
             _ts: PhantomData,
         }
     }
@@ -115,6 +128,13 @@ where
     W: ConnStream,
     TS: TransportSpec<Wire = W>,
     Rt: RuntimeSpec,
+    // Demanded by hotaru_core's `Protocol::Context` bound (`CtxError` must
+    // absorb transport connect errors). It cannot be generalized away on
+    // the mqtt side: a blanket `impl<E: Error> From<E> for MqttError`
+    // collides with coherence. tokio's `TS::IoError = std::io::Error` is
+    // covered by the std-gated `From` in `error.rs`; an embedded transport
+    // supplies the one-line `From` for its own error type (or the bound
+    // moves in hotaru_core itself).
     MqttError: From<<TS as TransportSpec>::IoError>,
     W::ReadHalf: HotaruRead,
     W::WriteHalf: HotaruWrite,
@@ -180,7 +200,7 @@ where
         );
         // First call wins; later open_channel attempts return their own channel
         // but only the first one is stash-acquirable.
-        let _ = self.session_channel.set(channel.clone());
+        let _ = self.session_channel.set(Box::new(channel.clone()));
         channel
     }
 
@@ -496,7 +516,7 @@ fn node_key<TS: TransportSpec, Rt: RuntimeSpec>(
 }
 
 type EndpointQueueMap<TS, Rt> =
-    DashMap<NodeKey, async_channel::Sender<(IncomingPublish, Arc<UrlNode<MqttContext<TS, Rt>, TS>>)>>;
+    PMap<NodeKey, async_channel::Sender<(IncomingPublish, Arc<UrlNode<MqttContext<TS, Rt>, TS>>)>>;
 
 struct EndpointDispatcher<W: ConnStream, TS: TransportSpec<Wire = W>, Rt: RuntimeSpec> {
     channel: MqttChannel<W, Rt>,
@@ -505,7 +525,7 @@ struct EndpointDispatcher<W: ConnStream, TS: TransportSpec<Wire = W>, Rt: Runtim
     /// can remove its own entry on idle-timeout exit (P3.E).
     endpoint_queues: Arc<EndpointQueueMap<TS, Rt>>,
     /// Lazy-spawned single FIFO worker for the default inbound handler.
-    fallback_queue: std::sync::OnceLock<async_channel::Sender<IncomingPublish>>,
+    fallback_queue: OnceBox<async_channel::Sender<IncomingPublish>>,
     default_handler: Option<Arc<dyn DefaultInboundHandler>>,
     /// `MqttSafety.worker_idle_timeout()`. `None` = workers stay alive
     /// until the channel drops them.
@@ -526,8 +546,8 @@ impl<W: ConnStream, TS: TransportSpec<Wire = W>, Rt: RuntimeSpec> EndpointDispat
     ) -> Self {
         Self {
             channel,
-            endpoint_queues: Arc::new(DashMap::new()),
-            fallback_queue: std::sync::OnceLock::new(),
+            endpoint_queues: Arc::new(PMap::new()),
+            fallback_queue: OnceBox::new(),
             default_handler,
             idle_timeout,
             queue_capacity,
@@ -540,21 +560,17 @@ impl<W: ConnStream, TS: TransportSpec<Wire = W>, Rt: RuntimeSpec> EndpointDispat
         incoming: IncomingPublish,
     ) {
         let key = node_key::<TS, Rt>(&node);
-        let tx = self
-            .endpoint_queues
-            .entry(key)
-            .or_insert_with(|| {
-                let (tx, rx) = async_channel::bounded(self.queue_capacity);
-                Rt::spawn_detached(endpoint_worker::<W, TS, Rt>(
-                    rx,
-                    self.channel.clone(),
-                    self.endpoint_queues.clone(),
-                    key,
-                    self.idle_timeout,
-                ));
-                tx
-            })
-            .clone();
+        let tx = self.endpoint_queues.get_or_insert_with(key, || {
+            let (tx, rx) = async_channel::bounded(self.queue_capacity);
+            Rt::spawn_detached(endpoint_worker::<W, TS, Rt>(
+                rx,
+                self.channel.clone(),
+                self.endpoint_queues.clone(),
+                key,
+                self.idle_timeout,
+            ));
+            tx
+        });
         // W §2 covers three drop modes here:
         //   - worker exited (channel closed) → bucket stale, next dispatch
         //     lazy-spawns afresh
@@ -574,7 +590,7 @@ impl<W: ConnStream, TS: TransportSpec<Wire = W>, Rt: RuntimeSpec> EndpointDispat
         let tx = self.fallback_queue.get_or_init(|| {
             let (tx, rx) = async_channel::bounded(self.queue_capacity);
             Rt::spawn_detached(fallback_worker::<Rt>(rx, handler.clone(), self.idle_timeout));
-            tx
+            Box::new(tx)
         });
         // Same overflow semantics as `dispatch_endpoint` above.
         let _ = tx.try_send(incoming);
@@ -669,7 +685,7 @@ where
         "no channel installed in ctx".into(),
     ))?;
 
-    let request = std::mem::replace(
+    let request = core::mem::replace(
         &mut ctx.request,
         MqttRequest::Publish(PublishRequest::default()),
     );

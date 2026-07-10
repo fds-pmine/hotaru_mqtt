@@ -12,7 +12,8 @@
 //! body reads `request`, endpoint body reads `incoming`. The framework guarantees
 //! this; user code that needs to inspect both should use `match`.
 
-use std::sync::Arc;
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 
 use hotaru_core::app::runtime::RuntimeSpec;
 use hotaru_core::connection::TransportSpec;
@@ -24,9 +25,13 @@ use crate::channel::MqttChannel;
 use crate::error::MqttError;
 use crate::request::{IncomingPublish, MqttRequest, MqttResponse, PublishAck, PublishRequest};
 
+// Ergonomic TCP+Tokio defaults only exist when the tokio backends are
+// compiled in; a no_std build names its transport / runtime explicitly.
 pub struct MqttContext<
-    TS: TransportSpec = hotaru_io_tokio::TcpTransport,
-    Rt: RuntimeSpec = hotaru_rt_tokio::TokioRuntime,
+    #[cfg(feature = "std")] TS: TransportSpec = hotaru_io_tokio::TcpTransport,
+    #[cfg(not(feature = "std"))] TS: TransportSpec,
+    #[cfg(feature = "std")] Rt: RuntimeSpec = hotaru_rt_tokio::TokioRuntime,
+    #[cfg(not(feature = "std"))] Rt: RuntimeSpec,
 > {
     /// `run!` path: injected by `RequestContext::inject_request`.
     pub request: MqttRequest,

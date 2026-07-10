@@ -4,8 +4,9 @@
 //! before `Client::build()`. `handle_client` reads it from runtime statics on
 //! startup to construct the CONNECT packet and initial SUBSCRIBE.
 
-use std::sync::Arc;
-use std::time::Duration;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::time::Duration;
 
 use bytes::Bytes;
 

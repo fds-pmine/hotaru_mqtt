@@ -10,7 +10,7 @@
 //! builder doesn't tie us to caller-side defaults — the canonical defaults
 //! live here and can shift without breaking call sites.
 
-use std::time::Duration;
+use core::time::Duration;
 
 /// Resource limits applied at the wire / connection layer.
 #[derive(Debug, Clone, Default)]

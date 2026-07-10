@@ -16,21 +16,28 @@ license = "MIT"
 # upcoming `0.8.3-rc1` release. Once upstream publishes, switch back to
 # `"0.8.3-rc1"` registry deps and (if desired) drop the path. Tracked in
 # HANDOFF §8.1.
-hotaru_core = { path = "../hotaru/hotaru_core", version = "0.8.3" }
+# default-features = false so the no_std build of hotaru_mqtt can pick the
+# platform axis itself (std/parking_lot vs embedded/spin); std consumers
+# (hotaru_mqtt's `std` feature, the broker) re-enable what they need.
+hotaru_core = { path = "../hotaru/hotaru_core", version = "0.8.3", default-features = false }
 hotaru_tls = { path = "../hotaru/hotaru_tls", version = "0.8.2" }
 hotaru_http = { path = "../hotaru/hotaru_http", version = "0.8.3" }
 hotaru_io_tokio = { path = "../hotaru/hotaru_io_tokio", version = "0.8.3" }
 hotaru_rt_tokio = { path = "../hotaru/hotaru_rt_tokio", version = "0.8.3" }
 # Runtime-agnostic sync primitives (executor-independent, no_std-capable):
 # async-channel replaces tokio mpsc (same try_send(&self) + bounded semantics),
-# futures-channel provides oneshot, event-listener replaces Notify.
-async-channel = "2"
+# futures-channel provides oneshot, event-listener replaces Notify,
+# once_cell::race replaces std::sync::OnceLock. All declared without default
+# features (= no_std + alloc); the `std` feature layers of hotaru_mqtt /
+# hotaru_mqtt_broker turn their `std` features back on.
+async-channel = { version = "2", default-features = false }
 futures-channel = { version = "0.3", default-features = false, features = ["alloc"] }
-event-listener = "5"
+event-listener = { version = "5", default-features = false }
+once_cell = { version = "1", default-features = false, features = ["race", "alloc"] }
 tokio = { version = "1.28", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 async-trait = "0.1.88"
 dashmap = "6"
-bytes = "1"
+bytes = { version = "1", default-features = false }
 bitflags = "2"
 tracing = "0.1"
 # no_std-ready: drop `std`, keep `alloc` (needed for `Zeroizing<Vec<u8>>`).
