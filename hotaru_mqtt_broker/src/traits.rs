@@ -5,7 +5,7 @@
 //! production deployments will swap the default impls for ones backed by a
 //! real password DB, ACL file, tenant directory, or persistence layer.
 
-use std::net::SocketAddr;
+use core::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;

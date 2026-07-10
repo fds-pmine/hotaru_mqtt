@@ -7,7 +7,7 @@
 //! single-node deployments where retained durability across broker
 //! restarts isn't required.
 
-use std::net::SocketAddr;
+use core::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

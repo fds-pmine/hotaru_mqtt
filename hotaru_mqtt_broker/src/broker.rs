@@ -8,7 +8,7 @@
 //! filters). The `walk_cursor` optimization is deferred to Stage A P3 perf
 //! tuning.
 
-use std::net::SocketAddr;
+use core::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 

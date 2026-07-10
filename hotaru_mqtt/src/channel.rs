@@ -10,7 +10,7 @@
 //! All wire writes flow through the writer actor via `cmd_tx`. Reader is owned
 //! by whoever takes it first (typically the `Protocol::handle` loop).
 
-use std::net::SocketAddr;
+use core::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 

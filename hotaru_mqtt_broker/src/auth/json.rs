@@ -27,7 +27,7 @@
 //! Hot-reload (mtime-based) is Stage A P8 (config split) — for now the
 //! snapshot is loaded once at construction time.
 
-use std::net::SocketAddr;
+use core::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
