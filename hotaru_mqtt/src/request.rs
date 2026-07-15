@@ -225,6 +225,12 @@ pub struct WillMessage {
     pub payload: Bytes,
     pub qos: QoS,
     pub retain: bool,
+    /// v5 §3.1.3.2 Will Properties, carried onto the will PUBLISH when it
+    /// fires (Content Type / Response Topic / Correlation Data / Message
+    /// Expiry / User Properties). Empty on v3.1.1. Will Delay Interval is
+    /// parsed but the will currently fires immediately (delay = 0
+    /// behavior); deferred-firing timers are a [future] item.
+    pub properties: crate::properties::Properties,
 }
 
 impl WillMessage {
@@ -239,6 +245,7 @@ impl WillMessage {
             payload: payload.into(),
             qos,
             retain,
+            properties: Default::default(),
         }
     }
 }

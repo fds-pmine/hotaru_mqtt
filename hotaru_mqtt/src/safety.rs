@@ -28,6 +28,12 @@ pub struct MqttSafety {
     /// (hardening F1 — defends against amplification via 65 535-filter
     /// SUBSCRIBEs which would saturate matching cost).
     max_filters_per_subscribe: Option<usize>,
+    /// v5 §3.3.2.3.4 Topic Alias Maximum this side advertises on CONNACK.
+    /// Bounds the per-connection alias table (each entry pins one topic
+    /// string), so it is a memory knob as much as a protocol one. `0`
+    /// disables aliasing entirely: nothing is advertised and any inbound
+    /// alias is a protocol error.
+    topic_alias_maximum: Option<u16>,
 }
 
 // ── Default constants ─────────────────────────────────────────────
@@ -53,6 +59,10 @@ pub(crate) const DEFAULT_MAX_INFLIGHT_MESSAGES: usize = 20;
 const DEFAULT_MAX_QUEUED_MESSAGES: usize = 1000;
 const DEFAULT_RECEIVE_MAXIMUM_INBOUND: usize = 64;
 const DEFAULT_MAX_FILTERS_PER_SUBSCRIBE: usize = 64;
+/// Default v5 Topic Alias Maximum. 16 aliases × one `Arc<str>` topic each
+/// is a negligible per-connection footprint while covering the common
+/// constrained-client pattern (a handful of hot topics aliased).
+const DEFAULT_TOPIC_ALIAS_MAXIMUM: u16 = 16;
 
 impl MqttSafety {
     pub fn new() -> Self {
@@ -90,6 +100,12 @@ impl MqttSafety {
             .unwrap_or(DEFAULT_RECEIVE_MAXIMUM_INBOUND)
     }
 
+    /// v5 Topic Alias Maximum advertised on CONNACK (0 = aliasing off).
+    pub fn topic_alias_maximum(&self) -> u16 {
+        self.topic_alias_maximum
+            .unwrap_or(DEFAULT_TOPIC_ALIAS_MAXIMUM)
+    }
+
     pub fn max_filters_per_subscribe(&self) -> usize {
         self.max_filters_per_subscribe
             .unwrap_or(DEFAULT_MAX_FILTERS_PER_SUBSCRIBE)
@@ -123,6 +139,12 @@ impl MqttSafety {
 
     pub fn with_receive_maximum_inbound(mut self, n: usize) -> Self {
         self.receive_maximum_inbound = Some(n);
+        self
+    }
+
+    /// Set the v5 Topic Alias Maximum this side advertises (0 disables).
+    pub fn with_topic_alias_maximum(mut self, n: u16) -> Self {
+        self.topic_alias_maximum = Some(n);
         self
     }
 

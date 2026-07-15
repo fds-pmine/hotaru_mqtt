@@ -65,10 +65,10 @@ pub enum Packet {
     Connect(ConnectPacket),
     Connack(ConnackPacket),
     Publish(PublishPacket),
-    Puback(PacketId),
-    Pubrec(PacketId),
-    Pubrel(PacketId),
-    Pubcomp(PacketId),
+    Puback(AckPacket),
+    Pubrec(AckPacket),
+    Pubrel(AckPacket),
+    Pubcomp(AckPacket),
     Subscribe(SubscribePacket),
     Suback(SubackPacket),
     Unsubscribe(UnsubscribePacket),
@@ -97,6 +97,45 @@ impl Packet {
             Self::Pingresp => "PINGRESP",
             Self::Disconnect => "DISCONNECT",
         }
+    }
+}
+
+/// PUBACK / PUBREC / PUBREL / PUBCOMP body (spec v5 §3.4–§3.7).
+///
+/// v3.1.1 acks are just a packet id; v5 adds an optional reason code and
+/// properties. `reason_code = 0x00` (Success) with empty properties encodes
+/// in the 2-byte v3-compatible short form on both versions, so every
+/// pre-v5 call site keeps its exact wire bytes via [`AckPacket::success`].
+///
+/// Phase 2 surfaces reasons on the *decode* side (a v5 peer's 0x10 /
+/// 0x87 / 0x97 is now visible to the QoS state machine instead of being
+/// discarded). Emitting non-success reasons from the broker is deferred:
+/// it interacts with the ACL-before-handler rework tracked in the security
+/// audit (F3), so the send paths still always emit `success`.
+#[derive(Debug, Clone)]
+pub struct AckPacket {
+    pub packet_id: PacketId,
+    /// v5 reason code (0x00 = Success; >= 0x80 = failure). Always 0x00 on
+    /// v3.1.1 wires.
+    pub reason_code: u8,
+    /// v5 ack properties (Reason String / User Property). Empty on v3.1.1.
+    pub properties: Properties,
+}
+
+impl AckPacket {
+    /// The v3-shaped ack every existing QoS path sends: Success, no
+    /// properties — encodes identically to the pre-phase-2 wire bytes.
+    pub fn success(packet_id: PacketId) -> Self {
+        Self {
+            packet_id,
+            reason_code: 0x00,
+            properties: Properties::default(),
+        }
+    }
+
+    /// Spec v5 §2.4: codes < 0x80 are success-class, >= 0x80 are failures.
+    pub fn is_success(&self) -> bool {
+        self.reason_code < 0x80
     }
 }
 
@@ -313,11 +352,22 @@ pub enum ConnackReturnCode {
     ServerUnavailable = 3,
     BadUsernameOrPassword = 4,
     NotAuthorized = 5,
+    /// v5-only refusal (§3.2.2.2 reason 0x8C): the CONNECT carried an
+    /// Authentication Method property but this broker does not implement
+    /// enhanced authentication (§4.12). Collapses to `NotAuthorized`'s
+    /// byte on a v3.1.1 wire — unreachable in practice, since the property
+    /// itself only exists on v5 CONNECTs.
+    BadAuthenticationMethod = 6,
 }
 
 impl ConnackReturnCode {
     pub fn as_u8(self) -> u8 {
-        self as u8
+        match self {
+            // v3 return-code space is 0..=5 (§3.2.2.3); the v5-only
+            // refusal has no v3 byte, so it degrades to NotAuthorized.
+            Self::BadAuthenticationMethod => Self::NotAuthorized as u8,
+            other => other as u8,
+        }
     }
 
     /// Map to the MQTT 5.0 CONNACK reason-code space (spec §3.2.2.2).
@@ -331,6 +381,7 @@ impl ConnackReturnCode {
             Self::ServerUnavailable => 0x88,           // Server unavailable
             Self::BadUsernameOrPassword => 0x86,       // Bad User Name or Password
             Self::NotAuthorized => 0x87,               // Not authorized
+            Self::BadAuthenticationMethod => 0x8C,     // Bad authentication method
         }
     }
 
@@ -343,6 +394,7 @@ impl ConnackReturnCode {
             0x84 => Ok(Self::UnacceptableProtocolVersion),
             0x85 => Ok(Self::IdentifierRejected),
             0x86 => Ok(Self::BadUsernameOrPassword),
+            0x8C => Ok(Self::BadAuthenticationMethod),
             0x87 | 0x9C | 0x9D => Ok(Self::NotAuthorized), // incl. Use another server / Server moved
             0x88 | 0x89 | 0x97 => Ok(Self::ServerUnavailable), // incl. Server busy / Quota exceeded
             0x80..=0xFF => Ok(Self::ServerUnavailable),    // generic unspecified failures
@@ -376,6 +428,7 @@ impl core::fmt::Display for ConnackReturnCode {
             Self::ServerUnavailable => write!(f, "Server Unavailable"),
             Self::BadUsernameOrPassword => write!(f, "Bad Username or Password"),
             Self::NotAuthorized => write!(f, "Not Authorized"),
+            Self::BadAuthenticationMethod => write!(f, "Bad Authentication Method"),
         }
     }
 }

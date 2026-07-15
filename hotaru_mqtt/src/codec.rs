@@ -18,9 +18,9 @@ use zeroize::Zeroizing;
 
 use crate::error::{CodecError, MqttError, Violation};
 use crate::packet::{
-    ConnackPacket, ConnackReturnCode, ConnectFlags, ConnectPacket, FixedHeaderFlags, Packet,
-    PacketType, ProtocolVersion, PublishPacket, SubackPacket, SubscribePacket, TopicSubscription,
-    UnsubackPacket, UnsubscribePacket, WillPacket,
+    AckPacket, ConnackPacket, ConnackReturnCode, ConnectFlags, ConnectPacket, FixedHeaderFlags,
+    Packet, PacketType, ProtocolVersion, PublishPacket, SubackPacket, SubscribePacket,
+    TopicSubscription, UnsubackPacket, UnsubscribePacket, WillPacket,
 };
 use crate::properties::Properties;
 use crate::request::{QoS, SubackCode};
@@ -123,13 +123,10 @@ pub fn encode_packet(packet: &Packet, version: ProtocolVersion) -> Result<Vec<u8
         Packet::Connect(c) => encode_connect(c),
         Packet::Connack(c) => encode_connack(c, version),
         Packet::Publish(p) => encode_publish(p, version),
-        // v5 §3.4.2: a 2-byte ack means reason 0x00 with no properties —
-        // the abbreviation is legal in both versions, so the ack encoders
-        // stay version-independent until non-success reasons are surfaced.
-        Packet::Puback(id) => Ok(vec![0x40, 0x02, (*id >> 8) as u8, (*id & 0xFF) as u8]),
-        Packet::Pubrec(id) => Ok(vec![0x50, 0x02, (*id >> 8) as u8, (*id & 0xFF) as u8]),
-        Packet::Pubrel(id) => Ok(vec![0x62, 0x02, (*id >> 8) as u8, (*id & 0xFF) as u8]),
-        Packet::Pubcomp(id) => Ok(vec![0x70, 0x02, (*id >> 8) as u8, (*id & 0xFF) as u8]),
+        Packet::Puback(a) => encode_ack(0x40, a, version),
+        Packet::Pubrec(a) => encode_ack(0x50, a, version),
+        Packet::Pubrel(a) => encode_ack(0x62, a, version),
+        Packet::Pubcomp(a) => encode_ack(0x70, a, version),
         Packet::Subscribe(s) => encode_subscribe(s, version),
         Packet::Suback(s) => Ok(encode_suback(s, version)),
         Packet::Unsubscribe(u) => encode_unsubscribe(u, version),
@@ -494,14 +491,21 @@ fn parse_publish(first: u8, body: &[u8], version: ProtocolVersion) -> Result<Pac
     let mut cursor = 0usize;
     let topic = read_arc_str(body, &mut cursor)?;
 
-    // spec §3.3.2.1: topic name MUST be at least 1 char.
-    if topic.is_empty() {
+    // spec §3.3.2.1: topic name MUST be at least 1 char — except on a v5
+    // wire, where an empty topic paired with a Topic Alias means "use the
+    // previously registered mapping" (§3.3.2.3.4). Alias presence is only
+    // knowable after the property block below, so the v5 empty-topic case
+    // defers the check: `resolve_topic_alias` rejects an empty topic with
+    // no alias when the connection owner resolves it.
+    if topic.is_empty() && version == ProtocolVersion::V311 {
         return Err(Violation::EmptyPublishTopic.into());
     }
     // spec §3.3.2.1 + §4.7.1.1: PUBLISH topic name MUST NOT contain
     // wildcards. Reuses the canonical validator so client and server
     // share one rule (§1.4).
-    crate::topic::validate_publish_topic(topic.as_ref())?;
+    if !topic.is_empty() {
+        crate::topic::validate_publish_topic(topic.as_ref())?;
+    }
 
     let packet_id = if qos != QoS::AtMostOnce {
         let id = read_u16(body, &mut cursor)?;
@@ -518,11 +522,14 @@ fn parse_publish(first: u8, body: &[u8], version: ProtocolVersion) -> Result<Pac
     // on the packet so broker fanout forwards them unaltered.
     let properties = if version == ProtocolVersion::V5 {
         let props = Properties::parse(body, &mut cursor)?;
-        // v5 §3.3.2.3.4: we never advertise a non-zero Topic Alias
-        // Maximum, so the effective maximum is 0 and any alias is a
-        // protocol error.
-        if props.topic_alias.is_some() {
-            return Err(Violation::TopicAliasNotAccepted.into());
+        // v5 §3.3.2.3.4: a Topic Alias of 0 is a protocol error on any
+        // wire. Whether a non-zero alias is *acceptable* is a session
+        // question (did this side advertise a Topic Alias Maximum?), so
+        // enforcement lives with the connection owner: the broker keeps a
+        // per-connection alias table (`resolve_topic_alias`), the pure
+        // client — which advertises 0 — rejects any alias at dispatch.
+        if props.topic_alias == Some(0) {
+            return Err(Violation::MalformedProperty(crate::properties::id::TOPIC_ALIAS).into());
         }
         props
     } else {
@@ -550,7 +557,7 @@ fn parse_ack_packet(
     body: &[u8],
     version: ProtocolVersion,
 ) -> Result<Packet, MqttError> {
-    match version {
+    let (reason_code, properties) = match version {
         // v3.1.1: exactly packet id.
         ProtocolVersion::V311 => {
             if remaining != 2 {
@@ -560,21 +567,27 @@ fn parse_ack_packet(
                 }
                 .into());
             }
+            (0x00, Properties::default())
         }
         // v5 §3.4.2: id [+ reason [+ properties]]; a remaining length of
-        // 2 means reason 0x00. The QoS state machine treats any ack as
-        // slot completion, so the reason value is validated structurally
-        // and not yet surfaced (deferred with DISCONNECT reasons).
+        // 2 means reason 0x00 with no properties. Phase 2 surfaces both
+        // on the packet so a peer's non-success reason (0x10 No matching
+        // subscribers, 0x87 Not authorized, 0x97 Quota exceeded, ...) is
+        // visible to the QoS state machine instead of being discarded.
         ProtocolVersion::V5 => {
             if remaining < 2 {
                 return Err(CodecError::UnexpectedEof.into());
             }
-            if remaining > 3 {
+            let reason = if remaining >= 3 { body[2] } else { 0x00 };
+            let props = if remaining > 3 {
                 let mut cursor = 3usize; // id(2) + reason(1)
-                let _props = Properties::parse(body, &mut cursor)?;
-            }
+                Properties::parse(body, &mut cursor)?
+            } else {
+                Properties::default()
+            };
+            (reason, props)
         }
-    }
+    };
     let flags = first & 0x0F;
     let expected = if packet_type == PacketType::Pubrel {
         0x02
@@ -584,13 +597,49 @@ fn parse_ack_packet(
     if flags != expected {
         return Err(CodecError::ReservedFlagSet.into());
     }
-    let id = u16::from_be_bytes([body[0], body[1]]);
+    let ack = AckPacket {
+        packet_id: u16::from_be_bytes([body[0], body[1]]),
+        reason_code,
+        properties,
+    };
     Ok(match packet_type {
-        PacketType::Puback => Packet::Puback(id),
-        PacketType::Pubrec => Packet::Pubrec(id),
-        PacketType::Pubrel => Packet::Pubrel(id),
-        _ => Packet::Pubcomp(id),
+        PacketType::Puback => Packet::Puback(ack),
+        PacketType::Pubrec => Packet::Pubrec(ack),
+        PacketType::Pubrel => Packet::Pubrel(ack),
+        _ => Packet::Pubcomp(ack),
     })
+}
+
+/// Encode one PUBACK / PUBREC / PUBREL / PUBCOMP frame.
+///
+/// Success with no properties uses the 2-byte short form on both versions
+/// (v5 §3.4.2.1 allows omitting reason 0x00) — byte-identical to the
+/// pre-phase-2 encoder, so v3 peers and existing fixtures see no change.
+/// A non-success reason or non-empty properties require a v5 wire; on a
+/// v3.1.1 session that combination is unrepresentable and fails closed
+/// rather than silently dropping the reason.
+fn encode_ack(
+    first_byte: u8,
+    ack: &AckPacket,
+    version: ProtocolVersion,
+) -> Result<Vec<u8>, MqttError> {
+    if ack.reason_code == 0x00 && ack.properties.is_empty() {
+        let id = ack.packet_id;
+        return Ok(vec![first_byte, 0x02, (id >> 8) as u8, (id & 0xFF) as u8]);
+    }
+    if version == ProtocolVersion::V311 {
+        return Err(MqttError::Unsupported(
+            "non-success ack reason codes require an MQTT 5.0 session".into(),
+        ));
+    }
+    let mut body = Vec::with_capacity(4);
+    body.extend_from_slice(&ack.packet_id.to_be_bytes());
+    body.push(ack.reason_code);
+    ack.properties.encode(&mut body)?;
+    let mut buf = vec![first_byte];
+    buf.extend(encode_remaining_length(body.len()));
+    buf.extend(body);
+    Ok(buf)
 }
 
 fn parse_subscribe(body: &[u8], version: ProtocolVersion) -> Result<Packet, MqttError> {
@@ -1597,7 +1646,61 @@ mod tests {
     }
 
     #[test]
-    fn v5_publish_with_topic_alias_rejected() {
+    fn v5_ack_failure_reason_roundtrips() {
+        // A PUBACK with a failure reason (0x87 Not authorized) + a Reason
+        // String must survive encode → decode on a v5 wire with both the
+        // reason and the property intact.
+        let ack = AckPacket {
+            packet_id: 7,
+            reason_code: 0x87,
+            properties: Properties {
+                reason_string: Some(Arc::from("denied")),
+                ..Default::default()
+            },
+        };
+        let bytes = encode_packet(&Packet::Puback(ack), PV::V5).unwrap();
+        let mut buf = BytesMut::from(&bytes[..]);
+        let Packet::Puback(got) = decode_packet_from_bytes(&mut buf, usize::MAX, PV::V5)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected PUBACK")
+        };
+        assert_eq!(got.packet_id, 7);
+        assert_eq!(got.reason_code, 0x87);
+        assert!(!got.is_success());
+        assert_eq!(got.properties.reason_string.as_deref(), Some("denied"));
+    }
+
+    #[test]
+    fn success_ack_uses_short_form_on_both_versions() {
+        // Success + no properties encodes as the 2-byte v3 short form on
+        // BOTH versions (v5 §3.4.2.1) — byte-identical, so mixed-version
+        // peers interoperate and pre-phase-2 fixtures are unchanged.
+        for v in [PV::V311, PV::V5] {
+            let bytes = encode_packet(&Packet::Pubrec(AckPacket::success(9)), v).unwrap();
+            assert_eq!(bytes, vec![0x50, 0x02, 0x00, 0x09]);
+        }
+    }
+
+    #[test]
+    fn nonsuccess_ack_unrepresentable_on_v311() {
+        // A non-success reason cannot be expressed on a v3.1.1 wire; encode
+        // fails closed instead of silently dropping the reason.
+        let ack = AckPacket {
+            packet_id: 3,
+            reason_code: 0x87,
+            properties: Properties::default(),
+        };
+        assert!(encode_packet(&Packet::Puback(ack), PV::V311).is_err());
+    }
+
+    #[test]
+    fn v5_publish_nonzero_topic_alias_parses() {
+        // Phase 2: a non-zero Topic Alias is no longer a codec-level
+        // rejection — the codec parses it through and leaves acceptance to
+        // the connection owner (broker alias table / client rejection).
+        // Only alias 0 is a hard codec error (see below).
         let packet = PublishPacket {
             topic: Arc::from("t"),
             payload: Bytes::new(),
@@ -1612,8 +1715,39 @@ mod tests {
         };
         let bytes = encode_packet(&Packet::Publish(packet), PV::V5).unwrap();
         let mut buf = BytesMut::from(&bytes[..]);
+        let Packet::Publish(p) = decode_packet_from_bytes(&mut buf, usize::MAX, PV::V5)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected PUBLISH")
+        };
+        assert_eq!(p.properties.topic_alias, Some(3));
+    }
+
+    #[test]
+    fn v5_publish_zero_topic_alias_rejected() {
+        // A Topic Alias of 0 is a hard protocol error on any wire (spec
+        // §3.3.2.3.4) — rejected at the codec regardless of the connection
+        // owner's alias table.
+        let packet = PublishPacket {
+            topic: Arc::from("t"),
+            payload: Bytes::new(),
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            packet_id: None,
+            properties: Properties {
+                topic_alias: Some(0),
+                ..Default::default()
+            },
+        };
+        let bytes = encode_packet(&Packet::Publish(packet), PV::V5).unwrap();
+        let mut buf = BytesMut::from(&bytes[..]);
         let err = decode_packet_from_bytes(&mut buf, usize::MAX, PV::V5).unwrap_err();
-        assert_eq!(must_violation(err), Violation::TopicAliasNotAccepted);
+        assert_eq!(
+            must_violation(err),
+            Violation::MalformedProperty(crate::properties::id::TOPIC_ALIAS)
+        );
     }
 
     #[test]
@@ -1721,13 +1855,19 @@ mod tests {
         // PUBACK id=5, reason=0x10 (No matching subscribers), empty props.
         let wire = vec![0x40, 0x04, 0x00, 0x05, 0x10, 0x00];
         let mut buf = BytesMut::from(&wire[..]);
-        let Packet::Puback(id) = decode_packet_from_bytes(&mut buf, usize::MAX, PV::V5)
+        let Packet::Puback(ack) = decode_packet_from_bytes(&mut buf, usize::MAX, PV::V5)
             .unwrap()
             .unwrap()
         else {
             panic!("expected PUBACK")
         };
-        assert_eq!(id, 5);
+        assert_eq!(ack.packet_id, 5);
+        // phase 2: the v5 reason code is now surfaced, not discarded.
+        // 0x10 (No matching subscribers) is a normal/success-class code
+        // (< 0x80 per spec §2.4) — the publish still succeeded, there was
+        // just nobody subscribed.
+        assert_eq!(ack.reason_code, 0x10);
+        assert!(ack.is_success());
         // The same frame is malformed under v3.1.1 (fixed 2-byte body).
         let mut buf = BytesMut::from(&wire[..]);
         assert!(decode_packet_from_bytes(&mut buf, usize::MAX, PV::V311).is_err());
@@ -1769,7 +1909,7 @@ mod tests {
             vec![0xC0, 0x00]
         );
         assert_eq!(
-            encode_packet(&Packet::Puback(1), PV::V311).unwrap(),
+            encode_packet(&Packet::Puback(AckPacket::success(1)), PV::V311).unwrap(),
             vec![0x40, 0x02, 0x00, 0x01]
         );
         assert_eq!(

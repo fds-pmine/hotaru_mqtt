@@ -33,8 +33,9 @@ use crate::codec::read_packet;
 use crate::context::MqttContext;
 use crate::error::{MqttError, TimeoutKind, Violation};
 use crate::packet::{
-    ConnackReturnCode, ConnectPacket, Packet, PublishPacket, SubackPacket, SubscribePacket,
-    TopicSubscription, UnsubscribePacket, WillPacket, incoming_from_packet,
+    AckPacket, ConnackReturnCode, ConnectPacket, Packet, ProtocolVersion, PublishPacket,
+    SubackPacket, SubscribePacket, TopicSubscription, UnsubscribePacket, WillPacket,
+    incoming_from_packet,
 };
 use crate::request::{
     IncomingPublish, MqttRequest, MqttResponse, PublishAck, PublishRequest, QoS, TopicFilter,
@@ -430,28 +431,55 @@ where
             dispatch_incoming(incoming_from_packet(&publish), root, dispatcher);
             Ok(false)
         }
-        Packet::Puback(id) => {
+        Packet::Puback(ack) => {
+            // A failure reason (v5 §3.4.2.1, e.g. 0x87 Not authorized)
+            // still terminates the delivery attempt — same slot/inflight
+            // cleanup as success; the reason is visible on the packet.
+            let id = ack.packet_id;
             fire_ack(&channel, id, AckKind::Puback);
             channel.session().forget_outbound_inflight(id);
             Ok(false)
         }
-        Packet::Pubrec(id) => {
-            // QoS 2 phase 1: send PUBREL, wait for PUBCOMP
+        Packet::Pubrec(ack) => {
+            let id = ack.packet_id;
             fire_ack(&channel, id, AckKind::Pubrec);
-            channel.send_packet(Packet::Pubrel(id))?;
+            if ack.is_success() {
+                // QoS 2 phase 1: send PUBREL, wait for PUBCOMP.
+                channel.send_packet(Packet::Pubrel(AckPacket::success(id)))?;
+            } else {
+                // v5 §4.3.3: a failure PUBREC means the receiver discarded
+                // the message — MUST NOT send PUBREL; drop the inflight
+                // record so the id frees up.
+                channel.session().forget_outbound_inflight(id);
+            }
             Ok(false)
         }
-        Packet::Pubcomp(id) => {
+        Packet::Pubcomp(ack) => {
+            let id = ack.packet_id;
             fire_ack(&channel, id, AckKind::Pubcomp);
             channel.session().forget_outbound_inflight(id);
             Ok(false)
         }
-        Packet::Pubrel(id) => {
-            // Inbound QoS 2: take stored publish and dispatch
-            if let Some(incoming) = channel.session().take_qos2_inbound(id) {
+        Packet::Pubrel(ack) => {
+            let id = ack.packet_id;
+            // Inbound QoS 2: take stored publish and dispatch.
+            let comp = if let Some(incoming) = channel.session().take_qos2_inbound(id) {
                 dispatch_incoming(incoming, root, dispatcher);
-            }
-            channel.send_packet(Packet::Pubcomp(id))?;
+                AckPacket::success(id)
+            } else if channel.protocol_version() == ProtocolVersion::V5 {
+                // v5 §3.6.2.1: no matching QoS-2 stash entry — reply
+                // PUBCOMP 0x92 (Packet Identifier not found).
+                AckPacket {
+                    packet_id: id,
+                    reason_code: 0x92,
+                    properties: Default::default(),
+                }
+            } else {
+                // v3.1.1 has no reason codes; a bare PUBCOMP is the only
+                // spec-shaped reply (pre-phase-2 behavior).
+                AckPacket::success(id)
+            };
+            channel.send_packet(Packet::Pubcomp(comp))?;
             Ok(false)
         }
         Packet::Suback(s) => {

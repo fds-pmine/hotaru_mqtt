@@ -21,7 +21,7 @@ use crate::pmap::PMap;
 
 use crate::channel::MqttChannel;
 use crate::error::{MqttError, Violation};
-use crate::packet::{Packet, PublishPacket, incoming_from_packet};
+use crate::packet::{AckPacket, Packet, PublishPacket, incoming_from_packet};
 use crate::request::{IncomingPublish, PacketId, QoS, SubackCode};
 use crate::safety::DEFAULT_MAX_INFLIGHT_MESSAGES;
 
@@ -305,7 +305,7 @@ pub fn ack_inbound_publish_pre_chain<W: ConnStream, Rt: hotaru_core::app::runtim
         QoS::AtMostOnce => Ok(()),
         QoS::AtLeastOnce => {
             if let Some(id) = publish.packet_id {
-                channel.send_packet(Packet::Puback(id))?;
+                channel.send_packet(Packet::Puback(AckPacket::success(id)))?;
             }
             Ok(())
         }
@@ -319,7 +319,7 @@ pub fn ack_inbound_publish_pre_chain<W: ConnStream, Rt: hotaru_core::app::runtim
                     return Err(Violation::ReceiveMaximumExceeded { limit: receive_max }.into());
                 }
                 session.stash_qos2_inbound(id, incoming_from_packet(publish));
-                channel.send_packet(Packet::Pubrec(id))?;
+                channel.send_packet(Packet::Pubrec(AckPacket::success(id)))?;
             }
             Ok(())
         }

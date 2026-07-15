@@ -6,6 +6,7 @@
 //! Sibling of `hotaru_mqtt::MqttClientProtocol`; the symmetric split keeps
 //! client / sensor builds free of broker code.
 
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,8 +25,8 @@ use hotaru_mqtt::codec::read_packet;
 use hotaru_mqtt::context::MqttContext;
 use hotaru_mqtt::error::{MqttError, TimeoutKind, Violation};
 use hotaru_mqtt::packet::{
-    ConnackPacket, ConnackReturnCode, Packet, ProtocolVersion, PublishPacket, SubackPacket,
-    incoming_from_packet,
+    AckPacket, ConnackPacket, ConnackReturnCode, Packet, ProtocolVersion, PublishPacket,
+    SubackPacket, incoming_from_packet,
 };
 use hotaru_mqtt::request::{QoS, TopicFilter, WillMessage};
 use hotaru_mqtt::session::BindInfo;
@@ -271,6 +272,28 @@ where
         return Err(Violation::ConnectionRefused(ConnackReturnCode::IdentifierRejected).into());
     }
 
+    // v5 §4.12 / §3.2.2.2: enhanced authentication is not implemented. A
+    // CONNECT carrying an Authentication Method property must be refused
+    // with 0x8C (Bad authentication method) rather than silently falling
+    // through to password auth with the property ignored. Checked
+    // pre-admission alongside the identifier rule: a refused CONNECT
+    // never costs a connection slot.
+    if connect.properties.authentication_method.is_some() {
+        warn!(
+            target: "hotaru_mqtt_broker",
+            client_id = %connect.client_id,
+            "rejecting CONNECT: enhanced authentication (v5 AUTH) not supported"
+        );
+        let _ = channel.send_packet(Packet::Connack(ConnackPacket {
+            properties: Default::default(),
+            session_present: false,
+            return_code: ConnackReturnCode::BadAuthenticationMethod,
+        }));
+        return Err(
+            Violation::ConnectionRefused(ConnackReturnCode::BadAuthenticationMethod).into(),
+        );
+    }
+
     // 2a. Admission control FIRST (SAFETY_PROOF v3 U7): a `TenantResolver`
     //     impl that does DNS / DB lookups would otherwise be exercisable
     //     without occupying a connection slot, opening a DoS amplification
@@ -330,7 +353,23 @@ where
         payload: w.payload.clone(),
         qos: w.qos,
         retain: w.retain,
+        // v5 §3.1.3.2: Will Properties travel onto the will PUBLISH when
+        // it fires (Content Type / Response Topic / Correlation Data /
+        // Message Expiry / User Properties).
+        properties: w.properties.clone(),
     });
+
+    // v5 §3.1.2.11 Receive Maximum: the client's cap on concurrent QoS≥1
+    // publishes *we* may have in flight toward it. Effective outbound cap
+    // = min(operator's `max_inflight_messages`, client's Receive Maximum);
+    // fanout consults `session.max_inflight()` per subscriber. The value 0
+    // is a protocol error per spec — clamped to 1 rather than closing.
+    // (v3.1.1 clients carry no properties: they get the operator cap.)
+    let mut effective_inflight = broker.safety().max_inflight_messages();
+    if let Some(rm) = connect.properties.receive_maximum {
+        effective_inflight = effective_inflight.min(rm.max(1) as usize);
+    }
+    channel.session().set_max_inflight(effective_inflight);
 
     // 3. Register session (broker takes channel clone). `tenant` was
     //    resolved in step 2a; all broker-internal maps key on
@@ -361,9 +400,24 @@ where
         "CONNECT accepted"
     );
 
-    // 4. Send CONNACK
+    // 4. Send CONNACK. On a v5 session the acceptance advertises this
+    //    broker's limits (§3.2.2.3): Topic Alias Maximum (how many aliases
+    //    we will track for this connection) and Receive Maximum (our
+    //    inbound QoS-2 stash cap, clamped to the u16 property range).
+    let connack_properties = if version == ProtocolVersion::V5 {
+        let mut props = hotaru_mqtt::Properties::default();
+        let alias_max = broker.safety().topic_alias_maximum();
+        if alias_max > 0 {
+            props.topic_alias_maximum = Some(alias_max);
+        }
+        props.receive_maximum =
+            Some(broker.safety().receive_maximum_inbound().min(u16::MAX as usize) as u16);
+        props
+    } else {
+        Default::default()
+    };
     if let Err(e) = channel.send_packet(Packet::Connack(ConnackPacket {
-        properties: Default::default(),
+        properties: connack_properties,
         session_present,
         return_code: ConnackReturnCode::Accepted,
     })) {
@@ -424,6 +478,13 @@ where
     let mut terminal_error: Option<MqttError> = None;
     let shutdown = channel.shutdown_signal();
 
+    // v5 §3.3.2.3.4: per-connection inbound Topic Alias table. Owned by
+    // this read loop (aliases die with the network connection, never with
+    // the logical session) and bounded by the advertised Topic Alias
+    // Maximum, so its footprint is at most `alias_max` topic strings.
+    let alias_max = broker.safety().topic_alias_maximum();
+    let mut topic_aliases: BTreeMap<u16, Arc<str>> = BTreeMap::new();
+
     loop {
         if !channel.is_open() {
             break;
@@ -461,6 +522,8 @@ where
                             &client_id,
                             p,
                             &fanout_tx,
+                            &mut topic_aliases,
+                            alias_max,
                         ).await {
                             terminal_error = Some(e);
                             break;
@@ -523,6 +586,42 @@ async fn fanout_worker<W, TS, Rt>(
     }
 }
 
+/// Resolve (and strip) a v5 Topic Alias on an inbound PUBLISH against the
+/// connection's alias table (spec §3.3.2.3.4).
+///
+/// - alias with a non-empty topic: (re)register the mapping;
+/// - alias with an empty topic: substitute the registered topic;
+/// - alias of 0, alias above the advertised maximum, or an unregistered
+///   alias with an empty topic: protocol error — connection closes;
+/// - no alias and an empty topic: `EmptyPublishTopic` (the codec defers
+///   this v5 check here, where alias context exists).
+///
+/// The alias property is always removed: aliases are hop-local and MUST
+/// NOT leak into fanout, the retained store, or the QoS-2 stash.
+fn resolve_topic_alias(
+    publish: &mut PublishPacket,
+    table: &mut BTreeMap<u16, Arc<str>>,
+    alias_max: u16,
+) -> Result<(), MqttError> {
+    if let Some(alias) = publish.properties.topic_alias.take() {
+        if alias == 0 || alias > alias_max {
+            return Err(Violation::TopicAliasNotAccepted.into());
+        }
+        if publish.topic.is_empty() {
+            match table.get(&alias) {
+                Some(topic) => publish.topic = topic.clone(),
+                None => return Err(Violation::TopicAliasNotAccepted.into()),
+            }
+        } else {
+            table.insert(alias, publish.topic.clone());
+        }
+    } else if publish.topic.is_empty() {
+        return Err(Violation::EmptyPublishTopic.into());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_server_inbound<W, Rt>(
     channel: MqttChannel<W, Rt>,
     broker: Broker<W, Rt>,
@@ -530,13 +629,22 @@ async fn dispatch_server_inbound<W, Rt>(
     client_id: &Arc<str>,
     packet: Packet,
     fanout_tx: &async_channel::Sender<PublishPacket>,
+    topic_aliases: &mut BTreeMap<u16, Arc<str>>,
+    alias_max: u16,
 ) -> Result<(), MqttError>
 where
     W: ConnStream,
     Rt: RuntimeSpec,
 {
     match packet {
-        Packet::Publish(publish) => {
+        Packet::Publish(mut publish) => {
+            // v5 topic alias FIRST: every later stage (QoS-2 stash, ACL,
+            // chain, fanout, retained store) must see the real topic and
+            // never the hop-local alias.
+            resolve_topic_alias(&mut publish, topic_aliases, alias_max)?;
+            // Wildcard/NUL validation was skipped at the codec for the
+            // empty-topic alias form — the substituted topic came from a
+            // prior validated PUBLISH, so it is already clean.
             // Ack BEFORE chain (O.2). Per-session QoS-2 stash cap from
             // `MqttSafety.receive_maximum_inbound()` (second-audit G2)
             // — overflow surfaces as `ReceiveMaximumExceeded` and
@@ -633,23 +741,35 @@ where
             channel.send_packet(Packet::Pingresp)?;
             Ok(())
         }
-        Packet::Puback(id) => {
-            broker.ack_outbound(tenant, client_id, id).await;
+        Packet::Puback(ack) => {
+            // A v5 failure reason (0x87 / 0x97 / ...) still terminates the
+            // delivery attempt; cleanup is identical to success.
+            broker.ack_outbound(tenant, client_id, ack.packet_id).await;
             Ok(())
         }
-        Packet::Pubrec(id) => {
-            channel.send_packet(Packet::Pubrel(id))?;
+        Packet::Pubrec(ack) => {
+            let id = ack.packet_id;
+            if ack.is_success() {
+                channel.send_packet(Packet::Pubrel(AckPacket::success(id)))?;
+            } else {
+                // v5 §4.3.3: failure PUBREC — the subscriber discarded the
+                // message. MUST NOT send PUBREL; release the inflight slot.
+                broker.ack_outbound(tenant, client_id, id).await;
+            }
             Ok(())
         }
-        Packet::Pubcomp(id) => {
-            broker.ack_outbound(tenant, client_id, id).await;
+        Packet::Pubcomp(ack) => {
+            broker.ack_outbound(tenant, client_id, ack.packet_id).await;
             Ok(())
         }
-        Packet::Pubrel(id) => {
+        Packet::Pubrel(ack) => {
+            let id = ack.packet_id;
             // QoS 2 phase 2: take the stored publish and submit to coordinator
             // — preserves ordering relative to subsequent QoS 0/1 publishes
             // from this same client.
+            let mut found = false;
             if let Some(stored) = channel.session().take_qos2_inbound(id) {
+                found = true;
                 let publish = PublishPacket {
                     // Forward the publisher's v5 properties through the
                     // QoS 2 release path (stash carries them).
@@ -676,7 +796,21 @@ where
                     }
                 }
             }
-            channel.send_packet(Packet::Pubcomp(id))?;
+            let comp = if found {
+                AckPacket::success(id)
+            } else if channel.protocol_version() == ProtocolVersion::V5 {
+                // v5 §3.6.2.1: no matching QoS-2 stash entry — PUBCOMP
+                // 0x92 (Packet Identifier not found).
+                AckPacket {
+                    packet_id: id,
+                    reason_code: 0x92,
+                    properties: Default::default(),
+                }
+            } else {
+                // v3.1.1 has no reason codes; bare PUBCOMP as before.
+                AckPacket::success(id)
+            };
+            channel.send_packet(Packet::Pubcomp(comp))?;
             Ok(())
         }
         Packet::Connect(_) => Err(Violation::SessionAlreadyBound.into()),
@@ -729,4 +863,84 @@ where
     }
 
     if fanout { Some(current) } else { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use hotaru_mqtt::packet::ProtocolVersion;
+    use hotaru_mqtt::Properties;
+
+    fn publish(topic: &str, alias: Option<u16>) -> PublishPacket {
+        PublishPacket {
+            topic: Arc::from(topic),
+            payload: Bytes::from_static(b"x"),
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            packet_id: None,
+            properties: Properties {
+                topic_alias: alias,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn topic_alias_register_then_resolve() {
+        let mut table = BTreeMap::new();
+        // First PUBLISH: topic + alias registers the mapping and strips it.
+        let mut p1 = publish("sensors/a/temp", Some(1));
+        resolve_topic_alias(&mut p1, &mut table, 16).unwrap();
+        assert_eq!(p1.topic.as_ref(), "sensors/a/temp");
+        assert_eq!(p1.properties.topic_alias, None, "alias must not leak downstream");
+        // Second PUBLISH: empty topic + same alias resolves to the stored topic.
+        let mut p2 = publish("", Some(1));
+        resolve_topic_alias(&mut p2, &mut table, 16).unwrap();
+        assert_eq!(p2.topic.as_ref(), "sensors/a/temp");
+        assert_eq!(p2.properties.topic_alias, None);
+    }
+
+    #[test]
+    fn topic_alias_above_max_rejected() {
+        let mut table = BTreeMap::new();
+        let mut p = publish("t", Some(99));
+        let err = resolve_topic_alias(&mut p, &mut table, 16).unwrap_err();
+        assert!(matches!(
+            err,
+            MqttError::Protocol(Violation::TopicAliasNotAccepted)
+        ));
+    }
+
+    #[test]
+    fn unknown_alias_with_empty_topic_rejected() {
+        let mut table = BTreeMap::new();
+        let mut p = publish("", Some(2)); // never registered
+        let err = resolve_topic_alias(&mut p, &mut table, 16).unwrap_err();
+        assert!(matches!(
+            err,
+            MqttError::Protocol(Violation::TopicAliasNotAccepted)
+        ));
+    }
+
+    #[test]
+    fn empty_topic_without_alias_is_error() {
+        let mut table = BTreeMap::new();
+        let mut p = publish("", None);
+        let err = resolve_topic_alias(&mut p, &mut table, 16).unwrap_err();
+        assert!(matches!(
+            err,
+            MqttError::Protocol(Violation::EmptyPublishTopic)
+        ));
+    }
+
+    #[test]
+    fn plain_publish_untouched() {
+        let mut table = BTreeMap::new();
+        let mut p = publish("a/b", None);
+        resolve_topic_alias(&mut p, &mut table, 16).unwrap();
+        assert_eq!(p.topic.as_ref(), "a/b");
+        assert!(table.is_empty());
+    }
 }

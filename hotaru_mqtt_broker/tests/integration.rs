@@ -19,8 +19,8 @@ use tokio::net::{TcpListener, TcpStream as RawTcpStream};
 use tokio::time::timeout;
 
 use hotaru_mqtt::{
-    ConnackPacket, ConnackReturnCode, ConnectPacket, Packet, ProtocolVersion, PublishPacket, QoS,
-    SubackPacket, SubscribePacket, TopicSubscription, codec,
+    AckPacket, ConnackPacket, ConnackReturnCode, ConnectPacket, Packet, ProtocolVersion,
+    PublishPacket, QoS, SubackPacket, SubscribePacket, TopicSubscription, codec,
 };
 use hotaru_mqtt_broker::{
     AclChecker, AclDecision, BROKER_STATICS_KEY, Broker, BrokerSafety, MQTT_SERVER, TenantId,
@@ -1535,7 +1535,7 @@ async fn publish_q1_round_trip_with_puback() {
     .await;
 
     match read_packet(&mut pub_reader).await {
-        Packet::Puback(id) => assert_eq!(id, 42),
+        Packet::Puback(ack) => assert_eq!(ack.packet_id, 42),
         other => panic!("expected PUBACK, got {:?}", other),
     }
 
@@ -1545,7 +1545,11 @@ async fn publish_q1_round_trip_with_puback() {
             assert_eq!(&p.payload[..], b"q1-payload");
             assert_eq!(p.qos, QoS::AtLeastOnce);
             assert!(p.packet_id.is_some());
-            send_packet(&mut sub_writer, &Packet::Puback(p.packet_id.unwrap())).await;
+            send_packet(
+                &mut sub_writer,
+                &Packet::Puback(AckPacket::success(p.packet_id.unwrap())),
+            )
+            .await;
         }
         other => panic!("expected PUBLISH, got {:?}", other),
     }
@@ -1762,14 +1766,14 @@ async fn publish_q2_full_handshake() {
     .await;
 
     match read_packet(&mut pub_reader).await {
-        Packet::Pubrec(id) => assert_eq!(id, 99),
+        Packet::Pubrec(ack) => assert_eq!(ack.packet_id, 99),
         other => panic!("expected PUBREC, got {:?}", other),
     }
 
-    send_packet(&mut pub_writer, &Packet::Pubrel(99)).await;
+    send_packet(&mut pub_writer, &Packet::Pubrel(AckPacket::success(99))).await;
 
     match read_packet(&mut pub_reader).await {
-        Packet::Pubcomp(id) => assert_eq!(id, 99),
+        Packet::Pubcomp(ack) => assert_eq!(ack.packet_id, 99),
         other => panic!("expected PUBCOMP, got {:?}", other),
     }
 
@@ -1779,11 +1783,16 @@ async fn publish_q2_full_handshake() {
             assert_eq!(&p.payload[..], b"q2-payload");
             assert_eq!(p.qos, QoS::ExactlyOnce);
             assert!(p.packet_id.is_some());
-            send_packet(&mut sub_writer, &Packet::Pubrec(p.packet_id.unwrap())).await;
+            send_packet(
+                &mut sub_writer,
+                &Packet::Pubrec(AckPacket::success(p.packet_id.unwrap())),
+            )
+            .await;
             match read_packet(&mut sub_reader).await {
-                Packet::Pubrel(id) => {
-                    assert_eq!(id, p.packet_id.unwrap());
-                    send_packet(&mut sub_writer, &Packet::Pubcomp(id)).await;
+                Packet::Pubrel(ack) => {
+                    assert_eq!(ack.packet_id, p.packet_id.unwrap());
+                    send_packet(&mut sub_writer, &Packet::Pubcomp(AckPacket::success(ack.packet_id)))
+                        .await;
                 }
                 other => panic!("expected PUBREL, got {:?}", other),
             }

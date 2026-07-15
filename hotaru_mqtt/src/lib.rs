@@ -47,9 +47,9 @@ pub use hotaru_tls::{
     TlsOutbound, TlsOutboundTarget, TlsStream, TlsTransport,
 };
 pub use packet::{
-    ConnackPacket, ConnackReturnCode, ConnectPacket, Packet, ProtocolVersion, PublishPacket,
-    SubackPacket, SubscribePacket, TopicSubscription, UnsubackPacket, UnsubscribePacket,
-    WillPacket, incoming_from_packet,
+    AckPacket, ConnackPacket, ConnackReturnCode, ConnectPacket, Packet, ProtocolVersion,
+    PublishPacket, SubackPacket, SubscribePacket, TopicSubscription, UnsubackPacket,
+    UnsubscribePacket, WillPacket, incoming_from_packet,
 };
 pub use properties::Properties;
 pub use protocol::{CLIENT_CONFIG_STATICS_KEY, DefaultInboundHandler, MqttClientProtocol};
