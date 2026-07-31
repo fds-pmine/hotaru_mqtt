@@ -10,28 +10,34 @@
 //! All wire writes flow through the writer actor via `cmd_tx`. Reader is owned
 //! by whoever takes it first (typically the `Protocol::handle` loop).
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::net::SocketAddr;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
-use hotaru_core::connection::{ConnMeta, ConnStream};
+use event_listener::Event;
+use hotaru_core::app::runtime::{AsyncMutexCap, Either, RuntimeSpec};
+use hotaru_core::connection::{ConnMeta, ConnStream, HotaruRead, HotaruWrite};
 use hotaru_core::protocol::{Channel, ProtocolRole};
-use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, Notify, mpsc};
+#[cfg(feature = "std")]
+use hotaru_rt_tokio::TokioRuntime;
 
 use crate::codec::{write_packet, write_publish_packet};
 use crate::error::MqttError;
-use crate::packet::{Packet, PublishPacket};
+use crate::packet::{Packet, ProtocolVersion, PublishPacket};
 use crate::session::MqttSession;
 
 // ----------------------------------------------------------------------------
 // Connection-id global counter (Q decision: u64 + AtomicU64)
 // ----------------------------------------------------------------------------
 
-static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(1);
+// `AtomicUsize` instead of `AtomicU64`: 32-bit no_std targets (thumbv7em,
+// ESP) have no native 64-bit atomics. The public id stays `u64`; on 32-bit
+// targets the counter wraps after ~4e9 connections, far past any embedded
+// session count.
+static CONNECTION_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
 pub fn next_connection_id() -> u64 {
-    CONNECTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+    CONNECTION_COUNTER.fetch_add(1, Ordering::Relaxed) as u64
 }
 
 // ----------------------------------------------------------------------------
@@ -52,16 +58,22 @@ pub enum WriteCmd {
 // MqttChannel
 // ----------------------------------------------------------------------------
 
-pub struct MqttChannel<W: ConnStream> {
+// Ergonomic Tokio default only exists when the tokio runtime is compiled
+// in; a no_std build names its runtime explicitly.
+pub struct MqttChannel<
+    W: ConnStream,
+    #[cfg(feature = "std")] Rt: RuntimeSpec = TokioRuntime,
+    #[cfg(not(feature = "std"))] Rt: RuntimeSpec,
+> {
     // ── Physical wire ───────────────────────────────────────────
-    reader: Arc<Mutex<Option<BufReader<W::ReadHalf>>>>,
+    reader: Arc<Rt::AsyncMutex<Option<<W::ReadHalf as HotaruRead>::Buffered>>>,
     /// Writer actor's input — **bounded** (capacity from caller's `MqttSafety`).
     /// `pub(crate)`; downstream protocol implementations drive it via the
     /// public `send_cmd` / `send_packet` / `send_publish` methods, never
     /// touch the sender directly. Full queue → `MqttError::Backpressure`
     /// (P1.B); slow-consumer policy that translates that into drop-vs-
     /// disconnect lives in `hotaru_mqtt_broker` and gets wired in P3.
-    pub(crate) cmd_tx: mpsc::Sender<WriteCmd>,
+    pub(crate) cmd_tx: async_channel::Sender<WriteCmd>,
 
     // ── Connection metadata ─────────────────────────────────────
     connection_id: u64,
@@ -72,12 +84,22 @@ pub struct MqttChannel<W: ConnStream> {
     // ── Logical session (may outlive channel under clean_session=false) ──
     session: Arc<MqttSession>,
 
+    // ── Negotiated protocol version ─────────────────────────────
+    /// Wire protocol level for this connection (4 = v3.1.1, 5 = v5).
+    /// Shared with the writer actor so encodes always match the version
+    /// set during the CONNECT handshake. Defaults to v3.1.1.
+    version: Arc<AtomicU8>,
+
     // ── Lifecycle signals ───────────────────────────────────────
     open: Arc<AtomicBool>,
-    shutdown: Arc<Notify>,
+    /// Close broadcast. `event_listener::Event` replaces `tokio::sync::Notify`:
+    /// executor-independent, same register-then-notify discipline. Every
+    /// wait site pairs `listen()` with an `open` re-check to close the
+    /// lost-wakeup window (close() flips `open` before notifying).
+    shutdown: Arc<Event>,
 }
 
-impl<W: ConnStream> Clone for MqttChannel<W> {
+impl<W: ConnStream, Rt: RuntimeSpec> Clone for MqttChannel<W, Rt> {
     fn clone(&self) -> Self {
         Self {
             reader: self.reader.clone(),
@@ -87,13 +109,14 @@ impl<W: ConnStream> Clone for MqttChannel<W> {
             local_addr: self.local_addr,
             remote_addr: self.remote_addr,
             session: self.session.clone(),
+            version: self.version.clone(),
             open: self.open.clone(),
             shutdown: self.shutdown.clone(),
         }
     }
 }
 
-impl<W: ConnStream> Channel for MqttChannel<W> {
+impl<W: ConnStream, Rt: RuntimeSpec> Channel for MqttChannel<W, Rt> {
     fn is_open(&self) -> bool {
         self.open.load(Ordering::Acquire)
     }
@@ -104,14 +127,14 @@ impl<W: ConnStream> Channel for MqttChannel<W> {
             return;
         }
         // Notify writer actor to exit (drains in-flight commands first).
-        self.shutdown.notify_waiters();
+        self.shutdown.notify(usize::MAX);
         // MVP: tear down session inflight on channel close. M phase
         // (clean_session=false) will skip this so session can rebind.
         self.session.abandon();
     }
 }
 
-impl<W: ConnStream> MqttChannel<W> {
+impl<W: ConnStream, Rt: RuntimeSpec> MqttChannel<W, Rt> {
     /// Construct a new channel, spawn its writer actor, and stash the reader
     /// for `take_reader`. Called from `Protocol::open_channel` implementations
     /// in any downstream protocol crate, client or server.
@@ -120,43 +143,63 @@ impl<W: ConnStream> MqttChannel<W> {
     /// (`MqttSafety.max_queued_messages()`). A producer overrunning it gets
     /// `MqttError::Backpressure`.
     pub fn new(
-        reader: BufReader<W::ReadHalf>,
-        writer: W::WriteHalf,
+        reader: <W::ReadHalf as HotaruRead>::Buffered,
+        writer: <W::WriteHalf as HotaruWrite>::Buffered,
         meta: &W::Meta,
         role: ProtocolRole,
         cmd_buffer_size: usize,
-    ) -> Self {
-        let (cmd_tx, cmd_rx) = mpsc::channel(cmd_buffer_size.max(1));
+    ) -> Self
+    where
+        W::WriteHalf: HotaruWrite,
+    {
+        let (cmd_tx, cmd_rx) = async_channel::bounded(cmd_buffer_size.max(1));
         let open = Arc::new(AtomicBool::new(true));
-        let shutdown = Arc::new(Notify::new());
+        let shutdown = Arc::new(Event::new());
         let session = MqttSession::new();
+        let version = Arc::new(AtomicU8::new(ProtocolVersion::default().level()));
 
-        // Spawn the writer actor — single owner of W::WriteHalf.
-        tokio::spawn(writer_actor::<W>(
+        // Spawn the writer actor — single owner of W::WriteHalf. Spawned
+        // through the runtime spec, never a concrete executor.
+        Rt::spawn_detached(writer_actor::<W, Rt>(
             writer,
             cmd_rx,
             shutdown.clone(),
             open.clone(),
+            version.clone(),
         ));
 
         Self {
-            reader: Arc::new(Mutex::new(Some(reader))),
+            reader: Arc::new(Rt::AsyncMutex::new(Some(reader))),
             cmd_tx,
             connection_id: next_connection_id(),
             role,
             local_addr: meta.local_addr(),
             remote_addr: meta.remote_addr(),
             session,
+            version,
             open,
             shutdown,
         }
+    }
+
+    /// Record the protocol version negotiated on CONNECT. Client side sets
+    /// this from its config before sending CONNECT; broker side sets it
+    /// from the parsed CONNECT before replying CONNACK. The writer actor
+    /// picks it up on the next encode.
+    pub fn set_protocol_version(&self, version: ProtocolVersion) {
+        self.version.store(version.level(), Ordering::Release);
+    }
+
+    /// The protocol version negotiated for this connection.
+    pub fn protocol_version(&self) -> ProtocolVersion {
+        ProtocolVersion::from_level(self.version.load(Ordering::Acquire)).unwrap_or_default()
     }
 
     /// Take ownership of the reader. Returns `None` on subsequent calls.
     ///
     /// Called once by the `Protocol::handle` loop at startup. Channel clones
     /// held elsewhere cannot read — they only push commands.
-    pub async fn take_reader(&self) -> Option<BufReader<W::ReadHalf>> {
+    pub async fn take_reader(&self) -> Option<<W::ReadHalf as HotaruRead>::Buffered> {
         self.reader.lock().await.take()
     }
 
@@ -209,7 +252,7 @@ impl<W: ConnStream> MqttChannel<W> {
     }
 
     fn try_send(&self, cmd: WriteCmd) -> Result<(), MqttError> {
-        use mpsc::error::TrySendError;
+        use async_channel::TrySendError;
         match self.cmd_tx.try_send(cmd) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => Err(MqttError::Backpressure),
@@ -217,10 +260,11 @@ impl<W: ConnStream> MqttChannel<W> {
         }
     }
 
-    /// Shared `Notify` that fires on `close()`. `handle_*` loops `.await`
-    /// `notified()` on this to break early. Exposed `pub` so downstream
-    /// dispatchers can react to channel shutdown.
-    pub fn shutdown_signal(&self) -> Arc<Notify> {
+    /// Shared close `Event` that fires on `close()`. `handle_*` loops
+    /// `listen().await` on this to break early (always re-checking
+    /// `is_open` after `listen()` to avoid the lost-wakeup window).
+    /// Exposed `pub` so downstream dispatchers can react to shutdown.
+    pub fn shutdown_signal(&self) -> Arc<Event> {
         self.shutdown.clone()
     }
 }
@@ -229,32 +273,87 @@ impl<W: ConnStream> MqttChannel<W> {
 // Writer actor task
 // ----------------------------------------------------------------------------
 
-async fn writer_actor<W: ConnStream>(
-    mut writer: W::WriteHalf,
-    mut cmd_rx: mpsc::Receiver<WriteCmd>,
-    shutdown: Arc<Notify>,
+async fn writer_actor<W: ConnStream, Rt: RuntimeSpec>(
+    mut writer: <W::WriteHalf as HotaruWrite>::Buffered,
+    cmd_rx: async_channel::Receiver<WriteCmd>,
+    shutdown: Arc<Event>,
     open: Arc<AtomicBool>,
-) {
+    version: Arc<AtomicU8>,
+) where
+    W::WriteHalf: HotaruWrite,
+{
     loop {
-        tokio::select! {
-            cmd = cmd_rx.recv() => {
+        let ver = ProtocolVersion::from_level(version.load(Ordering::Acquire)).unwrap_or_default();
+        // Register the listener BEFORE re-checking `open`: close() flips
+        // `open` first and notifies second, so either we observe the flag
+        // here or the listener catches the notification — no lost wakeup.
+        let closed = shutdown.listen();
+        if !open.load(Ordering::Acquire) {
+            drain_queued::<W, Rt>(&mut writer, &cmd_rx, ver).await;
+            break;
+        }
+        match Rt::select2(cmd_rx.recv(), closed).await {
+            Either::Left(cmd) => {
                 match cmd {
-                    Some(WriteCmd::Packet(p)) => {
-                        if write_packet(&mut writer, &p).await.is_err() { break; }
+                    // 0.8.3: the write half is the transport's Buffered form
+                    // (`into_buf_write`), so bytes sit in the buffer until
+                    // flushed. Flush after each packet to keep the pre-0.8.3
+                    // unbuffered-write semantics (acks must hit the wire now).
+                    Ok(WriteCmd::Packet(p)) => {
+                        if write_packet(&mut writer, &p, ver).await.is_err() { break; }
+                        if writer.flush().await.is_err() { break; }
                     }
-                    Some(WriteCmd::Publish(p)) => {
-                        if write_publish_packet(&mut writer, &p).await.is_err() { break; }
+                    Ok(WriteCmd::Publish(p)) => {
+                        if write_publish_packet(&mut writer, &p, ver).await.is_err() { break; }
+                        if writer.flush().await.is_err() { break; }
                     }
-                    Some(WriteCmd::Flush) => {
+                    Ok(WriteCmd::Flush) => {
                         let _ = writer.flush().await;  // W policy §1: shutdown-ish path
                     }
-                    Some(WriteCmd::Shutdown) | None => break,
+                    // Err(_) = every sender dropped — same end-of-stream
+                    // semantics as tokio's `recv() == None`.
+                    Ok(WriteCmd::Shutdown) | Err(_) => break,
                 }
             }
-            _ = shutdown.notified() => break,
+            Either::Right(()) => {
+                // close() contract: "drains in-flight commands first".
+                // The refusal path (send CONNACK-refused, then close())
+                // depends on this — commands queued before the close
+                // still reach the wire.
+                drain_queued::<W, Rt>(&mut writer, &cmd_rx, ver).await;
+                break;
+            }
         }
     }
     // Mark channel closed (idempotent with Channel::close).
     open.store(false, Ordering::Release);
     let _ = writer.shutdown().await; // W policy §1: shutdown path
+}
+
+/// Best-effort drain of commands already queued at close() time. Stops on
+/// the first write error or an explicit `Shutdown` command; never blocks
+/// (only `try_recv`, so nothing enqueued after this point is honoured).
+async fn drain_queued<W: ConnStream, Rt: RuntimeSpec>(
+    writer: &mut <W::WriteHalf as HotaruWrite>::Buffered,
+    cmd_rx: &async_channel::Receiver<WriteCmd>,
+    ver: ProtocolVersion,
+) where
+    W::WriteHalf: HotaruWrite,
+{
+    while let Ok(cmd) = cmd_rx.try_recv() {
+        match cmd {
+            WriteCmd::Packet(p) => {
+                if write_packet(writer, &p, ver).await.is_err() { return; }
+                if writer.flush().await.is_err() { return; }
+            }
+            WriteCmd::Publish(p) => {
+                if write_publish_packet(writer, &p, ver).await.is_err() { return; }
+                if writer.flush().await.is_err() { return; }
+            }
+            WriteCmd::Flush => {
+                let _ = writer.flush().await;
+            }
+            WriteCmd::Shutdown => return,
+        }
+    }
 }

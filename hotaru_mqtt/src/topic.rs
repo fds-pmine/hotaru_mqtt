@@ -13,6 +13,7 @@
 //! (HTTP grammar — `<id>` / `<**path>`) back to MQTT wire format (`+` / `#`),
 //! used when constructing SUBSCRIBE packets from `endpoint!`-registered paths.
 
+use alloc::{string::{String, ToString}, vec::Vec};
 use hotaru_core::url::{PathPattern, PatternError, RawToken, TypeKind};
 
 use crate::error::{MqttError, Violation};

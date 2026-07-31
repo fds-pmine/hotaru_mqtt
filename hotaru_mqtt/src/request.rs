@@ -4,7 +4,8 @@
 //! / `Response`. All three outpoint operations (`Publish` / `Subscribe` /
 //! `Unsubscribe`) go through this enum via `run!(...)`.
 
-use std::sync::Arc;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use bytes::Bytes;
 
@@ -86,6 +87,11 @@ pub struct IncomingPublish {
     pub retain: bool,
     pub dup: bool,
     pub packet_id: Option<PacketId>,
+    /// MQTT 5.0 properties carried by the wire PUBLISH (response topic,
+    /// correlation data, user properties, …). Empty for v3.1.1 peers.
+    /// Rides the inbound stash so QoS 2 release and endpoint dispatch
+    /// both see what the publisher sent.
+    pub properties: crate::properties::Properties,
 }
 
 impl IncomingPublish {
@@ -169,8 +175,8 @@ pub struct Credentials {
     pub password: Bytes,
 }
 
-impl std::fmt::Debug for Credentials {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Credentials")
             .field("username", &self.username)
             .field(
@@ -219,6 +225,12 @@ pub struct WillMessage {
     pub payload: Bytes,
     pub qos: QoS,
     pub retain: bool,
+    /// v5 §3.1.3.2 Will Properties, carried onto the will PUBLISH when it
+    /// fires (Content Type / Response Topic / Correlation Data / Message
+    /// Expiry / User Properties). Empty on v3.1.1. Will Delay Interval is
+    /// parsed but the will currently fires immediately (delay = 0
+    /// behavior); deferred-firing timers are a [future] item.
+    pub properties: crate::properties::Properties,
 }
 
 impl WillMessage {
@@ -233,6 +245,7 @@ impl WillMessage {
             payload: payload.into(),
             qos,
             retain,
+            properties: Default::default(),
         }
     }
 }

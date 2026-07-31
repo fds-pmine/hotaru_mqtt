@@ -8,20 +8,24 @@
 //! The server-side counterpart (`MqttServerProtocol`) and its broker live in
 //! a separate downstream crate so client / sensor builds don't pay for them.
 
-use std::marker::PhantomData;
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::time::Duration;
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::marker::PhantomData;
+use core::time::Duration;
 
 use async_trait::async_trait;
-use dashmap::DashMap;
+use futures_channel::oneshot;
 use hotaru_core::app::common::RuntimeConfig;
-use hotaru_core::connection::{ConnStream, TransportSpec};
+use hotaru_core::app::runtime::{Either, RuntimeSpec};
+use hotaru_core::connection::{ConnStream, HotaruRead, HotaruWrite, TransportSpec};
 use hotaru_core::protocol::{Channel as _, CtxError, Protocol, ProtocolFlow, ProtocolRole};
 use hotaru_core::url::{UrlNode, UrlRoot};
-use tokio::io::BufReader;
-use tokio::sync::{mpsc, oneshot};
-use tokio::time::timeout;
+#[cfg(feature = "std")]
+use hotaru_rt_tokio::TokioRuntime;
+use once_cell::race::OnceBox;
+
+use crate::pmap::PMap;
 
 use crate::channel::MqttChannel;
 use crate::client::MqttClientConfig;
@@ -29,8 +33,9 @@ use crate::codec::read_packet;
 use crate::context::MqttContext;
 use crate::error::{MqttError, TimeoutKind, Violation};
 use crate::packet::{
-    ConnackReturnCode, ConnectPacket, Packet, PublishPacket, SubackPacket, SubscribePacket,
-    TopicSubscription, UnsubscribePacket, WillPacket, incoming_from_packet,
+    AckPacket, ConnackReturnCode, ConnectPacket, Packet, ProtocolVersion, PublishPacket,
+    SubackPacket, SubscribePacket, TopicSubscription, UnsubscribePacket, WillPacket,
+    incoming_from_packet,
 };
 use crate::request::{
     IncomingPublish, MqttRequest, MqttResponse, PublishAck, PublishRequest, QoS, TopicFilter,
@@ -58,8 +63,10 @@ const INITIAL_CMD_BUFFER_SIZE: usize = 1000;
 // MqttClientProtocol
 // ----------------------------------------------------------------------------
 
-pub type DefaultMqttTransport = hotaru_core::connection::tcp::TcpTransport;
-pub type MQTT = MqttClientProtocol<tokio::net::TcpStream, DefaultMqttTransport>;
+#[cfg(feature = "std")]
+pub type DefaultMqttTransport = hotaru_io_tokio::TcpTransport;
+#[cfg(feature = "std")]
+pub type MQTT = MqttClientProtocol<hotaru_io_tokio::TcpStream, DefaultMqttTransport>;
 
 /// MQTT over TLS (gated by `tls` feature). Mirrors `hotaru_http::HTTPS`.
 #[cfg(feature = "tls")]
@@ -70,18 +77,28 @@ pub type MqttTlsProtocol = MqttClientProtocol<hotaru_tls::TlsStream, hotaru_tls:
 #[allow(non_camel_case_types)]
 pub type MQTTS = MqttTlsProtocol;
 
+// Ergonomic defaults (bare `MqttClientProtocol` = TCP + Tokio) only exist
+// when the tokio backends are compiled in; a no_std build always names its
+// wire / transport / runtime explicitly.
 pub struct MqttClientProtocol<
-    W: ConnStream = tokio::net::TcpStream,
-    TS: TransportSpec<Wire = W> = DefaultMqttTransport,
+    #[cfg(feature = "std")] W: ConnStream = hotaru_io_tokio::TcpStream,
+    #[cfg(not(feature = "std"))] W: ConnStream,
+    #[cfg(feature = "std")] TS: TransportSpec<Wire = W> = DefaultMqttTransport,
+    #[cfg(not(feature = "std"))] TS: TransportSpec<Wire = W>,
+    #[cfg(feature = "std")] Rt: RuntimeSpec = TokioRuntime,
+    #[cfg(not(feature = "std"))] Rt: RuntimeSpec,
 > {
     /// Shared session channel slot. Cloned across protocol clones via `Arc`.
     /// First `open_channel` calls `set`; subsequent `acquire_channel` calls
-    /// `get` and clones.
-    session_channel: Arc<OnceLock<MqttChannel<W>>>,
+    /// `get` and clones. `OnceBox` (lock-free, no_std) replaces
+    /// `std::sync::OnceLock` — same set-once semantics.
+    session_channel: Arc<OnceBox<MqttChannel<W, Rt>>>,
     _ts: PhantomData<fn() -> TS>,
 }
 
-impl<W: ConnStream, TS: TransportSpec<Wire = W>> Clone for MqttClientProtocol<W, TS> {
+impl<W: ConnStream, TS: TransportSpec<Wire = W>, Rt: RuntimeSpec> Clone
+    for MqttClientProtocol<W, TS, Rt>
+{
     fn clone(&self) -> Self {
         Self {
             session_channel: self.session_channel.clone(),
@@ -90,33 +107,45 @@ impl<W: ConnStream, TS: TransportSpec<Wire = W>> Clone for MqttClientProtocol<W,
     }
 }
 
-impl<W: ConnStream, TS: TransportSpec<Wire = W>> Default for MqttClientProtocol<W, TS> {
+impl<W: ConnStream, TS: TransportSpec<Wire = W>, Rt: RuntimeSpec> Default
+    for MqttClientProtocol<W, TS, Rt>
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<W: ConnStream, TS: TransportSpec<Wire = W>> MqttClientProtocol<W, TS> {
+impl<W: ConnStream, TS: TransportSpec<Wire = W>, Rt: RuntimeSpec> MqttClientProtocol<W, TS, Rt> {
     pub fn new() -> Self {
         Self {
-            session_channel: Arc::new(OnceLock::new()),
+            session_channel: Arc::new(OnceBox::new()),
             _ts: PhantomData,
         }
     }
 }
 
-#[async_trait]
-impl<W, TS> Protocol for MqttClientProtocol<W, TS>
+impl<W, TS, Rt> Protocol for MqttClientProtocol<W, TS, Rt>
 where
     W: ConnStream,
     TS: TransportSpec<Wire = W>,
+    Rt: RuntimeSpec,
+    // Demanded by hotaru_core's `Protocol::Context` bound (`CtxError` must
+    // absorb transport connect errors). It cannot be generalized away on
+    // the mqtt side: a blanket `impl<E: Error> From<E> for MqttError`
+    // collides with coherence. tokio's `TS::IoError = std::io::Error` is
+    // covered by the std-gated `From` in `error.rs`; an embedded transport
+    // supplies the one-line `From` for its own error type (or the bound
+    // moves in hotaru_core itself).
+    MqttError: From<<TS as TransportSpec>::IoError>,
+    W::ReadHalf: HotaruRead,
+    W::WriteHalf: HotaruWrite,
 {
     type Wire = W;
     type TS = TS;
-    type Channel = MqttChannel<W>;
+    type Channel = MqttChannel<W, Rt>;
     type Stream = ();
     type Message = Packet;
-    type Context = MqttContext<TS>;
+    type Context = MqttContext<TS, Rt>;
 
     fn name(&self) -> &'static str {
         "mqtt"
@@ -159,8 +188,8 @@ where
 
     fn open_channel(
         self,
-        reader: BufReader<<<Self::TS as TransportSpec>::Wire as ConnStream>::ReadHalf>,
-        writer: <<Self::TS as TransportSpec>::Wire as ConnStream>::WriteHalf,
+        reader: <<<Self::TS as TransportSpec>::Wire as ConnStream>::ReadHalf as HotaruRead>::Buffered,
+        writer: <<<Self::TS as TransportSpec>::Wire as ConnStream>::WriteHalf as HotaruWrite>::Buffered,
         meta: <<Self::TS as TransportSpec>::Wire as ConnStream>::Meta,
     ) -> Self::Channel {
         let channel = MqttChannel::new(
@@ -172,7 +201,7 @@ where
         );
         // First call wins; later open_channel attempts return their own channel
         // but only the first one is stash-acquirable.
-        let _ = self.session_channel.set(channel.clone());
+        let _ = self.session_channel.set(Box::new(channel.clone()));
         channel
     }
 
@@ -211,14 +240,16 @@ where
 // handle_client — client-side persistent session loop
 // ============================================================================
 
-async fn handle_client<W, TS>(
-    channel: &MqttChannel<W>,
+async fn handle_client<W, TS, Rt>(
+    channel: &MqttChannel<W, Rt>,
     runtime: Arc<RuntimeConfig>,
-    root: Arc<UrlRoot<MqttContext<TS>, TS>>,
+    root: Arc<UrlRoot<MqttContext<TS, Rt>, TS>>,
 ) -> Result<ProtocolFlow, MqttError>
 where
     W: ConnStream,
     TS: TransportSpec<Wire = W>,
+    Rt: RuntimeSpec,
+    W::ReadHalf: HotaruRead,
 {
     let config = runtime
         .get_static::<Arc<MqttClientConfig>>(CLIENT_CONFIG_STATICS_KEY)
@@ -241,15 +272,21 @@ where
         .session()
         .set_max_inflight(config.safety.max_inflight_messages());
 
+    // Record the wire version before any traffic: the writer actor
+    // encodes CONNECT (and everything after) with it, and reads below
+    // parse with it.
+    let version = config.protocol_version;
+    channel.set_protocol_version(version);
+
     let connect = build_connect(&config);
     channel.send_packet(Packet::Connect(connect))?;
 
     let max_packet_size = config.safety.max_packet_size();
 
     // 3. Wait for CONNACK with timeout
-    let connack_packet = timeout(
+    let connack_packet = Rt::timeout(
         config.connect_timeout,
-        read_packet(&mut reader, max_packet_size),
+        read_packet(&mut reader, max_packet_size, version),
     )
     .await
     .map_err(|_| MqttError::Timeout(TimeoutKind::Connack))??;
@@ -285,7 +322,7 @@ where
             packet_id: pkt_id,
             subscriptions: subs,
         }))?;
-        let _ = timeout(DEFAULT_ACK_TIMEOUT, rx)
+        let _ = Rt::timeout(DEFAULT_ACK_TIMEOUT, rx)
             .await
             .map_err(|_| MqttError::Timeout(TimeoutKind::Ack))?
             .map_err(|_| MqttError::ChannelClosed)?;
@@ -295,7 +332,7 @@ where
     //    a lazy-spawned worker that drains its mpsc queue in arrival order.
     //    On `handle_client` return, the dispatcher drops → senders drop →
     //    workers drain queues, then exit.
-    let dispatcher = EndpointDispatcher::<W, TS>::new(
+    let dispatcher = EndpointDispatcher::<W, TS, Rt>::new(
         channel.clone(),
         config.default_inbound.clone(),
         config.safety.worker_idle_timeout(),
@@ -307,41 +344,60 @@ where
     //    arm's type, then gate it with `if keep_alive_enabled`.
     let keep_alive_enabled = config.keep_alive_secs > 0;
     let ping_interval = Duration::from_secs(config.keep_alive_secs.max(1) as u64);
-    let mut ping_timer = tokio::time::interval(ping_interval);
-    ping_timer.tick().await; // skip first immediate tick
+    // Absolute next-ping deadline via Rt::Instant, replacing tokio's
+    // interval: advance by one period per fire → same steady cadence,
+    // no executor-specific timer type.
+    let mut next_ping = Rt::instant_plus(Rt::now(), ping_interval);
     let shutdown = channel.shutdown_signal();
 
     loop {
+        // Lost-wakeup discipline (see channel.rs): register the shutdown
+        // listener first, then re-check the open flag.
+        let closed = shutdown.listen();
         if !channel.is_open() {
             break;
         }
-        tokio::select! {
-            inbound = read_packet(&mut reader, max_packet_size) => {
-                match inbound {
-                    Ok(p) => {
-                        if dispatch_client_inbound(
-                            channel.clone(),
-                            p,
-                            &root,
-                            &dispatcher,
-                            config.safety.receive_maximum_inbound(),
-                        )
-                        .await?
-                        {
-                            break;  // disconnect
-                        }
-                    }
-                    Err(MqttError::Io(_)) => break,    // wire closed
-                    Err(e) => return Err(e),
-                }
+        // Arm 2 of 3: ping deadline, or never when keep_alive is disabled
+        // (spec §3.1.2.10: keep_alive=0 turns the timer off entirely).
+        let ping_due = async {
+            if keep_alive_enabled {
+                Rt::sleep_until(next_ping).await;
+            } else {
+                core::future::pending::<()>().await;
             }
-            _ = ping_timer.tick(), if keep_alive_enabled => {
+        };
+        // 3-arm select as nested select2: inbound ⊕ (ping ⊕ shutdown).
+        match Rt::select2(
+            read_packet(&mut reader, max_packet_size, version),
+            Rt::select2(ping_due, closed),
+        )
+        .await
+        {
+            Either::Left(inbound) => match inbound {
+                Ok(p) => {
+                    if dispatch_client_inbound(
+                        channel.clone(),
+                        p,
+                        &root,
+                        &dispatcher,
+                        config.safety.receive_maximum_inbound(),
+                    )
+                    .await?
+                    {
+                        break; // disconnect
+                    }
+                }
+                Err(MqttError::Io(_)) => break, // wire closed
+                Err(e) => return Err(e),
+            },
+            Either::Right(Either::Left(())) => {
+                next_ping = Rt::instant_plus(Rt::now(), ping_interval);
                 // PINGREQ failure means writer is dead → break (W must-propagate)
                 if channel.send_packet(Packet::Pingreq).is_err() {
                     break;
                 }
             }
-            _ = shutdown.notified() => break,
+            Either::Right(Either::Right(())) => break,
         }
     }
 
@@ -352,16 +408,17 @@ where
 }
 
 /// Returns `Ok(true)` if loop should break (DISCONNECT received).
-async fn dispatch_client_inbound<W, TS>(
-    channel: MqttChannel<W>,
+async fn dispatch_client_inbound<W, TS, Rt>(
+    channel: MqttChannel<W, Rt>,
     packet: Packet,
-    root: &Arc<UrlRoot<MqttContext<TS>, TS>>,
-    dispatcher: &EndpointDispatcher<W, TS>,
+    root: &Arc<UrlRoot<MqttContext<TS, Rt>, TS>>,
+    dispatcher: &EndpointDispatcher<W, TS, Rt>,
     receive_max: usize,
 ) -> Result<bool, MqttError>
 where
     W: ConnStream,
     TS: TransportSpec<Wire = W>,
+    Rt: RuntimeSpec,
 {
     match packet {
         Packet::Publish(publish) => {
@@ -374,36 +431,63 @@ where
             dispatch_incoming(incoming_from_packet(&publish), root, dispatcher);
             Ok(false)
         }
-        Packet::Puback(id) => {
+        Packet::Puback(ack) => {
+            // A failure reason (v5 §3.4.2.1, e.g. 0x87 Not authorized)
+            // still terminates the delivery attempt — same slot/inflight
+            // cleanup as success; the reason is visible on the packet.
+            let id = ack.packet_id;
             fire_ack(&channel, id, AckKind::Puback);
             channel.session().forget_outbound_inflight(id);
             Ok(false)
         }
-        Packet::Pubrec(id) => {
-            // QoS 2 phase 1: send PUBREL, wait for PUBCOMP
+        Packet::Pubrec(ack) => {
+            let id = ack.packet_id;
             fire_ack(&channel, id, AckKind::Pubrec);
-            channel.send_packet(Packet::Pubrel(id))?;
+            if ack.is_success() {
+                // QoS 2 phase 1: send PUBREL, wait for PUBCOMP.
+                channel.send_packet(Packet::Pubrel(AckPacket::success(id)))?;
+            } else {
+                // v5 §4.3.3: a failure PUBREC means the receiver discarded
+                // the message — MUST NOT send PUBREL; drop the inflight
+                // record so the id frees up.
+                channel.session().forget_outbound_inflight(id);
+            }
             Ok(false)
         }
-        Packet::Pubcomp(id) => {
+        Packet::Pubcomp(ack) => {
+            let id = ack.packet_id;
             fire_ack(&channel, id, AckKind::Pubcomp);
             channel.session().forget_outbound_inflight(id);
             Ok(false)
         }
-        Packet::Pubrel(id) => {
-            // Inbound QoS 2: take stored publish and dispatch
-            if let Some(incoming) = channel.session().take_qos2_inbound(id) {
+        Packet::Pubrel(ack) => {
+            let id = ack.packet_id;
+            // Inbound QoS 2: take stored publish and dispatch.
+            let comp = if let Some(incoming) = channel.session().take_qos2_inbound(id) {
                 dispatch_incoming(incoming, root, dispatcher);
-            }
-            channel.send_packet(Packet::Pubcomp(id))?;
+                AckPacket::success(id)
+            } else if channel.protocol_version() == ProtocolVersion::V5 {
+                // v5 §3.6.2.1: no matching QoS-2 stash entry — reply
+                // PUBCOMP 0x92 (Packet Identifier not found).
+                AckPacket {
+                    packet_id: id,
+                    reason_code: 0x92,
+                    properties: Default::default(),
+                }
+            } else {
+                // v3.1.1 has no reason codes; a bare PUBCOMP is the only
+                // spec-shaped reply (pre-phase-2 behavior).
+                AckPacket::success(id)
+            };
+            channel.send_packet(Packet::Pubcomp(comp))?;
             Ok(false)
         }
         Packet::Suback(s) => {
             fire_suback(&channel, s);
             Ok(false)
         }
-        Packet::Unsuback(id) => {
-            fire_unsuback(&channel, id);
+        Packet::Unsuback(u) => {
+            fire_unsuback(&channel, u.packet_id);
             Ok(false)
         }
         Packet::Pingresp => Ok(false),
@@ -416,13 +500,14 @@ where
 /// per-endpoint FIFO queue. Falls back to the default handler if no endpoint
 /// matched. Sync (not async) — submission is non-blocking, chains run on
 /// dispatcher workers.
-fn dispatch_incoming<W, TS>(
+fn dispatch_incoming<W, TS, Rt>(
     incoming: IncomingPublish,
-    root: &UrlRoot<MqttContext<TS>, TS>,
-    dispatcher: &EndpointDispatcher<W, TS>,
+    root: &UrlRoot<MqttContext<TS, Rt>, TS>,
+    dispatcher: &EndpointDispatcher<W, TS, Rt>,
 ) where
     W: ConnStream,
     TS: TransportSpec<Wire = W>,
+    Rt: RuntimeSpec,
 {
     let topic = incoming.topic.clone();
     let segments: Vec<&str> = topic.split('/').collect();
@@ -452,21 +537,23 @@ fn dispatch_incoming<W, TS>(
 /// Key identifying one endpoint by its `Arc<UrlNode>` pointer identity.
 type NodeKey = usize;
 
-fn node_key<TS: TransportSpec>(node: &Arc<UrlNode<MqttContext<TS>, TS>>) -> NodeKey {
+fn node_key<TS: TransportSpec, Rt: RuntimeSpec>(
+    node: &Arc<UrlNode<MqttContext<TS, Rt>, TS>>,
+) -> NodeKey {
     Arc::as_ptr(node) as *const () as usize
 }
 
-type EndpointQueueMap<TS> =
-    DashMap<NodeKey, mpsc::Sender<(IncomingPublish, Arc<UrlNode<MqttContext<TS>, TS>>)>>;
+type EndpointQueueMap<TS, Rt> =
+    PMap<NodeKey, async_channel::Sender<(IncomingPublish, Arc<UrlNode<MqttContext<TS, Rt>, TS>>)>>;
 
-struct EndpointDispatcher<W: ConnStream, TS: TransportSpec<Wire = W>> {
-    channel: MqttChannel<W>,
+struct EndpointDispatcher<W: ConnStream, TS: TransportSpec<Wire = W>, Rt: RuntimeSpec> {
+    channel: MqttChannel<W, Rt>,
     /// Per-endpoint FIFO queues keyed by `node_key`. Lazy-spawned on first
     /// dispatch to that endpoint. Wrapped in `Arc` so each spawned worker
     /// can remove its own entry on idle-timeout exit (P3.E).
-    endpoint_queues: Arc<EndpointQueueMap<TS>>,
+    endpoint_queues: Arc<EndpointQueueMap<TS, Rt>>,
     /// Lazy-spawned single FIFO worker for the default inbound handler.
-    fallback_queue: std::sync::OnceLock<mpsc::Sender<IncomingPublish>>,
+    fallback_queue: OnceBox<async_channel::Sender<IncomingPublish>>,
     default_handler: Option<Arc<dyn DefaultInboundHandler>>,
     /// `MqttSafety.worker_idle_timeout()`. `None` = workers stay alive
     /// until the channel drops them.
@@ -478,17 +565,17 @@ struct EndpointDispatcher<W: ConnStream, TS: TransportSpec<Wire = W>> {
     queue_capacity: usize,
 }
 
-impl<W: ConnStream, TS: TransportSpec<Wire = W>> EndpointDispatcher<W, TS> {
+impl<W: ConnStream, TS: TransportSpec<Wire = W>, Rt: RuntimeSpec> EndpointDispatcher<W, TS, Rt> {
     fn new(
-        channel: MqttChannel<W>,
+        channel: MqttChannel<W, Rt>,
         default_handler: Option<Arc<dyn DefaultInboundHandler>>,
         idle_timeout: Option<Duration>,
         queue_capacity: usize,
     ) -> Self {
         Self {
             channel,
-            endpoint_queues: Arc::new(DashMap::new()),
-            fallback_queue: std::sync::OnceLock::new(),
+            endpoint_queues: Arc::new(PMap::new()),
+            fallback_queue: OnceBox::new(),
             default_handler,
             idle_timeout,
             queue_capacity,
@@ -497,25 +584,21 @@ impl<W: ConnStream, TS: TransportSpec<Wire = W>> EndpointDispatcher<W, TS> {
 
     fn dispatch_endpoint(
         &self,
-        node: Arc<UrlNode<MqttContext<TS>, TS>>,
+        node: Arc<UrlNode<MqttContext<TS, Rt>, TS>>,
         incoming: IncomingPublish,
     ) {
-        let key = node_key::<TS>(&node);
-        let tx = self
-            .endpoint_queues
-            .entry(key)
-            .or_insert_with(|| {
-                let (tx, rx) = mpsc::channel(self.queue_capacity);
-                tokio::spawn(endpoint_worker::<W, TS>(
-                    rx,
-                    self.channel.clone(),
-                    self.endpoint_queues.clone(),
-                    key,
-                    self.idle_timeout,
-                ));
-                tx
-            })
-            .clone();
+        let key = node_key::<TS, Rt>(&node);
+        let tx = self.endpoint_queues.get_or_insert_with(key, || {
+            let (tx, rx) = async_channel::bounded(self.queue_capacity);
+            Rt::spawn_detached(endpoint_worker::<W, TS, Rt>(
+                rx,
+                self.channel.clone(),
+                self.endpoint_queues.clone(),
+                key,
+                self.idle_timeout,
+            ));
+            tx
+        });
         // W §2 covers three drop modes here:
         //   - worker exited (channel closed) → bucket stale, next dispatch
         //     lazy-spawns afresh
@@ -533,16 +616,18 @@ impl<W: ConnStream, TS: TransportSpec<Wire = W>> EndpointDispatcher<W, TS> {
             return;
         };
         let tx = self.fallback_queue.get_or_init(|| {
-            let (tx, rx) = mpsc::channel(self.queue_capacity);
-            tokio::spawn(fallback_worker(rx, handler.clone(), self.idle_timeout));
-            tx
+            let (tx, rx) = async_channel::bounded(self.queue_capacity);
+            Rt::spawn_detached(fallback_worker::<Rt>(rx, handler.clone(), self.idle_timeout));
+            Box::new(tx)
         });
         // Same overflow semantics as `dispatch_endpoint` above.
         let _ = tx.try_send(incoming);
     }
 }
 
-impl<W: ConnStream, TS: TransportSpec<Wire = W>> Drop for EndpointDispatcher<W, TS> {
+impl<W: ConnStream, TS: TransportSpec<Wire = W>, Rt: RuntimeSpec> Drop
+    for EndpointDispatcher<W, TS, Rt>
+{
     // V2 — workers hold `Arc<EndpointQueueMap>` clones (they need it to
     // self-remove from the map on idle-timeout exit). That keeps the map
     // alive after this dispatcher drops, so the per-endpoint `Sender`
@@ -559,20 +644,23 @@ impl<W: ConnStream, TS: TransportSpec<Wire = W>> Drop for EndpointDispatcher<W, 
     }
 }
 
-async fn endpoint_worker<W, TS>(
-    mut rx: mpsc::Receiver<(IncomingPublish, Arc<UrlNode<MqttContext<TS>, TS>>)>,
-    channel: MqttChannel<W>,
-    queues: Arc<EndpointQueueMap<TS>>,
+async fn endpoint_worker<W, TS, Rt>(
+    rx: async_channel::Receiver<(IncomingPublish, Arc<UrlNode<MqttContext<TS, Rt>, TS>>)>,
+    channel: MqttChannel<W, Rt>,
+    queues: Arc<EndpointQueueMap<TS, Rt>>,
     self_key: NodeKey,
     idle_timeout: Option<Duration>,
 ) where
     W: ConnStream,
     TS: TransportSpec<Wire = W>,
+    Rt: RuntimeSpec,
 {
     loop {
+        // async-channel recv() yields Err(RecvError) once every sender is
+        // dropped — same end-of-stream meaning as tokio's `None`.
         let next = match idle_timeout {
-            Some(d) => match tokio::time::timeout(d, rx.recv()).await {
-                Ok(item) => item,
+            Some(d) => match Rt::timeout(d, rx.recv()).await {
+                Ok(item) => item.ok(),
                 Err(_) => {
                     // Idle timeout — release the slot so dispatch_endpoint
                     // lazy-spawns a fresh worker on the next hit. There is
@@ -583,28 +671,29 @@ async fn endpoint_worker<W, TS>(
                     return;
                 }
             },
-            None => rx.recv().await,
+            None => rx.recv().await.ok(),
         };
         let Some((incoming, node)) = next else { return };
-        let ctx = MqttContext::<TS>::for_inbound_dispatch(channel.clone(), incoming, node.clone());
+        let ctx =
+            MqttContext::<TS, Rt>::for_inbound_dispatch(channel.clone(), incoming, node.clone());
         let _ = node.run(ctx).await;
     }
 }
 
-async fn fallback_worker(
-    mut rx: mpsc::Receiver<IncomingPublish>,
+async fn fallback_worker<Rt: RuntimeSpec>(
+    rx: async_channel::Receiver<IncomingPublish>,
     handler: Arc<dyn DefaultInboundHandler>,
     idle_timeout: Option<Duration>,
 ) {
     loop {
         let next = match idle_timeout {
-            Some(d) => match tokio::time::timeout(d, rx.recv()).await {
-                Ok(item) => item,
+            Some(d) => match Rt::timeout(d, rx.recv()).await {
+                Ok(item) => item.ok(),
                 Err(_) => return, // fallback is OnceLock-backed; we can't
                                   // lazy-respawn anyway, so just exit and
                                   // accept future drops silently.
             },
-            None => rx.recv().await,
+            None => rx.recv().await.ok(),
         };
         let Some(incoming) = next else { return };
         handler.handle(incoming).await;
@@ -615,15 +704,16 @@ async fn fallback_worker(
 // Protocol::send — outpoint outbound execution
 // ============================================================================
 
-async fn send_impl<TS>(mut ctx: MqttContext<TS>) -> Result<MqttContext<TS>, MqttError>
+async fn send_impl<TS, Rt>(mut ctx: MqttContext<TS, Rt>) -> Result<MqttContext<TS, Rt>, MqttError>
 where
     TS: TransportSpec,
+    Rt: RuntimeSpec,
 {
     let channel = ctx.channel().cloned().ok_or(MqttError::NotConnected(
         "no channel installed in ctx".into(),
     ))?;
 
-    let request = std::mem::replace(
+    let request = core::mem::replace(
         &mut ctx.request,
         MqttRequest::Publish(PublishRequest::default()),
     );
@@ -638,8 +728,8 @@ where
     Ok(ctx)
 }
 
-async fn send_publish<W: ConnStream>(
-    channel: &MqttChannel<W>,
+async fn send_publish<W: ConnStream, Rt: RuntimeSpec>(
+    channel: &MqttChannel<W, Rt>,
     req: PublishRequest,
 ) -> Result<MqttResponse, MqttError> {
     let packet_id = if req.qos != QoS::AtMostOnce {
@@ -649,6 +739,7 @@ async fn send_publish<W: ConnStream>(
     };
 
     let packet = PublishPacket {
+        properties: Default::default(),
         topic: req.topic,
         payload: req.payload,
         dup: false,
@@ -667,7 +758,7 @@ async fn send_publish<W: ConnStream>(
             let (tx, rx) = oneshot::channel();
             channel.session().install_ack_slot(id, AckSlot::Puback(tx));
             channel.send_publish(packet)?;
-            let acked = timeout(DEFAULT_ACK_TIMEOUT, rx)
+            let acked = Rt::timeout(DEFAULT_ACK_TIMEOUT, rx)
                 .await
                 .map_err(|_| {
                     let _ = channel.session().take_ack_slot(id);
@@ -683,7 +774,7 @@ async fn send_publish<W: ConnStream>(
                 .session()
                 .install_ack_slot(id, AckSlot::Pubrec(rec_tx));
             channel.send_publish(packet)?;
-            timeout(DEFAULT_ACK_TIMEOUT, rec_rx)
+            Rt::timeout(DEFAULT_ACK_TIMEOUT, rec_rx)
                 .await
                 .map_err(|_| {
                     let _ = channel.session().take_ack_slot(id);
@@ -695,7 +786,7 @@ async fn send_publish<W: ConnStream>(
             channel
                 .session()
                 .install_ack_slot(id, AckSlot::Pubcomp(comp_tx));
-            let comp_id = timeout(DEFAULT_ACK_TIMEOUT, comp_rx)
+            let comp_id = Rt::timeout(DEFAULT_ACK_TIMEOUT, comp_rx)
                 .await
                 .map_err(|_| {
                     let _ = channel.session().take_ack_slot(id);
@@ -707,8 +798,8 @@ async fn send_publish<W: ConnStream>(
     }
 }
 
-async fn send_subscribe<W: ConnStream>(
-    channel: &MqttChannel<W>,
+async fn send_subscribe<W: ConnStream, Rt: RuntimeSpec>(
+    channel: &MqttChannel<W, Rt>,
     filters: Vec<TopicFilter>,
 ) -> Result<MqttResponse, MqttError> {
     let packet_id = channel.session().allocate_client_packet_id()?;
@@ -727,7 +818,7 @@ async fn send_subscribe<W: ConnStream>(
         packet_id,
         subscriptions: subs,
     }))?;
-    let codes = timeout(DEFAULT_ACK_TIMEOUT, rx)
+    let codes = Rt::timeout(DEFAULT_ACK_TIMEOUT, rx)
         .await
         .map_err(|_| {
             let _ = channel.session().take_ack_slot(packet_id);
@@ -737,8 +828,8 @@ async fn send_subscribe<W: ConnStream>(
     Ok(MqttResponse::Subscribed(codes))
 }
 
-async fn send_unsubscribe<W: ConnStream>(
-    channel: &MqttChannel<W>,
+async fn send_unsubscribe<W: ConnStream, Rt: RuntimeSpec>(
+    channel: &MqttChannel<W, Rt>,
     topics: Vec<Arc<str>>,
 ) -> Result<MqttResponse, MqttError> {
     let packet_id = channel.session().allocate_client_packet_id()?;
@@ -747,7 +838,7 @@ async fn send_unsubscribe<W: ConnStream>(
         .session()
         .install_ack_slot(packet_id, AckSlot::Unsuback(tx));
     channel.send_packet(Packet::Unsubscribe(UnsubscribePacket { packet_id, topics }))?;
-    timeout(DEFAULT_ACK_TIMEOUT, rx)
+    Rt::timeout(DEFAULT_ACK_TIMEOUT, rx)
         .await
         .map_err(|_| {
             let _ = channel.session().take_ack_slot(packet_id);
@@ -767,7 +858,7 @@ enum AckKind {
     Pubcomp,
 }
 
-fn fire_ack<W: ConnStream>(channel: &MqttChannel<W>, id: u16, kind: AckKind) {
+fn fire_ack<W: ConnStream, Rt: RuntimeSpec>(channel: &MqttChannel<W, Rt>, id: u16, kind: AckKind) {
     if let Some(slot) = channel.session().take_ack_slot(id) {
         match (slot, kind) {
             (AckSlot::Puback(tx), AckKind::Puback) => {
@@ -786,13 +877,13 @@ fn fire_ack<W: ConnStream>(channel: &MqttChannel<W>, id: u16, kind: AckKind) {
     }
 }
 
-fn fire_suback<W: ConnStream>(channel: &MqttChannel<W>, packet: SubackPacket) {
+fn fire_suback<W: ConnStream, Rt: RuntimeSpec>(channel: &MqttChannel<W, Rt>, packet: SubackPacket) {
     if let Some(AckSlot::Suback(tx)) = channel.session().take_ack_slot(packet.packet_id) {
         let _ = tx.send(packet.return_codes);
     }
 }
 
-fn fire_unsuback<W: ConnStream>(channel: &MqttChannel<W>, id: u16) {
+fn fire_unsuback<W: ConnStream, Rt: RuntimeSpec>(channel: &MqttChannel<W, Rt>, id: u16) {
     if let Some(AckSlot::Unsuback(tx)) = channel.session().take_ack_slot(id) {
         let _ = tx.send(());
     }
@@ -804,6 +895,8 @@ fn fire_unsuback<W: ConnStream>(channel: &MqttChannel<W>, id: u16) {
 
 fn build_connect(config: &MqttClientConfig) -> ConnectPacket {
     ConnectPacket {
+        version: config.protocol_version,
+        properties: Default::default(),
         client_id: config.client_id.clone(),
         clean_session: config.clean_session,
         keep_alive: config.keep_alive_secs,
@@ -821,6 +914,7 @@ fn build_connect(config: &MqttClientConfig) -> ConnectPacket {
             payload: w.payload.clone(),
             qos: w.qos,
             retain: w.retain,
+            properties: Default::default(),
         }),
     }
 }

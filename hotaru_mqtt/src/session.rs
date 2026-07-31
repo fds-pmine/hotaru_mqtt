@@ -5,20 +5,23 @@
 //! `clean_session=false` resume will later allow an old session to be
 //! re-bound to a new channel (see `SessionStore`).
 //!
-//! All concurrency primitives are chosen per the "实用无锁" constraint:
-//! `AtomicU16` for the packet-id counter, `OnceLock` for the one-time bind,
-//! `DashMap` for per-packet-id inflight tracking.
+//! All concurrency primitives are chosen per the "pragmatic lock-free" constraint:
+//! `AtomicU16` for the packet-id counter, a set-once cell for the one-time
+//! bind, and a platform-mutexed map (`PMap`) for per-packet-id inflight
+//! tracking — all no_std-capable.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
-use dashmap::DashMap;
 use hotaru_core::connection::ConnStream;
-use tokio::sync::oneshot;
+use futures_channel::oneshot;
+
+use crate::pmap::PMap;
 
 use crate::channel::MqttChannel;
 use crate::error::{MqttError, Violation};
-use crate::packet::{Packet, PublishPacket, incoming_from_packet};
+use crate::packet::{AckPacket, Packet, PublishPacket, incoming_from_packet};
 use crate::request::{IncomingPublish, PacketId, QoS, SubackCode};
 use crate::safety::DEFAULT_MAX_INFLIGHT_MESSAGES;
 
@@ -58,13 +61,13 @@ pub struct MqttSession {
     pub bind: OnceLockBindInfo,
     /// Inbound QoS 2 half-state: keyed by peer-allocated packet-id, holds
     /// the PUBLISH awaiting PUBREL.
-    pub(crate) qos2_recv: DashMap<u16, IncomingPublish>,
+    pub(crate) qos2_recv: PMap<u16, IncomingPublish>,
     /// Outbound inflight: keyed by our allocated packet-id, holds the
     /// pending ack slot. Cleared on `abandon`.
-    pub(crate) pending_acks: DashMap<u16, AckSlot>,
+    pub(crate) pending_acks: PMap<u16, AckSlot>,
     /// Outbound QoS≥1 inflight publishes — held for retransmit and to allow
     /// `clean_session=false` resume. Indexed by our packet-id.
-    pub(crate) outbound_inflight: DashMap<u16, PublishPacket>,
+    pub(crate) outbound_inflight: PMap<u16, PublishPacket>,
     /// Client-side cap on simultaneously-outstanding ack-awaiting outbound
     /// ops (QoS≥1 PUBLISH + SUBSCRIBE + UNSUBSCRIBE). Seeded with the
     /// `MqttSafety` default and overridden by `handle_client` from the
@@ -80,9 +83,9 @@ impl MqttSession {
         Arc::new(Self {
             pkt_counter: AtomicU16::new(0),
             bind: OnceLockBindInfo::new(),
-            qos2_recv: DashMap::new(),
-            pending_acks: DashMap::new(),
-            outbound_inflight: DashMap::new(),
+            qos2_recv: PMap::new(),
+            pending_acks: PMap::new(),
+            outbound_inflight: PMap::new(),
             max_inflight: AtomicUsize::new(DEFAULT_MAX_INFLIGHT_MESSAGES),
         })
     }
@@ -188,10 +191,9 @@ impl MqttSession {
     /// packets have `dup=true` set; caller re-allocates nothing.
     pub fn drain_outbound_for_retransmit(&self) -> Vec<(PacketId, PublishPacket)> {
         self.outbound_inflight
-            .iter()
-            .map(|e| {
-                let id = *e.key();
-                let mut p = e.value().clone();
+            .snapshot()
+            .into_iter()
+            .map(|(id, mut p)| {
                 p.dup = true;
                 (id, p)
             })
@@ -208,12 +210,11 @@ impl MqttSession {
     /// After this returns, `source` is left with empty maps and the new
     /// channel session owns all the resumable state.
     pub fn import_persistent_state(&self, source: &MqttSession) {
-        for entry in source.outbound_inflight.iter() {
-            self.outbound_inflight
-                .insert(*entry.key(), entry.value().clone());
+        for (id, packet) in source.outbound_inflight.snapshot() {
+            self.outbound_inflight.insert(id, packet);
         }
-        for entry in source.qos2_recv.iter() {
-            self.qos2_recv.insert(*entry.key(), entry.value().clone());
+        for (id, incoming) in source.qos2_recv.snapshot() {
+            self.qos2_recv.insert(id, incoming);
         }
         source.outbound_inflight.clear();
         source.qos2_recv.clear();
@@ -231,7 +232,7 @@ impl MqttSession {
 
     /// Remove and return an installed ack slot, if any.
     pub fn take_ack_slot(&self, id: PacketId) -> Option<AckSlot> {
-        self.pending_acks.remove(&id).map(|(_, slot)| slot)
+        self.pending_acks.remove(&id)
     }
 
     // ── qos2_recv ───────────────────────────────────────────────
@@ -243,7 +244,7 @@ impl MqttSession {
 
     /// Take a previously stashed inbound QoS 2 PUBLISH on PUBREL arrival.
     pub fn take_qos2_inbound(&self, id: PacketId) -> Option<IncomingPublish> {
-        self.qos2_recv.remove(&id).map(|(_, v)| v)
+        self.qos2_recv.remove(&id)
     }
 
     // ── outbound_inflight ───────────────────────────────────────
@@ -254,11 +255,10 @@ impl MqttSession {
     }
 
     /// Snapshot the current outbound inflight cardinality (G7 enforcement
-    /// at the broker fanout cap site). DashMap's `len()` is a relaxed
-    /// counter — exact under no concurrent insert/remove on this session,
-    /// approximate otherwise; the comparison against
-    /// `max_inflight_messages` tolerates an off-by-one race because
-    /// `try_allocate_packet_id` is the authoritative gate.
+    /// at the broker fanout cap site). Taken under the map lock — exact at
+    /// the instant of the call, but stale by the time the caller compares
+    /// it against `max_inflight_messages`; the off-by-one race is tolerated
+    /// because `try_allocate_packet_id` is the authoritative gate.
     pub fn outbound_inflight_len(&self) -> usize {
         self.outbound_inflight.len()
     }
@@ -267,7 +267,7 @@ impl MqttSession {
     /// `Puback` slot is also installed, fire its waiter.
     pub fn discharge_outbound_puback(&self, id: PacketId) {
         self.outbound_inflight.remove(&id);
-        if let Some((_, AckSlot::Puback(tx))) = self.pending_acks.remove(&id) {
+        if let Some(AckSlot::Puback(tx)) = self.pending_acks.remove(&id) {
             let _ = tx.send(id); // W §3 silent on receiver gone
         }
     }
@@ -296,8 +296,8 @@ impl MqttSession {
 ///
 /// Lives on the session module so any protocol implementation (client or
 /// downstream server) can reuse it without duplicating QoS bookkeeping.
-pub fn ack_inbound_publish_pre_chain<W: ConnStream>(
-    channel: &MqttChannel<W>,
+pub fn ack_inbound_publish_pre_chain<W: ConnStream, Rt: hotaru_core::app::runtime::RuntimeSpec>(
+    channel: &MqttChannel<W, Rt>,
     publish: &PublishPacket,
     receive_max: usize,
 ) -> Result<(), MqttError> {
@@ -305,7 +305,7 @@ pub fn ack_inbound_publish_pre_chain<W: ConnStream>(
         QoS::AtMostOnce => Ok(()),
         QoS::AtLeastOnce => {
             if let Some(id) = publish.packet_id {
-                channel.send_packet(Packet::Puback(id))?;
+                channel.send_packet(Packet::Puback(AckPacket::success(id)))?;
             }
             Ok(())
         }
@@ -319,7 +319,7 @@ pub fn ack_inbound_publish_pre_chain<W: ConnStream>(
                     return Err(Violation::ReceiveMaximumExceeded { limit: receive_max }.into());
                 }
                 session.stash_qos2_inbound(id, incoming_from_packet(publish));
-                channel.send_packet(Packet::Pubrec(id))?;
+                channel.send_packet(Packet::Pubrec(AckPacket::success(id)))?;
             }
             Ok(())
         }
@@ -327,23 +327,25 @@ pub fn ack_inbound_publish_pre_chain<W: ConnStream>(
 }
 
 // ----------------------------------------------------------------------------
-// OnceLockBindInfo — small wrapper over `std::sync::OnceLock<BindInfo>` so we
-// can implement helpers without naming the path everywhere.
+// OnceLockBindInfo — small wrapper over a set-once cell so we can implement
+// helpers without naming the path everywhere. Backed by
+// `once_cell::race::OnceBox` (lock-free, no_std) instead of
+// `std::sync::OnceLock`; same set-once / read-many semantics.
 // ----------------------------------------------------------------------------
 
 pub struct OnceLockBindInfo {
-    inner: std::sync::OnceLock<BindInfo>,
+    inner: once_cell::race::OnceBox<BindInfo>,
 }
 
 impl OnceLockBindInfo {
     pub fn new() -> Self {
         Self {
-            inner: std::sync::OnceLock::new(),
+            inner: once_cell::race::OnceBox::new(),
         }
     }
 
     pub fn set(&self, info: BindInfo) -> Result<(), BindInfo> {
-        self.inner.set(info)
+        self.inner.set(alloc::boxed::Box::new(info)).map_err(|b| *b)
     }
 
     pub fn get(&self) -> Option<&BindInfo> {

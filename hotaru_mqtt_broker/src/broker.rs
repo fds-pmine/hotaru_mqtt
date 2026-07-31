@@ -8,13 +8,15 @@
 //! filters). The `walk_cursor` optimization is deferred to Stage A P3 perf
 //! tuning.
 
-use std::net::SocketAddr;
+use core::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use hotaru_core::app::runtime::RuntimeSpec;
 use hotaru_core::connection::ConnStream;
+use hotaru_rt_tokio::TokioRuntime;
 
 use hotaru_core::protocol::Channel as _;
 use hotaru_mqtt::MqttSafety;
@@ -55,8 +57,8 @@ pub struct ShutdownReport {
     pub timed_out: bool,
 }
 
-pub struct SubscriberEntry<W: ConnStream> {
-    pub channel: MqttChannel<W>,
+pub struct SubscriberEntry<W: ConnStream, Rt: RuntimeSpec = TokioRuntime> {
+    pub channel: MqttChannel<W, Rt>,
     pub filters: DashMap<Arc<str>, QoS>,
     pub will: Option<WillMessage>,
     pub clean_session: bool,
@@ -231,14 +233,14 @@ pub struct RetainedMessage {
 // Broker
 // ----------------------------------------------------------------------------
 
-pub struct Broker<W: ConnStream> {
-    inner: Arc<BrokerInner<W>>,
+pub struct Broker<W: ConnStream, Rt: RuntimeSpec = TokioRuntime> {
+    inner: Arc<BrokerInner<W, Rt>>,
 }
 
-struct BrokerInner<W: ConnStream> {
+struct BrokerInner<W: ConnStream, Rt: RuntimeSpec> {
     /// Keyed by `(tenant, client_id)` so cross-tenant collisions cannot
     /// silently evict (audit F5).
-    sessions: DashMap<SessionKey, SubscriberEntry<W>>,
+    sessions: DashMap<SessionKey, SubscriberEntry<W, Rt>>,
     subscriptions: SubscriptionTree,
     authenticator: Arc<dyn Authenticator>,
     acl_checker: Arc<dyn AclChecker>,
@@ -266,7 +268,7 @@ struct BrokerInner<W: ConnStream> {
     next_connection_id: AtomicU64,
 }
 
-impl<W: ConnStream> Clone for Broker<W> {
+impl<W: ConnStream, Rt: RuntimeSpec> Clone for Broker<W, Rt> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -274,13 +276,13 @@ impl<W: ConnStream> Clone for Broker<W> {
     }
 }
 
-impl<W: ConnStream> Default for Broker<W> {
+impl<W: ConnStream, Rt: RuntimeSpec> Default for Broker<W, Rt> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<W: ConnStream> Broker<W> {
+impl<W: ConnStream, Rt: RuntimeSpec> Broker<W, Rt> {
     /// Construct a broker that is **secure by default** (attack-surface
     /// finding AS2). The default authenticator is [`DenyAllAuthenticator`],
     /// so a broker that is bound to the network without an explicit
@@ -452,10 +454,18 @@ impl<W: ConnStream> Broker<W> {
         for entry in self.inner.sessions.iter() {
             entry.value().channel.close();
         }
+        // Scheduling stays runtime-agnostic: the drain deadline lives in
+        // Rt::timeout, not in an Instant comparison (RuntimeSpec's Instant
+        // is opaque). The std clock below is observation only — it feeds
+        // the ShutdownReport.elapsed diagnostic, never a scheduling
+        // decision, and the broker is a std-only component anyway.
         let start = std::time::Instant::now();
-        while self.inner.active_connections.load(Ordering::Acquire) > 0 && start.elapsed() < grace {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        let _ = Rt::timeout(grace, async {
+            while self.inner.active_connections.load(Ordering::Acquire) > 0 {
+                Rt::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await;
         let remaining = self.inner.active_connections.load(Ordering::Acquire);
         ShutdownReport {
             initial,
@@ -541,7 +551,7 @@ impl<W: ConnStream> Broker<W> {
         tenant: Option<TenantId>,
         client_id: Arc<str>,
         username: Option<Arc<str>>,
-        channel: MqttChannel<W>,
+        channel: MqttChannel<W, Rt>,
         will: Option<WillMessage>,
         clean_session: bool,
     ) -> (bool, u64) {
@@ -674,7 +684,7 @@ impl<W: ConnStream> Broker<W> {
     async fn cleanup_session_state(
         &self,
         client_id: &Arc<str>,
-        entry: SubscriberEntry<W>,
+        entry: SubscriberEntry<W, Rt>,
         graceful: bool,
     ) {
         let session_tenant = entry.tenant.clone();
@@ -743,6 +753,7 @@ impl<W: ConnStream> Broker<W> {
 
         if !graceful && let Some(will) = entry.will {
             let will_packet = PublishPacket {
+                properties: Default::default(),
                 topic: will.topic,
                 payload: will.payload,
                 dup: false,
@@ -771,7 +782,7 @@ impl<W: ConnStream> Broker<W> {
     /// Silent on writer-actor backpressure (W §1) — the client will see
     /// the publish via the broker's normal retransmit path on the next
     /// reconnect if this delivery falls on the floor.
-    pub fn retransmit_inflight(&self, channel: &MqttChannel<W>) {
+    pub fn retransmit_inflight(&self, channel: &MqttChannel<W, Rt>) {
         for (_id, publish) in channel.session().drain_outbound_for_retransmit() {
             // W §1 — backpressure on the writer actor's bounded cmd_tx is
             // silently absorbed; the broker still holds outbound_inflight
@@ -914,6 +925,7 @@ impl<W: ConnStream> Broker<W> {
                             session.stash_outbound_inflight(
                                 id,
                                 PublishPacket {
+                                    properties: Default::default(),
                                     topic: r.topic.clone(),
                                     payload: r.payload.clone(),
                                     dup: false,
@@ -936,6 +948,10 @@ impl<W: ConnStream> Broker<W> {
                     None
                 };
                 let replay = PublishPacket {
+                    // Deferred: RetainedStore entries don't carry v5
+                    // properties yet, so retained replays deliver without
+                    // them (tracked in the v5 PR notes).
+                    properties: Default::default(),
                     topic: r.topic,
                     payload: r.payload,
                     dup: false,
@@ -1174,6 +1190,9 @@ impl<W: ConnStream> Broker<W> {
             };
 
             let adjusted = PublishPacket {
+                // v5 §3.3.2.3: Response Topic / Correlation Data / Content
+                // Type / User Properties are forwarded unaltered.
+                properties: packet.properties.clone(),
                 topic: packet.topic.clone(),
                 payload: packet.payload.clone(),
                 dup: false,
@@ -1278,6 +1297,7 @@ impl<W: ConnStream> Broker<W> {
                         session.stash_outbound_inflight(
                             id,
                             PublishPacket {
+                                properties: Default::default(),
                                 topic: topic.clone(),
                                 payload: payload.clone(),
                                 dup: false,
@@ -1301,6 +1321,7 @@ impl<W: ConnStream> Broker<W> {
                 None
             };
             let p = PublishPacket {
+                properties: Default::default(),
                 topic: topic.clone(),
                 payload: payload.clone(),
                 dup: false,

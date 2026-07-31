@@ -4,8 +4,9 @@
 //! before `Client::build()`. `handle_client` reads it from runtime statics on
 //! startup to construct the CONNECT packet and initial SUBSCRIBE.
 
-use std::sync::Arc;
-use std::time::Duration;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::time::Duration;
 
 use bytes::Bytes;
 
@@ -16,6 +17,9 @@ use crate::safety::MqttSafety;
 /// All settings required to bring up an MQTT client session.
 pub struct MqttClientConfig {
     pub client_id: Arc<str>,
+    /// Wire protocol version for this session. Defaults to MQTT 3.1.1;
+    /// opt into 5.0 with [`MqttClientConfig::protocol_version`].
+    pub protocol_version: crate::packet::ProtocolVersion,
     pub clean_session: bool,
     pub keep_alive_secs: u16,
     pub connect_timeout: Duration,
@@ -32,6 +36,7 @@ impl MqttClientConfig {
     pub fn new(client_id: impl Into<Arc<str>>) -> Self {
         Self {
             client_id: client_id.into(),
+            protocol_version: crate::packet::ProtocolVersion::default(),
             clean_session: true,
             keep_alive_secs: 60,
             connect_timeout: Duration::from_secs(30),

@@ -9,7 +9,8 @@
 //! MQTT-level error recovery means "reconnect", which is a user-level
 //! concern, not a framework retry.
 
-use std::fmt;
+use alloc::{boxed::Box, string::String};
+use core::fmt;
 
 use hotaru_core::protocol::DefaultProtocolError;
 
@@ -17,7 +18,13 @@ use crate::packet::ConnackReturnCode;
 
 #[derive(Debug)]
 pub enum MqttError {
-    Io(std::io::Error),
+    /// A wire error from the underlying transport, kept abstract so the codec
+    /// is not pinned to one backend: it holds tokio's `std::io::Error`,
+    /// embassy's `EmbeddedIoError`, or any other `HotaruRead`/`HotaruWrite`
+    /// error (the framework bounds that associated type to
+    /// `core::error::Error + Send + Sync + 'static`). Boxed via `alloc`, so it
+    /// stays available under `no_std`.
+    Io(Box<dyn core::error::Error + Send + Sync>),
     ChannelClosed,
     AckTimeout,
     Timeout(TimeoutKind),
@@ -113,6 +120,21 @@ pub enum Violation {
         count: usize,
         max: usize,
     },
+    // ── MQTT 5.0 (v5 spec §2.2.2 / §3.3.2.3.4 / §3.15) ───────────────────
+    /// A non-repeatable v5 property appeared more than once in one block —
+    /// v5 spec: "It is a Protocol Error to include [it] more than once."
+    DuplicateProperty(u8),
+    /// v5 property value is structurally invalid (e.g. Subscription
+    /// Identifier of 0, which the spec forbids).
+    MalformedProperty(u8),
+    /// v5 property identifier not defined by the spec (§2.2.2.2 table).
+    UnknownProperty(u8),
+    /// Peer sent a Topic Alias but we never advertise a non-zero Topic
+    /// Alias Maximum, so the effective maximum is 0 — v5 §3.3.2.3.4.
+    TopicAliasNotAccepted,
+    /// AUTH packet received, but no Authentication Method was negotiated
+    /// on CONNECT — v5 §4.12: enhanced auth must be agreed first.
+    UnexpectedAuthPacket,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,18 +185,32 @@ impl fmt::Display for MqttError {
     }
 }
 
-impl std::error::Error for MqttError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl MqttError {
+    /// Wrap any backend wire error (tokio `std::io::Error`, embassy
+    /// `EmbeddedIoError`, …) into the abstract `Io` variant. Codec/channel
+    /// call sites use `.map_err(MqttError::io)?` instead of a concrete
+    /// `From<std::io::Error>`, which is what lets one MQTT crate serve every
+    /// `HotaruRead`/`HotaruWrite` backend.
+    pub fn io<E: core::error::Error + Send + Sync + 'static>(e: E) -> Self {
+        Self::Io(Box::new(e))
+    }
+}
+
+impl core::error::Error for MqttError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
-            Self::Io(e) => Some(e),
+            Self::Io(e) => Some(e.as_ref()),
             _ => None,
         }
     }
 }
 
+/// std-only convenience: lets tokio-backend call sites keep using `?` on
+/// `std::io::Error`. no_std backends go through [`MqttError::io`] instead.
+#[cfg(feature = "std")]
 impl From<std::io::Error> for MqttError {
     fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
+        Self::io(e)
     }
 }
 
