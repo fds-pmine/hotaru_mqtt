@@ -34,7 +34,9 @@ hotaru_tls = { workspace = true, optional = true }
 default = ["std", "spawn_send"]
 std = [
     "hotaru_core/std",
-    "hotaru_core/full",
+    # Renamed upstream in hotaru da81186 ("CI tests"): the old `full`
+    # (= regex/unicode) became `full_regex` (= dep:regex + regex/unicode).
+    "hotaru_core/full_regex",
     "dep:hotaru_io_tokio",
     "dep:hotaru_rt_tokio",
     "async-channel/std",

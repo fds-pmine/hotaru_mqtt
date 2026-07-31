@@ -14,7 +14,7 @@ categories = ["network-programming"]
 # never on the embedded robot), so it re-enables the std features that the
 # workspace declarations leave off for hotaru_mqtt's no_std build.
 hotaru_mqtt = { path = "../hotaru_mqtt", version = "0.8.3-rc1", features = ["std", "spawn_send"] }
-hotaru_core = { workspace = true, features = ["std", "spawn_send", "full"] }
+hotaru_core = { workspace = true, features = ["std", "spawn_send", "full_regex"] }
 hotaru_io_tokio = { workspace = true }
 hotaru_rt_tokio = { workspace = true }
 async-channel = { workspace = true, features = ["std"] }
