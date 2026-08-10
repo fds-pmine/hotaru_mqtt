@@ -19,17 +19,6 @@ pub mod session;
 pub mod topic;
 pub mod transport;
 
-// ─── Re-export external dependency types used in public API ─────────────────────────────
-
-pub use async_trait::async_trait;
-pub use bytes::{Bytes, BytesMut};
-pub use dashmap::DashMap;
-pub use bitflags::bitflags;
-pub use hotaru_core::connection::{Connection, Transport, TransportSpec};
-pub use hotaru_core::protocol::{Channel, Protocol};
-pub use hotaru_core::extensions::Locator;
-pub use hotaru_core::url::UrlNode;
-
 // ─── Re-exports for user-facing API ───────────────────────────────
 
 pub use broker::{
