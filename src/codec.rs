@@ -13,6 +13,8 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use hotaru_core::protocol::Message;
+
 use crate::error::{CodecError, MqttError, Violation};
 use crate::packet::{
     ConnackPacket, ConnackReturnCode, ConnectFlags, ConnectPacket, FixedHeaderFlags, Packet,
@@ -773,5 +775,25 @@ mod tests {
         let mut buf = BytesMut::from(&[0x10u8][..]);
         assert!(decode_packet_from_bytes(&mut buf).unwrap().is_none());
         assert_eq!(buf.len(), 1, "buffer must not be consumed on partial");
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Message impl — connects Packet to hotaru_core's protocol Message trait
+//
+// Lives here rather than in `packet` so the data definitions stay free of any
+// dependency on the codec: `codec -> packet` is the intended direction.
+// ----------------------------------------------------------------------------
+
+impl Message for Packet {
+    type BytesMut = BytesMut;
+
+    fn encode(&self, buf: &mut Self::BytesMut) -> Result<(), Box<dyn Error + Send + Sync>> {
+        buf.extend_from_slice(&encode_packet(self));
+        Ok(())
+    }
+
+    fn decode(buf: &mut Self::BytesMut) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
+        decode_packet_from_bytes(buf)
     }
 }

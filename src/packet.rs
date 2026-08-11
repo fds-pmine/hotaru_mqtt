@@ -6,15 +6,12 @@
 //! `Packet` is the framework's `Message` type for `MqttProtocol`. Encoding
 //! and decoding live in `codec.rs`; this module is plain data definitions.
 
-use std::error::Error;
 use std::sync::Arc;
 
 use bitflags::bitflags;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 
-use hotaru_core::protocol::Message;
 
-use crate::codec::{decode_packet_from_bytes, encode_packet};
 use crate::request::{PacketId, QoS, SubackCode};
 
 #[derive(Debug, Clone)]
@@ -237,19 +234,3 @@ impl std::fmt::Display for ConnackReturnCode {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Message impl — connects Packet to hotaru_core's protocol Message trait
-// ----------------------------------------------------------------------------
-
-impl Message for Packet {
-    type BytesMut = BytesMut;
-
-    fn encode(&self, buf: &mut Self::BytesMut) -> Result<(), Box<dyn Error + Send + Sync>> {
-        buf.extend_from_slice(&encode_packet(self));
-        Ok(())
-    }
-
-    fn decode(buf: &mut Self::BytesMut) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
-        decode_packet_from_bytes(buf)
-    }
-}
