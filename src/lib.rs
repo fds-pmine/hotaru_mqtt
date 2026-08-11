@@ -17,7 +17,6 @@ pub mod protocol;
 pub mod request;
 pub mod session;
 pub mod topic;
-pub mod transport;
 
 // ─── Re-export external dependency types used in public API ──────
 
