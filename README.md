@@ -115,7 +115,9 @@ cargo test
 | `session`   | `MqttSession`, packet-id tracking, `AckSlot`.                    |
 | `topic`     | Topic / filter parsing and validation.                           |
 | `error`     | `MqttError`, `CodecError`, `Violation`, `TimeoutKind`.           |
-| `transport` | Transport trait glue for `hotaru_core::connection`.              |
+
+Custom transports are supplied through the protocol's type parameters,
+`MqttProtocol<W, TS>`, rather than through a dedicated module.
 
 ## License
 
