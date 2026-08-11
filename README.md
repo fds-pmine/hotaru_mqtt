@@ -100,7 +100,11 @@ End-to-end examples live in [`tests/integration.rs`](tests/integration.rs), whic
 cargo test
 ```
 
-## Module layout
+## Internal layout
+
+These are internal modules, not addressable paths. Everything supported is
+re-exported at the crate root; `codec` is the one module you can name, for
+low-level wire encode/decode.
 
 | Module      | Responsibility                                                   |
 | ----------- | ---------------------------------------------------------------- |

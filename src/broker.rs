@@ -12,7 +12,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use dashmap::DashMap;
 use hotaru_core::connection::ConnStream;
 
@@ -165,16 +164,6 @@ fn filter_matches(filter: &str, topic_segs: &[&str]) -> bool {
 }
 
 // ----------------------------------------------------------------------------
-// RetainedMessage placeholder (Phase 4 feature)
-// ----------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub struct RetainedMessage {
-    pub payload: Bytes,
-    pub qos: QoS,
-}
-
-// ----------------------------------------------------------------------------
 // Broker
 // ----------------------------------------------------------------------------
 
@@ -186,9 +175,6 @@ struct BrokerInner<W: ConnStream> {
     sessions: DashMap<Arc<str>, SubscriberEntry<W>>,
     subscriptions: SubscriptionTree,
     authenticator: Arc<dyn Authenticator>,
-    /// Phase 4: retained message store. MVP: present but unused.
-    #[allow(dead_code)]
-    retained: DashMap<Arc<str>, RetainedMessage>,
 }
 
 impl<W: ConnStream> Clone for Broker<W> {
@@ -220,7 +206,6 @@ impl<W: ConnStream> Broker<W> {
                 sessions: DashMap::new(),
                 subscriptions: SubscriptionTree::new(),
                 authenticator: auth,
-                retained: DashMap::new(),
             }),
         }
     }
@@ -416,7 +401,7 @@ impl<W: ConnStream> Broker<W> {
 
 /// Convert wire `PublishPacket` into a user-facing `IncomingPublish`.
 /// Topic/payload are Arc/Bytes clones (O(1)).
-pub fn incoming_from_packet(p: &PublishPacket) -> IncomingPublish {
+pub(crate) fn incoming_from_packet(p: &PublishPacket) -> IncomingPublish {
     IncomingPublish {
         topic: p.topic.clone(),
         payload: p.payload.clone(),

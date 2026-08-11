@@ -237,7 +237,7 @@ where
     }
 
     // Bind session.
-    let _ = channel.session().bind.set(BindInfo {
+    let _ = channel.session().bind().set(BindInfo {
         client_id: config.client_id.clone(),
         keep_alive: config.keep_alive_secs,
     });
@@ -429,7 +429,7 @@ where
         .register_session(client_id.clone(), channel.clone(), will, clean_session)
         .await;
 
-    let _ = channel.session().bind.set(BindInfo {
+    let _ = channel.session().bind().set(BindInfo {
         client_id: client_id.clone(),
         keep_alive,
     });

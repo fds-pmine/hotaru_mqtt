@@ -125,7 +125,7 @@ pub struct UnsubscribePacket {
 // ----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PacketType {
+pub(crate) enum PacketType {
     Connect = 1,
     Connack = 2,
     Publish = 3,
@@ -168,7 +168,7 @@ impl TryFrom<u8> for PacketType {
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct FixedHeaderFlags: u8 {
+    pub(crate) struct FixedHeaderFlags: u8 {
         const Bypass = 0b0000_0000;
         const Retain = 0b0000_0001;
         const QoS = 0b0000_0110;
@@ -178,7 +178,7 @@ bitflags! {
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct ConnectFlags: u8 {
+    pub(crate) struct ConnectFlags: u8 {
         const Username = 0b1000_0000;
         const Password = 0b0100_0000;
         const WillRetain = 0b0010_0000;
