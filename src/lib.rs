@@ -25,9 +25,8 @@ pub use async_trait::async_trait;
 pub use bytes::{Bytes, BytesMut};
 pub use dashmap::DashMap;
 pub use bitflags::bitflags;
-pub use hotaru_core::connection::{Connection, Transport, TransportSpec};
+pub use hotaru_core::connection::TransportSpec;
 pub use hotaru_core::protocol::{Channel, Protocol};
-pub use hotaru_core::extensions::Locator;
 pub use hotaru_core::url::UrlNode;
 
 // ─── Re-exports for user-facing API ───────────────────────────────
