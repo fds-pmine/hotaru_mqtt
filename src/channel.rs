@@ -29,7 +29,7 @@ use crate::session::MqttSession;
 
 static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-pub fn next_connection_id() -> u64 {
+pub(crate) fn next_connection_id() -> u64 {
     CONNECTION_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -170,11 +170,11 @@ impl<W: ConnStream> MqttChannel<W> {
     }
 
     pub fn client_id(&self) -> Option<Arc<str>> {
-        self.session.bind.client_id()
+        self.session.bind().client_id()
     }
 
     pub fn keep_alive(&self) -> Option<u16> {
-        self.session.bind.keep_alive()
+        self.session.bind().keep_alive()
     }
 
     /// Send a control packet through the writer actor. Returns
