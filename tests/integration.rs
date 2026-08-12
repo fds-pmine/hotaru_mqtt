@@ -937,3 +937,198 @@ async fn malformed_packet_after_connect_publishes_the_will() {
         other => panic!("expected the will publish, got {other:?}"),
     }
 }
+
+// ----------------------------------------------------------------------------
+// Connection identity under takeover
+// ----------------------------------------------------------------------------
+
+/// MQTT-3.1.4-2: a second CONNECT carrying a client_id that is already
+/// connected must close the earlier connection.
+///
+/// Dropping the map entry does not do that — the earlier `handle_server` holds
+/// its own channel clone and reader, and would sit there until keep-alive
+/// elapsed, which the client picks and may set to 65535 seconds.
+#[tokio::test]
+async fn takeover_closes_the_earlier_connection() {
+    let (port, broker) = start_broker().await;
+
+    let (mut first_reader, mut first_writer) = connect_raw(port).await;
+    send_packet(&mut first_writer, &connect_packet("twins")).await;
+    let _ = read_packet(&mut first_reader).await;
+    assert_eq!(1, broker.session_count());
+
+    let (mut second_reader, mut second_writer) = connect_raw(port).await;
+    send_packet(&mut second_writer, &connect_packet("twins")).await;
+    let _ = read_packet(&mut second_reader).await;
+
+    let mut sink = Vec::new();
+    let closed = timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_to_end(&mut first_reader, &mut sink),
+    )
+    .await;
+    assert!(
+        closed.is_ok(),
+        "earlier connection still open 2s after being taken over"
+    );
+}
+
+/// The earlier connection runs its own teardown after being closed. Removal is
+/// keyed on client_id, which by then names the *newer* session, so an
+/// unconditional remove deletes the live session and takes its subscriptions
+/// with it. The generation guard is what stops that.
+#[tokio::test]
+async fn earlier_teardown_does_not_evict_the_live_session() {
+    let (port, broker) = start_broker().await;
+
+    let (mut first_reader, mut first_writer) = connect_raw(port).await;
+    send_packet(&mut first_writer, &connect_packet("twins")).await;
+    let _ = read_packet(&mut first_reader).await;
+
+    let (mut second_reader, mut second_writer) = connect_raw(port).await;
+    send_packet(&mut second_writer, &connect_packet("twins")).await;
+    let _ = read_packet(&mut second_reader).await;
+
+    // Let the earlier connection notice it was closed and finish tearing down.
+    let mut sink = Vec::new();
+    let _ = timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_to_end(&mut first_reader, &mut sink),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert_eq!(
+        1,
+        broker.session_count(),
+        "the earlier connection's teardown deleted the session that replaced it"
+    );
+
+    // And the survivor is still functional, not just present in the table.
+    send_packet(
+        &mut second_writer,
+        &Packet::Subscribe(SubscribePacket {
+            packet_id: 7,
+            subscriptions: vec![TopicSubscription {
+                topic: Arc::from("after/takeover"),
+                qos: QoS::AtMostOnce,
+            }],
+        }),
+    )
+    .await;
+    match read_packet(&mut second_reader).await {
+        Packet::Suback(ack) => assert_eq!(7, ack.packet_id),
+        other => panic!("expected SUBACK on the surviving session, got {other:?}"),
+    }
+}
+
+/// A takeover ends the earlier connection non-gracefully by construction, so
+/// MQTT-3.1.2-5 requires its Will.
+///
+/// This is the half that the generation guard silently breaks: once the earlier
+/// connection's `unregister_session` no-ops, the Will publishing that lived
+/// inside it stops happening, and nothing fails loudly — the connection closes
+/// either way and no existing test goes red.
+#[tokio::test]
+async fn takeover_publishes_the_earlier_connection_will() {
+    let (port, _broker) = start_broker().await;
+
+    let (mut watcher_reader, mut watcher_writer) = connect_raw(port).await;
+    send_packet(&mut watcher_writer, &connect_packet("will-watcher")).await;
+    let _ = read_packet(&mut watcher_reader).await;
+    send_packet(
+        &mut watcher_writer,
+        &Packet::Subscribe(SubscribePacket {
+            packet_id: 1,
+            subscriptions: vec![TopicSubscription {
+                topic: Arc::from("gone/#"),
+                qos: QoS::AtMostOnce,
+            }],
+        }),
+    )
+    .await;
+    let _ = read_packet(&mut watcher_reader).await;
+
+    let (mut first_reader, mut first_writer) = connect_raw(port).await;
+    let mut connect = match connect_packet("twins") {
+        Packet::Connect(c) => c,
+        _ => unreachable!(),
+    };
+    connect.will = Some(hotaru_mqtt::WillPacket {
+        topic: Arc::from("gone/twins"),
+        payload: bytes::Bytes::from_static(b"taken over"),
+        qos: QoS::AtMostOnce,
+        retain: false,
+    });
+    send_packet(&mut first_writer, &Packet::Connect(connect)).await;
+    let _ = read_packet(&mut first_reader).await;
+
+    let (mut second_reader, mut second_writer) = connect_raw(port).await;
+    send_packet(&mut second_writer, &connect_packet("twins")).await;
+    let _ = read_packet(&mut second_reader).await;
+
+    match read_packet(&mut watcher_reader).await {
+        Packet::Publish(p) => {
+            assert_eq!("gone/twins", &*p.topic);
+            assert_eq!(&b"taken over"[..], &p.payload[..]);
+        }
+        other => panic!("expected the earlier connection's will, got {other:?}"),
+    }
+}
+
+/// `subscribe` and `unsubscribe` resolve a session the same by-name way the
+/// ack path did, and both are public API. A caller holding a connection_id
+/// that has been superseded must not be able to mutate the live session's
+/// subscription set — the newer client never asked for that filter and would
+/// then receive traffic it did not subscribe to.
+///
+/// Driven through the broker API rather than over the wire: `close()` on the
+/// takeover path makes the earlier read loop exit promptly, so a stale
+/// SUBSCRIBE rarely gets dispatched at all. That narrows the window; it does
+/// not make the guard unnecessary, and it would make a wire-level test pass
+/// for the wrong reason.
+#[tokio::test]
+async fn a_superseded_connection_id_cannot_touch_the_live_session() {
+    let (port, broker) = start_broker().await;
+
+    let (mut reader, mut writer) = connect_raw(port).await;
+    send_packet(&mut writer, &connect_packet("twins")).await;
+    let _ = read_packet(&mut reader).await;
+
+    let client_id: Arc<str> = Arc::from("twins");
+    let filters = vec![hotaru_mqtt::TopicFilter::new("stale/topic", QoS::AtMostOnce)];
+
+    // u64::MAX can never have been issued: ids come from a counter starting at 0.
+    let codes = broker.subscribe(&client_id, u64::MAX, &filters).await;
+    assert!(
+        codes.iter().all(|c| matches!(c, hotaru_mqtt::SubackCode::Failure)),
+        "a superseded connection_id was allowed to subscribe: {codes:?}"
+    );
+
+    // And nothing was registered: a publish to that filter must not be routed.
+    let (mut pub_reader, mut pub_writer) = connect_raw(port).await;
+    send_packet(&mut pub_writer, &connect_packet("publisher")).await;
+    let _ = read_packet(&mut pub_reader).await;
+    send_packet(
+        &mut pub_writer,
+        &Packet::Publish(PublishPacket {
+            topic: Arc::from("stale/topic"),
+            payload: bytes::Bytes::from_static(b"should not arrive"),
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            packet_id: None,
+        }),
+    )
+    .await;
+
+    let waited = timeout(
+        Duration::from_millis(400),
+        codec::read_packet(&mut reader, ANY_SIZE),
+    )
+    .await;
+    assert!(
+        waited.is_err(),
+        "the live session received traffic for a filter it never asked for; got {waited:?}"
+    );
+}

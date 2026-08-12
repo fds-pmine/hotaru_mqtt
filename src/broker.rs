@@ -14,11 +14,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use hotaru_core::connection::ConnStream;
+use hotaru_core::protocol::Channel; // `close()` on the takeover path
 
 use crate::channel::MqttChannel;
 use crate::packet::{ConnackReturnCode, ConnectPacket, PublishPacket};
 use crate::request::{
-    IncomingPublish, PacketId, QoS, SubackCode, TopicFilter, WillMessage,
+    IncomingPublish, QoS, SubackCode, TopicFilter, WillMessage,
 };
 use crate::safety::MqttSafety;
 
@@ -255,7 +256,14 @@ impl<W: ConnStream> Broker<W> {
 
     /// Register a new session. Returns `session_present` — true when
     /// `clean_session=false` and the broker found prior state for this
-    /// client_id. (MVP: in-memory only; persistence is M phase.)
+    /// client_id.
+    ///
+    /// A second CONNECT carrying a client_id that is already connected is a
+    /// takeover: MQTT-3.1.4-2 requires the earlier connection to be closed.
+    /// Dropping the map entry does not do that — the earlier `handle_server`
+    /// holds its own channel clone and its own reader, and would sit there
+    /// until keep-alive elapsed, which the client chooses and may set to
+    /// 65535 seconds.
     pub async fn register_session(
         &self,
         client_id: Arc<str>,
@@ -267,6 +275,19 @@ impl<W: ConnStream> Broker<W> {
         // false and one exists, that's "session present".
         let existing = self.inner.sessions.remove(&client_id);
         let session_present = !clean_session && existing.is_some();
+
+        if let Some((_, prev)) = existing {
+            // Close is idempotent: it flips the channel's open flag and fires
+            // the shutdown notify, both of which the earlier read loop is
+            // selecting on, so that loop wakes and leaves through its own
+            // teardown rather than being abandoned.
+            prev.channel.close();
+            // The earlier connection's teardown will find a newer
+            // connection_id and no-op, so its Will has to be published here.
+            // A takeover ends the earlier connection non-gracefully by
+            // construction, which is exactly when MQTT-3.1.2-5 requires it.
+            self.publish_will(prev.will).await;
+        }
 
         // If clean_session=true, also wipe old subscriptions.
         if clean_session {
@@ -286,10 +307,48 @@ impl<W: ConnStream> Broker<W> {
         session_present
     }
 
+    /// Publish a session's Will, if it has one. Split out of
+    /// `unregister_session` because the takeover path in `register_session`
+    /// has to discharge the same obligation for a session whose own teardown
+    /// is about to become a no-op.
+    async fn publish_will(&self, will: Option<WillMessage>) {
+        let Some(will) = will else { return };
+        let will_packet = PublishPacket {
+            topic: will.topic,
+            payload: will.payload,
+            dup: false,
+            qos: will.qos,
+            retain: will.retain,
+            packet_id: None,
+        };
+        // No source_client_id — pass empty sentinel; self-fanout
+        // suppression won't match any real subscriber.
+        self.publish(&Arc::from(""), will_packet).await;
+    }
+
     /// Tear down a session. If `graceful=false` and the session has a Will,
     /// publish it.
-    pub async fn unregister_session(&self, client_id: &Arc<str>, graceful: bool) {
-        let Some((_, entry)) = self.inner.sessions.remove(client_id) else {
+    ///
+    /// `connection_id` is the caller's own `MqttChannel::connection_id`, which
+    /// is assigned per channel and copied verbatim by `Clone`, so every clone of
+    /// one connection reports the same value and no two connections share one.
+    /// Removal is conditional on it: after a takeover the earlier connection
+    /// still runs this, and an unconditional remove would delete the live
+    /// session that replaced it, taking its subscriptions and inflight state
+    /// with it.
+    pub async fn unregister_session(
+        &self,
+        client_id: &Arc<str>,
+        connection_id: u64,
+        graceful: bool,
+    ) {
+        let Some((_, entry)) = self
+            .inner
+            .sessions
+            .remove_if(client_id, |_, session_entry| {
+                session_entry.channel.connection_id() == connection_id
+            })
+        else {
             return;
         };
 
@@ -297,20 +356,8 @@ impl<W: ConnStream> Broker<W> {
         self.inner.subscriptions.remove_client(client_id);
 
         // Non-graceful + will set → publish the will message.
-        if !graceful
-            && let Some(will) = entry.will
-        {
-            let will_packet = PublishPacket {
-                topic: will.topic,
-                payload: will.payload,
-                dup: false,
-                qos: will.qos,
-                retain: will.retain,
-                packet_id: None,
-            };
-            // No source_client_id — pass empty sentinel; self-fanout
-            // suppression won't match any real subscriber.
-            self.publish(&Arc::from(""), will_packet).await;
+        if !graceful {
+            self.publish_will(entry.will).await;
         }
 
         // Session entry dropped → Arc<MqttChannel> refcount -1 → channel
@@ -319,13 +366,26 @@ impl<W: ConnStream> Broker<W> {
 
     // ── Subscription management ──────────────────────────────────
 
+    /// `connection_id` is checked against the entry for the same reason
+    /// `unregister_session` checks it: during a takeover the client_id names
+    /// the newer session, so a SUBSCRIBE the earlier connection had already
+    /// read off its socket would otherwise mutate the newer session's
+    /// subscription set.
     pub async fn subscribe(
         &self,
         client_id: &Arc<str>,
+        connection_id: u64,
         filters: &[TopicFilter],
     ) -> Vec<SubackCode> {
-        let Some(entry) = self.inner.sessions.get(client_id) else {
-            // Subscribing without a session — return all failure
+        let Some(entry) = self
+            .inner
+            .sessions
+            .get(client_id)
+            .filter(|session_entry| {
+                session_entry.channel.connection_id() == connection_id
+            })
+        else {
+            // No session, or it belongs to a different connection — all failure
             return filters.iter().map(|_| SubackCode::Failure).collect();
         };
 
@@ -348,8 +408,21 @@ impl<W: ConnStream> Broker<W> {
         codes
     }
 
-    pub async fn unsubscribe(&self, client_id: &Arc<str>, topics: &[Arc<str>]) {
-        let Some(entry) = self.inner.sessions.get(client_id) else {
+    /// See [`Broker::subscribe`] for why `connection_id` is checked.
+    pub async fn unsubscribe(
+        &self,
+        client_id: &Arc<str>,
+        connection_id: u64,
+        topics: &[Arc<str>],
+    ) {
+        let Some(entry) = self
+            .inner
+            .sessions
+            .get(client_id)
+            .filter(|session_entry| {
+                session_entry.channel.connection_id() == connection_id
+            })
+        else {
             return;
         };
         for topic in topics {
@@ -406,21 +479,6 @@ impl<W: ConnStream> Broker<W> {
             // W policy §2: subscriber's channel may have just closed —
             // send-failure is acceptable.
             let _ = entry.channel.send_publish(adjusted);
-        }
-    }
-
-    // ── QoS 1/2 inflight tracking ────────────────────────────────
-
-    /// Called when broker receives PUBACK from a subscriber.
-    pub async fn ack_outbound(&self, client_id: &Arc<str>, packet_id: PacketId) {
-        if let Some(entry) = self.inner.sessions.get(client_id) {
-            entry.channel.session().outbound_inflight.remove(&packet_id);
-            // Also fire pending_acks if there's an awaiter.
-            if let Some((_, slot)) = entry.channel.session().pending_acks.remove(&packet_id)
-                && let crate::session::AckSlot::Puback(tx) = slot
-            {
-                let _ = tx.send(packet_id); // W policy §3
-            }
         }
     }
 }
