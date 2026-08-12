@@ -17,8 +17,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 use hotaru_mqtt::{
-    BROKER_STATICS_KEY, Broker, ConnackPacket, ConnackReturnCode, ConnectPacket, MQTT, Packet,
-    PublishPacket, QoS, SubackPacket, SubscribePacket, TopicSubscription, codec,
+    BROKER_STATICS_KEY, Broker, ConnackPacket, ConnackReturnCode, ConnectPacket, MQTT,
+    MqttSafety, Packet, PublishPacket, QoS, SubackPacket, SubscribePacket,
+    TopicSubscription, codec,
 };
 
 // ----------------------------------------------------------------------------
@@ -28,9 +29,12 @@ use hotaru_mqtt::{
 /// Spin up a broker on a random port via raw TCP accept loop. Returns the
 /// bound port plus the broker handle (for in-process assertions).
 async fn start_broker() -> (u16, Broker<TcpStream>) {
+    start_broker_with(Broker::<TcpStream>::new()).await
+}
+
+async fn start_broker_with(broker: Broker<TcpStream>) -> (u16, Broker<TcpStream>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let broker = Broker::<TcpStream>::new();
 
     // Build a one-protocol registry holding MQTT::server() + the broker statics.
     let registry: ProtocolEntryRegistry<hotaru_core::connection::tcp::TcpTransport> =
@@ -86,8 +90,13 @@ async fn send_packet(writer: &mut tokio::net::tcp::OwnedWriteHalf, packet: &Pack
     writer.flush().await.unwrap();
 }
 
+/// Test reads are not exercising the size cap, so they use the widest value a
+/// conforming packet can declare. `oversize_publish_header_is_refused` is the
+/// one test that cares, and it drives the wire directly.
+const ANY_SIZE: usize = hotaru_mqtt::SPEC_MAX_PACKET_SIZE;
+
 async fn read_packet(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Packet {
-    timeout(Duration::from_secs(5), codec::read_packet(reader))
+    timeout(Duration::from_secs(5), codec::read_packet(reader, ANY_SIZE))
         .await
         .expect("read_packet timeout")
         .expect("read_packet error")
@@ -360,7 +369,7 @@ async fn unsubscribe_stops_delivery() {
     )
     .await;
 
-    let waited = timeout(Duration::from_millis(300), codec::read_packet(&mut sub_reader)).await;
+    let waited = timeout(Duration::from_millis(300), codec::read_packet(&mut sub_reader, ANY_SIZE)).await;
     assert!(
         waited.is_err(),
         "subscriber should not receive after UNSUBSCRIBE; got {:?}",
@@ -416,7 +425,7 @@ async fn self_fanout_suppression() {
     )
     .await;
 
-    let waited = timeout(Duration::from_millis(300), codec::read_packet(&mut reader)).await;
+    let waited = timeout(Duration::from_millis(300), codec::read_packet(&mut reader, ANY_SIZE)).await;
     assert!(
         waited.is_err(),
         "self-publish should be suppressed; got {:?}",
@@ -767,4 +776,71 @@ async fn will_message_fires_on_abrupt_disconnect() {
         }
         other => panic!("expected will PUBLISH, got {:?}", other),
     }
+}
+
+// ----------------------------------------------------------------------------
+// Wire-layer limits
+// ----------------------------------------------------------------------------
+
+/// An unauthenticated peer must not be able to choose the server's allocation
+/// size. Five bytes declare a ~256 MiB body; the cap has to bite on the CONNECT
+/// read itself, before authentication and before `vec![0u8; remaining]`.
+///
+/// The assertion is timing-shaped on purpose: without the cap the server
+/// allocates and then blocks in `read_exact` waiting for a body that never
+/// arrives, so the connection stays open for the full 10s CONNECT_RECEIVE
+/// timeout. With the cap it is refused on the header alone and the socket
+/// closes immediately.
+#[tokio::test]
+async fn oversize_declaration_is_refused_before_authentication() {
+    let (port, _broker) =
+        start_broker_with(Broker::with_safety(MqttSafety::new().with_max_packet_size(1024))).await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    // 0x10 = CONNECT, then FF FF FF 7F = the largest 4-byte VBI. No body follows.
+    writer.write_all(&[0x10, 0xFF, 0xFF, 0xFF, 0x7F]).await.unwrap();
+    writer.flush().await.unwrap();
+
+    let mut sink = Vec::new();
+    let closed = timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut sink),
+    )
+    .await;
+
+    assert!(
+        closed.is_ok(),
+        "connection still open after 2s: the body was allocated and the read \
+is parked waiting for 256 MiB that will never arrive"
+    );
+    assert!(
+        sink.is_empty(),
+        "server must not answer a malformed CONNECT, got {sink:?}"
+    );
+}
+
+/// The same guard on the steady-state loop, i.e. after CONNECT succeeded.
+#[tokio::test]
+async fn oversize_declaration_is_refused_after_connect() {
+    let (port, _broker) =
+        start_broker_with(Broker::with_safety(MqttSafety::new().with_max_packet_size(1024))).await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    send_packet(&mut writer, &connect_packet("oversize-after-connect")).await;
+    match read_packet(&mut reader).await {
+        Packet::Connack(ack) => assert_eq!(ConnackReturnCode::Accepted, ack.return_code),
+        other => panic!("expected CONNACK, got {other:?}"),
+    }
+
+    // 0x30 = PUBLISH with the same oversized declaration.
+    writer.write_all(&[0x30, 0xFF, 0xFF, 0xFF, 0x7F]).await.unwrap();
+    writer.flush().await.unwrap();
+
+    let mut sink = Vec::new();
+    let closed = timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut sink),
+    )
+    .await;
+    assert!(closed.is_ok(), "connection still open after 2s");
 }

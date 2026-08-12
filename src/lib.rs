@@ -20,6 +20,7 @@ mod error;
 mod packet;
 mod protocol;
 mod request;
+mod safety;
 mod session;
 mod topic;
 
@@ -55,6 +56,7 @@ pub use request::{
     Credentials, IncomingPublish, MqttRequest, MqttResponse, PacketId, PublishAck,
     PublishRequest, QoS, SubackCode, TopicFilter, WillMessage,
 };
+pub use safety::{MqttSafety, SPEC_MAX_PACKET_SIZE};
 pub use session::{AckSlot, BindInfo, MqttSession};
 pub use topic::{
     parse_publish_topic, parse_subscribe_filter, path_to_wire_filter,
