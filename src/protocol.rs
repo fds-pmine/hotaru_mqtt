@@ -246,14 +246,21 @@ where
     });
 
     // 4. Initial subscriptions (if any)
+    //
+    // Sent, not awaited. Waiting for the SUBACK here cannot work: this function
+    // owns the reader and does not poll it until the loop below, so nothing
+    // drains the socket while the wait is in progress and `fire_suback` — the
+    // only thing that resolves the slot — is only reachable from that loop. An
+    // awaited SUBACK therefore always expired, and the session died with
+    // `Timeout(Ack)`, so every client configured with an initial subscription
+    // failed to connect.
+    //
+    // Nothing was lost by dropping the wait: the SUBACK's return codes were
+    // discarded (`let _ =`) rather than surfaced, so the wait bought delay and
+    // no information. The loop dispatches the SUBACK normally; with no slot
+    // registered for it, `fire_suback` ignores it per the W §4 silent policy.
     if !config.initial_subscriptions.is_empty() {
-        // Use the same path P::send takes — via cmd_tx + pending_acks.
         let pkt_id = channel.session().allocate_packet_id();
-        let (tx, rx) = oneshot::channel();
-        channel
-            .session()
-            .pending_acks
-            .insert(pkt_id, AckSlot::Suback(tx));
         let subs: Vec<TopicSubscription> = config
             .initial_subscriptions
             .iter()
@@ -266,10 +273,6 @@ where
             packet_id: pkt_id,
             subscriptions: subs,
         }))?;
-        let _ = timeout(DEFAULT_ACK_TIMEOUT, rx)
-            .await
-            .map_err(|_| MqttError::Timeout(TimeoutKind::Ack))?
-            .map_err(|_| MqttError::ChannelClosed)?;
     }
 
     // 5. Main select loop

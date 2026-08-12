@@ -25,7 +25,7 @@ use tokio::time::timeout;
 
 use hotaru_mqtt::{
     CLIENT_CONFIG_STATICS_KEY, ConnackPacket, ConnackReturnCode, MQTT, MqttClientConfig,
-    Packet, PublishPacket, QoS, WillMessage, codec,
+    Packet, PublishPacket, QoS, SubackCode, SubackPacket, WillMessage, codec,
 };
 
 /// Test reads are not exercising the size cap.
@@ -185,6 +185,81 @@ async fn a_refused_connack_ends_the_session() {
     )
     .await;
     assert!(closed.is_ok(), "client stayed connected after a refusal");
+}
+
+// ----------------------------------------------------------------------------
+// Initial subscription
+// ----------------------------------------------------------------------------
+
+/// The configured filters must reach the wire, and the session must go on to
+/// its read loop.
+///
+/// Reaching the loop is the load-bearing half. `handle_client` owns the reader
+/// and does not poll it until the loop, so a SUBACK cannot be observed before
+/// the loop starts; a startup that waits for one waits forever. `keep_alive=1`
+/// makes that visible — a PINGREQ is only ever sent from inside the loop.
+#[tokio::test]
+async fn initial_subscriptions_are_sent_and_the_loop_starts() {
+    let config = MqttClientConfig::new("subber")
+        .keep_alive(1)
+        .with_initial_subscribe("sensors/+/temp", QoS::AtLeastOnce);
+    let mut peer = start_client(config).await;
+    handshake(&mut peer).await;
+
+    let packet_id = match recv(&mut peer.0).await {
+        Packet::Subscribe(s) => {
+            assert_eq!(1, s.subscriptions.len());
+            assert_eq!("sensors/+/temp", &*s.subscriptions[0].topic);
+            assert_eq!(QoS::AtLeastOnce, s.subscriptions[0].qos);
+            s.packet_id
+        }
+        other => panic!("expected SUBSCRIBE, got {other:?}"),
+    };
+
+    send(
+        &mut peer.1,
+        &Packet::Suback(SubackPacket {
+            packet_id,
+            return_codes: vec![SubackCode::Granted(QoS::AtLeastOnce)],
+        }),
+    )
+    .await;
+
+    match recv(&mut peer.0).await {
+        Packet::Pingreq => {}
+        other => panic!("expected PINGREQ once the loop was entered, got {other:?}"),
+    }
+}
+
+/// A peer that never answers the SUBSCRIBE must not be able to stall the
+/// session: startup does not depend on the SUBACK arriving at all.
+#[tokio::test]
+async fn a_missing_suback_does_not_stall_startup() {
+    let config = MqttClientConfig::new("unanswered")
+        .keep_alive(1)
+        .with_initial_subscribe("a/b", QoS::AtLeastOnce);
+    let mut peer = start_client(config).await;
+    handshake(&mut peer).await;
+
+    match recv(&mut peer.0).await {
+        Packet::Subscribe(_) => {}
+        other => panic!("expected SUBSCRIBE, got {other:?}"),
+    }
+    // No SUBACK is sent. The loop must start regardless.
+    match recv(&mut peer.0).await {
+        Packet::Pingreq => {}
+        other => panic!("expected PINGREQ without a SUBACK, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn no_subscribe_is_sent_when_none_are_configured() {
+    let mut peer = start_client(MqttClientConfig::new("quiet").keep_alive(1)).await;
+    handshake(&mut peer).await;
+    match recv(&mut peer.0).await {
+        Packet::Pingreq => {}
+        other => panic!("expected PINGREQ with no initial subscriptions, got {other:?}"),
+    }
 }
 
 // ----------------------------------------------------------------------------
