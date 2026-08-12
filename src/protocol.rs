@@ -444,15 +444,29 @@ where
     });
 
     // 4. Send CONNACK
-    channel.send_packet(Packet::Connack(ConnackPacket {
+    //
+    // The session is already registered at this point, so a failure here has
+    // to unregister before it propagates — the same obligation the read loop
+    // below discharges through `terminal_error`.
+    if let Err(e) = channel.send_packet(Packet::Connack(ConnackPacket {
         session_present,
         return_code: ConnackReturnCode::Accepted,
-    }))?;
+    })) {
+        broker.unregister_session(&client_id, false).await;
+        return Err(e);
+    }
 
     // 5. Main select loop with keep-alive timeout (1.5× grace per spec)
     let keep_alive_secs = keep_alive.max(1) as u64;
     let read_timeout = Duration::from_secs((keep_alive_secs * 3) / 2);
     let mut graceful = false;
+    // Every terminal condition sets state and breaks; nothing returns from
+    // inside the loop. Teardown is written after the loop, so a `return` there
+    // would skip it — which is exactly what used to happen on a malformed
+    // packet: the session stayed in the broker's table with its subscriptions
+    // live, and the Will was never published even though the connection had
+    // died non-gracefully.
+    let mut terminal_error: Option<MqttError> = None;
     let shutdown = channel.shutdown_signal();
 
     loop {
@@ -464,20 +478,26 @@ where
                 match packet {
                     Err(_) => break,                              // keep-alive timeout = crash
                     Ok(Err(MqttError::Io(_))) => break,           // wire closed = crash
-                    Ok(Err(e)) => return Err(e),
+                    Ok(Err(e)) => {
+                        terminal_error = Some(e);
+                        break;
+                    }
                     Ok(Ok(Packet::Disconnect)) => {
                         graceful = true;
                         break;
                     }
                     Ok(Ok(p)) => {
-                        dispatch_server_inbound(
+                        if let Err(e) = dispatch_server_inbound(
                             channel.clone(),
                             broker.clone(),
                             &client_id,
                             p,
                             runtime.clone(),
                             root.clone(),
-                        ).await?;
+                        ).await {
+                            terminal_error = Some(e);
+                            break;
+                        }
                     }
                 }
             }
@@ -485,8 +505,15 @@ where
         }
     }
 
-    // 6. Unregister (graceful flag drives Will trigger)
+    // 6. Unregister (graceful flag drives Will trigger). Single exit: this runs
+    //    on every path out of the loop, including the failing ones.
     broker.unregister_session(&client_id, graceful).await;
+    if let Some(e) = terminal_error {
+        // Still reported to the framework, just after cleanup rather than
+        // instead of it. `graceful` stays false on this path, which is what
+        // makes the Will fire (MQTT-3.1.2-5).
+        return Err(e);
+    }
     Ok(ProtocolFlow::Close)
 }
 

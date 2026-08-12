@@ -232,6 +232,14 @@ impl<W: ConnStream> Broker<W> {
         &self.inner.safety
     }
 
+    /// Number of registered sessions. Exposed so a caller can observe that a
+    /// dead connection actually left the table — the leak this guards against
+    /// is invisible from the wire, since the offending connection is closed
+    /// either way.
+    pub fn session_count(&self) -> usize {
+        self.inner.sessions.len()
+    }
+
     // ── Session lifecycle ────────────────────────────────────────
 
     pub async fn authenticate(
