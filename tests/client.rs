@@ -689,3 +689,70 @@ async fn a_one_second_keep_alive_client_pings_about_every_second() {
         }
     }
 }
+
+/// A QoS 2 flow is only finished at PUBCOMP, so an inflight record must survive
+/// the middle of the handshake.
+///
+/// PUBREC wakes the waiter — the sender may proceed — but it does not end the
+/// flow. Clearing the record there would throw away the only copy of a message
+/// the peer has not yet been told to release, and nothing on the wire would look
+/// wrong.
+///
+/// The record is seeded by hand rather than produced by the send. `send_publish`
+/// does not populate `outbound_inflight` at all — only `Broker::publish` does, on
+/// the fanout path — so on a pure client session the map is always empty and this
+/// invariant would be untestable through the public flow. That gap is real but
+/// separate; this test pins the arm's behaviour, which is what this PR changes.
+#[tokio::test]
+async fn a_qos2_flow_keeps_its_inflight_record_until_pubcomp() {
+    let (mut peer, channel) = start_client_with_channel(MqttClientConfig::new("q2-inflight")).await;
+    handshake(&mut peer).await;
+
+    let session = channel.session();
+    let script = async {
+        let packet_id = match recv(&mut peer.0).await {
+            Packet::Publish(publish) => publish.packet_id.expect("QoS 2 carries a packet id"),
+            other => panic!("expected PUBLISH, got {other:?}"),
+        };
+        // Stand in for a fanout record under the same id.
+        session.outbound_inflight.insert(
+            packet_id,
+            PublishPacket {
+                topic: Arc::from("seeded/for/this/test"),
+                payload: bytes::Bytes::from_static(b"x"),
+                dup: false,
+                qos: QoS::ExactlyOnce,
+                retain: false,
+                packet_id: Some(packet_id),
+            },
+        );
+
+        send(&mut peer.1, &Packet::Pubrec(packet_id)).await;
+        match recv(&mut peer.0).await {
+            Packet::Pubrel(released) => assert_eq!(packet_id, released),
+            other => panic!("expected PUBREL, got {other:?}"),
+        }
+        // PUBREL is out, PUBCOMP is not in: the flow is mid-air.
+        assert!(
+            session.outbound_inflight.get(&packet_id).is_some(),
+            "the record was cleared at PUBREC, so the message is no longer \
+retransmittable even though the peer has not confirmed release"
+        );
+
+        send(&mut peer.1, &Packet::Pubcomp(packet_id)).await;
+        packet_id
+    };
+
+    let (response, packet_id) = tokio::join!(
+        protocol_send(&channel, publish_request("out/q2-inflight", QoS::ExactlyOnce)),
+        script,
+    );
+    assert!(matches!(
+        response.expect("send failed"),
+        MqttResponse::Published(PublishAck::Completed(_))
+    ));
+    assert!(
+        channel.session().outbound_inflight.get(&packet_id).is_none(),
+        "the record should be cleared once PUBCOMP completes the flow"
+    );
+}

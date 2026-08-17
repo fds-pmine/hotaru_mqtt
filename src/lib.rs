@@ -57,7 +57,7 @@ pub use request::{
     PublishRequest, QoS, SubackCode, TopicFilter, WillMessage,
 };
 pub use safety::{MqttSafety, SPEC_MAX_PACKET_SIZE};
-pub use session::{AckSlot, BindInfo, MqttSession};
+pub use session::{AckKind, AckSlot, BindInfo, MqttSession};
 pub use topic::{
     parse_publish_topic, parse_subscribe_filter, path_to_wire_filter,
     validate_publish_topic, validate_subscribe_filter,
