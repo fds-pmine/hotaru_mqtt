@@ -642,3 +642,50 @@ async fn concurrent_sends_get_their_own_acks() {
     want.sort_unstable();
     assert_eq!(want, got, "each send must resolve with its own packet id");
 }
+
+// ----------------------------------------------------------------------------
+// keep-alive
+// ----------------------------------------------------------------------------
+
+/// `keep_alive = 0` means "no keep-alive" (spec §3.1.2.10), so the client owes
+/// the server nothing and must not ping.
+///
+/// The old `keep_alive_secs.max(1)` turned that into a PINGREQ every second —
+/// on a battery-powered device, a pointless wakeup per second, and that is
+/// precisely the deployment `keep_alive = 0` exists for.
+#[tokio::test]
+async fn a_zero_keep_alive_client_never_pings() {
+    let mut peer = start_client(MqttClientConfig::new("silent").keep_alive(0)).await;
+    handshake(&mut peer).await;
+
+    // Two seconds is generous: the old code pinged at one-second intervals.
+    let spoke = timeout(
+        Duration::from_secs(2),
+        codec::read_packet(&mut peer.0, ANY_SIZE),
+    )
+    .await;
+    assert!(
+        spoke.is_err(),
+        "client with keep_alive=0 sent something unbidden: {spoke:?}"
+    );
+}
+
+/// The value the client declares is the interval it pings on, not the server's
+/// 1.5x grace — pinging on the grace would be late by construction.
+#[tokio::test]
+async fn a_one_second_keep_alive_client_pings_about_every_second() {
+    let mut peer = start_client(MqttClientConfig::new("chatty").keep_alive(1)).await;
+    handshake(&mut peer).await;
+
+    for nth in 1..=2 {
+        match timeout(
+            Duration::from_millis(1_800),
+            codec::read_packet(&mut peer.0, ANY_SIZE),
+        )
+        .await
+        {
+            Ok(Ok(Packet::Pingreq)) => {}
+            other => panic!("expected PINGREQ number {nth}, got {other:?}"),
+        }
+    }
+}

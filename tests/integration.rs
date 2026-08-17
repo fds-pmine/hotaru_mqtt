@@ -1132,3 +1132,76 @@ async fn a_superseded_connection_id_cannot_touch_the_live_session() {
         "the live session received traffic for a filter it never asked for; got {waited:?}"
     );
 }
+
+// ----------------------------------------------------------------------------
+// keep-alive
+// ----------------------------------------------------------------------------
+
+/// A client that declared `keep_alive = 0` asked not to be timed out, so the
+/// broker must not disconnect it for saying nothing (spec §3.1.2.10).
+///
+/// The old code ran `keep_alive.max(1)`, so zero became a one-second deadline —
+/// the most aggressive the expression could produce, and the exact opposite of
+/// what was requested. A connection that declared "never time me out" was
+/// dropped after a second.
+#[tokio::test]
+async fn a_zero_keep_alive_connection_is_not_dropped_for_being_idle() {
+    let (port, broker) = start_broker().await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    let mut connect = match connect_packet("patient") {
+        Packet::Connect(c) => c,
+        _ => unreachable!(),
+    };
+    connect.keep_alive = 0;
+    send_packet(&mut writer, &Packet::Connect(connect)).await;
+    match read_packet(&mut reader).await {
+        Packet::Connack(ack) => assert_eq!(ConnackReturnCode::Accepted, ack.return_code),
+        other => panic!("expected CONNACK, got {other:?}"),
+    }
+
+    // Then say nothing. Under the old deadline this connection was gone after
+    // one second; two and a half is well past that and well short of flaky.
+    let mut sink = Vec::new();
+    let closed = timeout(
+        Duration::from_millis(2_500),
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut sink),
+    )
+    .await;
+    assert!(
+        closed.is_err(),
+        "broker disconnected an idle keep_alive=0 client; it read {sink:?}"
+    );
+    assert_eq!(1, broker.session_count(), "the session should still be live");
+}
+
+/// The grace still bites when a keep-alive was actually asked for: a client
+/// declaring 1 second and then going quiet is disconnected.
+///
+/// This is the other half of the same change — turning zero into "no deadline"
+/// must not turn every deadline off.
+#[tokio::test]
+async fn an_idle_connection_with_a_keep_alive_is_still_dropped() {
+    let (port, _broker) = start_broker().await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    let mut connect = match connect_packet("impatient") {
+        Packet::Connect(c) => c,
+        _ => unreachable!(),
+    };
+    connect.keep_alive = 1;
+    send_packet(&mut writer, &Packet::Connect(connect)).await;
+    let _ = read_packet(&mut reader).await;
+
+    // Deadline is 1.5s; 4s leaves room without being slow.
+    let mut sink = Vec::new();
+    let closed = timeout(
+        Duration::from_secs(4),
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut sink),
+    )
+    .await;
+    assert!(
+        closed.is_ok(),
+        "broker kept an idle keep_alive=1 connection past its 1.5s grace"
+    );
+}

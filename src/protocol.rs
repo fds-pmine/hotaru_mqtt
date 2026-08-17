@@ -195,6 +195,92 @@ where
 }
 
 // ============================================================================
+// keep-alive
+// ============================================================================
+
+/// The inactivity deadline a server enforces for a client's declared
+/// `keep_alive`, or `None` when the client asked for none.
+///
+/// Spec §3.1.2.10: the client owes traffic at least every `keep_alive` seconds,
+/// and the server disconnects it after 1.5× that without hearing anything. The
+/// 1.5 is the grace — a client pinging on schedule must survive ordinary jitter.
+/// `keep_alive == 0` turns the mechanism off, and the server must then NOT
+/// disconnect for inactivity, so it is `None` rather than any duration.
+///
+/// Milliseconds rather than `(secs * 3) / 2`: integer division truncates, which
+/// loses half a second on every odd value and the whole grace at `keep_alive`
+/// of 1. Multiplying 1500 ms per second is exact for every input, and `u64`
+/// leaves the largest legal value — 65535 × 1500 ms, roughly 27 hours — nowhere
+/// near overflow.
+fn server_read_deadline(keep_alive: u16) -> Option<Duration> {
+    if keep_alive == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(keep_alive as u64 * 1500))
+    }
+}
+
+/// How often a client sends PINGREQ, or `None` when it declared no keep-alive.
+///
+/// The client's obligation is its own `keep_alive`, not the server's 1.5× grace:
+/// pinging on the grace period would be late by construction.
+fn client_ping_interval(keep_alive: u16) -> Option<Duration> {
+    if keep_alive == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(keep_alive as u64))
+    }
+}
+
+/// What one attempt to read a packet under a deadline can end as.
+///
+/// A named three-way outcome instead of `Option<Result<Packet, MqttError>>`:
+/// the nesting made callers pattern-match through two layers whose meanings
+/// are easy to confuse, and none of the three cases is an "absence" or a
+/// generic failure — each has a name of its own.
+enum ReadOutcome {
+    /// A whole packet arrived before the deadline.
+    Packet(Packet),
+    /// The read itself failed (wire closed, malformed bytes, ...).
+    Failed(MqttError),
+    /// The deadline elapsed with nothing read. Only possible when a deadline
+    /// exists — with `keep_alive = 0` there is none and this never happens.
+    DeadlineElapsed,
+}
+
+/// Read one packet, giving up if `deadline` elapses first.
+/// A `deadline` of `None` waits forever, which is what `keep_alive = 0` asks for.
+async fn read_packet_before<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    max_size: usize,
+    deadline: Option<Duration>,
+) -> ReadOutcome {
+    let read_result = match deadline {
+        Some(limit) => match timeout(limit, read_packet(reader, max_size)).await {
+            Ok(finished_in_time) => finished_in_time,
+            Err(_elapsed) => return ReadOutcome::DeadlineElapsed,
+        },
+        None => read_packet(reader, max_size).await,
+    };
+    match read_result {
+        Ok(packet) => ReadOutcome::Packet(packet),
+        Err(error) => ReadOutcome::Failed(error),
+    }
+}
+
+/// Tick, or never fire at all when the client declared no keep-alive.
+/// `pending()` is a future that never completes, so the `select!` arm holding it
+/// simply never wins — no timer, no wakeups.
+async fn tick_or_never(timer: &mut Option<tokio::time::Interval>) {
+    match timer {
+        Some(t) => {
+            t.tick().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+// ============================================================================
 // handle_client — client-side persistent session loop
 // ============================================================================
 
@@ -276,9 +362,14 @@ where
     }
 
     // 5. Main select loop
-    let ping_interval = Duration::from_secs(config.keep_alive_secs.max(1) as u64);
-    let mut ping_timer = tokio::time::interval(ping_interval);
-    ping_timer.tick().await; // skip first immediate tick
+    let mut ping_timer = match client_ping_interval(config.keep_alive_secs) {
+        Some(interval) => {
+            let mut t = tokio::time::interval(interval);
+            t.tick().await; // skip first immediate tick
+            Some(t)
+        }
+        None => None,
+    };
     let shutdown = channel.shutdown_signal();
 
     loop {
@@ -297,7 +388,7 @@ where
                     Err(e) => return Err(e),
                 }
             }
-            _ = ping_timer.tick() => {
+            _ = tick_or_never(&mut ping_timer) => {
                 // PINGREQ failure means writer is dead → break (W must-propagate)
                 if channel.send_packet(Packet::Pingreq).is_err() {
                     break;
@@ -465,9 +556,9 @@ where
         return Err(e);
     }
 
-    // 5. Main select loop with keep-alive timeout (1.5× grace per spec)
-    let keep_alive_secs = keep_alive.max(1) as u64;
-    let read_timeout = Duration::from_secs((keep_alive_secs * 3) / 2);
+    // 5. Main select loop with keep-alive deadline (1.5× grace per spec, and
+    //    no deadline at all when the client declared keep_alive = 0)
+    let read_deadline = server_read_deadline(keep_alive);
     let mut graceful = false;
     // Every terminal condition sets state and breaks; nothing returns from
     // inside the loop. Teardown is written after the loop, so a `return` there
@@ -483,29 +574,29 @@ where
             break;
         }
         tokio::select! {
-            packet = timeout(read_timeout, read_packet(&mut reader, max_packet_size)) => {
-                match packet {
-                    Err(_) => break,                              // keep-alive timeout = crash
-                    Ok(Err(MqttError::Io(_))) => break,           // wire closed = crash
-                    Ok(Err(e)) => {
-                        terminal_error = Some(e);
+            outcome = read_packet_before(&mut reader, max_packet_size, read_deadline) => {
+                match outcome {
+                    ReadOutcome::DeadlineElapsed => break,             // keep-alive deadline = crash
+                    ReadOutcome::Failed(MqttError::Io(_)) => break,    // wire closed = crash
+                    ReadOutcome::Failed(error) => {
+                        terminal_error = Some(error);
                         break;
                     }
-                    Ok(Ok(Packet::Disconnect)) => {
+                    ReadOutcome::Packet(Packet::Disconnect) => {
                         graceful = true;
                         break;
                     }
-                    Ok(Ok(p)) => {
-                        if let Err(e) = dispatch_server_inbound(
+                    ReadOutcome::Packet(inbound) => {
+                        if let Err(error) = dispatch_server_inbound(
                             channel.clone(),
                             broker.clone(),
                             &client_id,
                             connection_id,
-                            p,
+                            inbound,
                             runtime.clone(),
                             root.clone(),
                         ).await {
-                            terminal_error = Some(e);
+                            terminal_error = Some(error);
                             break;
                         }
                     }
@@ -1034,3 +1125,6 @@ pub trait DefaultInboundHandler: Send + Sync + 'static {
 }
 
 // (shutdown_signal lives on MqttChannel as pub(crate))
+
+#[cfg(test)]
+mod test;
