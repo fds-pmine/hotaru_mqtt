@@ -1,4 +1,4 @@
-//! `hotaru_mqtt` — MQTT 3.1.1 broker + client built on `hotaru_core`.
+//! `hotaru_mqtt` — MQTT 3.1.1 and MQTT 5 broker + client built on `hotaru_core`.
 //!
 //! The crate root is the stable API surface: every supported type is
 //! re-exported here. `codec` is the one addressable module, holding the
@@ -44,8 +44,8 @@ pub use client::MqttClientConfig;
 pub use context::MqttContext;
 pub use error::{CodecError, MqttError, TimeoutKind, Violation};
 pub use packet::{
-    ConnackPacket, ConnackReturnCode, ConnectPacket, Packet, PublishPacket,
-    SubackPacket, SubscribePacket, TopicSubscription, UnsubscribePacket,
+    ConnackPacket, ConnackReturnCode, ConnectPacket, Packet, ProtocolVersion,
+    PublishPacket, SubackPacket, SubscribePacket, TopicSubscription, UnsubscribePacket,
     WillPacket,
 };
 pub use properties::Properties;
