@@ -18,7 +18,8 @@ use tokio::time::timeout;
 
 use hotaru_mqtt::{
     BROKER_STATICS_KEY, Broker, ConnackPacket, ConnackReturnCode, ConnectPacket, MQTT, Packet,
-    PublishPacket, QoS, SubackPacket, SubscribePacket, TopicSubscription, codec,
+    Properties, ProtocolVersion, PublishPacket, QoS, SubackPacket, SubscribePacket,
+    TopicSubscription, codec,
 };
 
 // ----------------------------------------------------------------------------
@@ -81,27 +82,48 @@ async fn connect_raw(
 }
 
 async fn send_packet(writer: &mut tokio::net::tcp::OwnedWriteHalf, packet: &Packet) {
-    let bytes = codec::encode_packet(packet);
+    send_packet_version(writer, packet, ProtocolVersion::V311).await;
+}
+
+async fn send_packet_version(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    packet: &Packet,
+    version: ProtocolVersion,
+) {
+    let bytes = codec::encode_packet(packet, version).unwrap();
     writer.write_all(&bytes).await.unwrap();
     writer.flush().await.unwrap();
 }
 
 async fn read_packet(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Packet {
-    timeout(Duration::from_secs(5), codec::read_packet(reader))
+    read_packet_version(reader, ProtocolVersion::V311).await
+}
+
+async fn read_packet_version(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    version: ProtocolVersion,
+) -> Packet {
+    timeout(Duration::from_secs(5), codec::read_packet(reader, version))
         .await
         .expect("read_packet timeout")
         .expect("read_packet error")
 }
 
 fn connect_packet(client_id: &str) -> Packet {
-    Packet::Connect(ConnectPacket {
+    connect_packet_version(client_id, ProtocolVersion::V311)
+}
+
+fn connect_packet_version(client_id: &str, version: ProtocolVersion) -> Packet {
+    Packet::Connect(Box::new(ConnectPacket {
+        version,
+        properties: Default::default(),
         client_id: Arc::from(client_id),
         clean_session: true,
         keep_alive: 60,
         username: None,
         password: None,
         will: None,
-    })
+    }))
 }
 
 // ----------------------------------------------------------------------------
@@ -127,11 +149,78 @@ async fn connect_returns_connack() {
         Packet::Connack(ConnackPacket {
             session_present,
             return_code,
+            ..
         }) => {
             assert!(!session_present);
             assert_eq!(return_code, ConnackReturnCode::Accepted);
         }
         other => panic!("expected CONNACK, got {:?}", other),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mqtt5_connect_returns_mqtt5_connack() {
+    let (port, _broker) = start_broker().await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    let connect = connect_packet_version("mqtt5-client", ProtocolVersion::V5);
+    send_packet_version(&mut writer, &connect, ProtocolVersion::V5).await;
+
+    match read_packet_version(&mut reader, ProtocolVersion::V5).await {
+        Packet::Connack(ack) => {
+            assert_eq!(ack.return_code, ConnackReturnCode::Accepted);
+            assert!(ack.properties.is_empty());
+        }
+        other => panic!("expected MQTT 5 CONNACK, got {:?}", other),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v311_publish_is_encoded_for_mqtt5_subscriber() {
+    let (port, _broker) = start_broker().await;
+
+    let (mut sub_reader, mut sub_writer) = connect_raw(port).await;
+    let sub_connect = connect_packet_version("mqtt5-sub", ProtocolVersion::V5);
+    send_packet_version(&mut sub_writer, &sub_connect, ProtocolVersion::V5).await;
+    let _ = read_packet_version(&mut sub_reader, ProtocolVersion::V5).await;
+    send_packet_version(
+        &mut sub_writer,
+        &Packet::Subscribe(SubscribePacket {
+            packet_id: 1,
+            subscriptions: vec![TopicSubscription {
+                topic: Arc::from("cross/version"),
+                qos: QoS::AtMostOnce,
+            }],
+        }),
+        ProtocolVersion::V5,
+    )
+    .await;
+    let _ = read_packet_version(&mut sub_reader, ProtocolVersion::V5).await;
+
+    let (mut pub_reader, mut pub_writer) = connect_raw(port).await;
+    send_packet(&mut pub_writer, &connect_packet("v311-pub")).await;
+    let _ = read_packet(&mut pub_reader).await;
+    send_packet(
+        &mut pub_writer,
+        &Packet::Publish(PublishPacket {
+            properties: Properties::default(),
+            topic: Arc::from("cross/version"),
+            payload: bytes::Bytes::from_static(b"mixed"),
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            packet_id: None,
+        }),
+    )
+    .await;
+
+    match read_packet_version(&mut sub_reader, ProtocolVersion::V5).await {
+        Packet::Publish(publish) => {
+            assert_eq!(publish.topic.as_ref(), "cross/version");
+            assert_eq!(&publish.payload[..], b"mixed");
+            assert!(publish.properties.is_empty());
+        }
+        other => panic!("expected cross-version PUBLISH, got {:?}", other),
     }
 }
 
@@ -194,6 +283,7 @@ async fn publish_q0_fanout_to_subscriber() {
     send_packet(
         &mut pub_writer,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("hello/world"),
             payload: bytes::Bytes::from_static(b"greetings"),
             dup: false,
@@ -240,6 +330,7 @@ async fn publish_q1_round_trip_with_puback() {
     send_packet(
         &mut pub_writer,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("q1/topic"),
             payload: bytes::Bytes::from_static(b"q1-payload"),
             dup: false,
@@ -293,6 +384,7 @@ async fn wildcard_plus_matches() {
     send_packet(
         &mut pub_writer,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("a/b/c"),
             payload: bytes::Bytes::from_static(b"hit"),
             dup: false,
@@ -350,6 +442,7 @@ async fn unsubscribe_stops_delivery() {
     send_packet(
         &mut pub_writer,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("u/topic"),
             payload: bytes::Bytes::from_static(b"should not arrive"),
             dup: false,
@@ -360,7 +453,11 @@ async fn unsubscribe_stops_delivery() {
     )
     .await;
 
-    let waited = timeout(Duration::from_millis(300), codec::read_packet(&mut sub_reader)).await;
+    let waited = timeout(
+        Duration::from_millis(300),
+        codec::read_packet(&mut sub_reader, ProtocolVersion::V311),
+    )
+    .await;
     assert!(
         waited.is_err(),
         "subscriber should not receive after UNSUBSCRIBE; got {:?}",
@@ -406,6 +503,7 @@ async fn self_fanout_suppression() {
     send_packet(
         &mut writer,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("self/topic"),
             payload: bytes::Bytes::from_static(b"echo"),
             dup: false,
@@ -416,7 +514,11 @@ async fn self_fanout_suppression() {
     )
     .await;
 
-    let waited = timeout(Duration::from_millis(300), codec::read_packet(&mut reader)).await;
+    let waited = timeout(
+        Duration::from_millis(300),
+        codec::read_packet(&mut reader, ProtocolVersion::V311),
+    )
+    .await;
     assert!(
         waited.is_err(),
         "self-publish should be suppressed; got {:?}",
@@ -457,6 +559,7 @@ async fn publish_q2_full_handshake() {
     send_packet(
         &mut pub_writer,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("q2/topic"),
             payload: bytes::Bytes::from_static(b"q2-payload"),
             dup: false,
@@ -530,6 +633,7 @@ async fn wildcard_hash_matches() {
     send_packet(
         &mut pub_writer,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("sensors/floor/3/temp"),
             payload: bytes::Bytes::from_static(b"deep"),
             dup: false,
@@ -578,6 +682,7 @@ async fn fanout_to_multiple_subscribers() {
     send_packet(
         &mut pub_writer,
         &Packet::Publish(PublishPacket {
+            properties: Default::default(),
             topic: Arc::from("broadcast/topic"),
             payload: bytes::Bytes::from_static(b"to all"),
             dup: false,
@@ -696,6 +801,7 @@ async fn external_broker_publish_reaches_mqtt_subscriber() {
         .publish(
             &Arc::from("http-bridge"),
             PublishPacket {
+                properties: Default::default(),
                 topic: Arc::from("aiot/event"),
                 payload: bytes::Bytes::from_static(b"from-http"),
                 dup: false,
@@ -739,19 +845,22 @@ async fn will_message_fires_on_abrupt_disconnect() {
 
     // "Crashing" publisher with a will
     let (mut pub_reader, mut pub_writer) = connect_raw(port).await;
-    let will_connect = Packet::Connect(ConnectPacket {
+    let will_connect = Packet::Connect(Box::new(ConnectPacket {
+        version: ProtocolVersion::V311,
+        properties: Default::default(),
         client_id: Arc::from("crash-client"),
         clean_session: true,
         keep_alive: 60,
         username: None,
         password: None,
         will: Some(hotaru_mqtt::WillPacket {
+            properties: Default::default(),
             topic: Arc::from("lwt/topic"),
             payload: bytes::Bytes::from_static(b"gone"),
             qos: QoS::AtMostOnce,
             retain: false,
         }),
-    });
+    }));
     send_packet(&mut pub_writer, &will_connect).await;
     let _ = read_packet(&mut pub_reader).await;
 
