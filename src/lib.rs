@@ -18,6 +18,7 @@ pub mod codec;
 mod context;
 mod error;
 mod packet;
+mod properties;
 mod protocol;
 mod request;
 mod session;
@@ -47,6 +48,7 @@ pub use packet::{
     SubackPacket, SubscribePacket, TopicSubscription, UnsubscribePacket,
     WillPacket,
 };
+pub use properties::Properties;
 pub use protocol::{
     DefaultInboundHandler, DefaultMqttTransport, MQTT, MqttProtocol,
     BROKER_STATICS_KEY, CLIENT_CONFIG_STATICS_KEY,

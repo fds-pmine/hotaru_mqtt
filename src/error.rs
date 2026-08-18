@@ -58,6 +58,14 @@ pub enum Violation {
     HashWildcardNotTerminal,
     WildcardMixedWithLiteral,
     SessionAlreadyBound,
+    /// MQTT 5 property which may occur only once was repeated.
+    DuplicateProperty(u8),
+    /// MQTT 5 property value is outside the range defined by the protocol.
+    MalformedProperty(u8),
+    /// Property identifier is not defined by MQTT 5.
+    UnknownProperty(u8),
+    /// MQTT UTF-8 strings must not contain U+0000.
+    Utf8NullCharacter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +77,10 @@ pub enum CodecError {
     PayloadTooLong { len: usize, max: usize },
     QosInvalid(u8),
     ReservedFlagSet,
+    /// A two-byte-length-prefixed field cannot represent this many bytes.
+    FieldTooLong { kind: &'static str, len: usize },
+    /// MQTT Variable Byte Integers are limited to 268,435,455.
+    VariableByteIntegerOutOfRange { value: usize },
 }
 
 impl fmt::Display for MqttError {
