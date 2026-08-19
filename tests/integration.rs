@@ -844,3 +844,96 @@ async fn oversize_declaration_is_refused_after_connect() {
     .await;
     assert!(closed.is_ok(), "connection still open after 2s");
 }
+
+// ----------------------------------------------------------------------------
+// Connection teardown
+// ----------------------------------------------------------------------------
+
+/// A malformed packet after CONNECT must still tear the session down.
+///
+/// The read loop used to `return Err(e)` here, jumping over the
+/// `unregister_session` call written below the loop, so the entry stayed in the
+/// broker's table with its subscriptions live and its channel `Arc` held.
+#[tokio::test]
+async fn malformed_packet_after_connect_unregisters_the_session() {
+    let (port, broker) = start_broker().await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    send_packet(&mut writer, &connect_packet("leaky")).await;
+    match read_packet(&mut reader).await {
+        Packet::Connack(ack) => assert_eq!(ConnackReturnCode::Accepted, ack.return_code),
+        other => panic!("expected CONNACK, got {other:?}"),
+    }
+    assert_eq!(1, broker.session_count(), "session should be registered");
+
+    // 0xF0 is not a valid MQTT 3.1.1 packet type — the codec refuses it and the
+    // read loop takes its error path.
+    writer.write_all(&[0xF0, 0x00]).await.unwrap();
+    writer.flush().await.unwrap();
+
+    let mut sink = Vec::new();
+    let _ = timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut sink),
+    )
+    .await;
+    // The teardown runs after the loop exits; give the task a moment to finish.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    assert_eq!(
+        0,
+        broker.session_count(),
+        "malformed packet left the session registered — teardown was skipped"
+    );
+}
+
+/// The Will is the other half of the same defect, and the more visible one:
+/// a Will exists precisely to announce a connection that ended badly, and a
+/// malformed packet is exactly that case (MQTT-3.1.2-5).
+#[tokio::test]
+async fn malformed_packet_after_connect_publishes_the_will() {
+    let (port, _broker) = start_broker().await;
+
+    // Subscriber waits on the will topic.
+    let (mut sub_reader, mut sub_writer) = connect_raw(port).await;
+    send_packet(&mut sub_writer, &connect_packet("will-watcher")).await;
+    let _ = read_packet(&mut sub_reader).await;
+    send_packet(
+        &mut sub_writer,
+        &Packet::Subscribe(SubscribePacket {
+            packet_id: 1,
+            subscriptions: vec![TopicSubscription {
+                topic: Arc::from("gone/#"),
+                qos: QoS::AtMostOnce,
+            }],
+        }),
+    )
+    .await;
+    let _ = read_packet(&mut sub_reader).await;
+
+    // Publisher connects with a will, then sends garbage.
+    let (mut pub_reader, mut pub_writer) = connect_raw(port).await;
+    let mut connect = match connect_packet("dies-badly") {
+        Packet::Connect(c) => c,
+        _ => unreachable!(),
+    };
+    connect.will = Some(hotaru_mqtt::WillPacket {
+        topic: Arc::from("gone/dies-badly"),
+        payload: bytes::Bytes::from_static(b"offline"),
+        qos: QoS::AtMostOnce,
+        retain: false,
+    });
+    send_packet(&mut pub_writer, &Packet::Connect(connect)).await;
+    let _ = read_packet(&mut pub_reader).await;
+
+    pub_writer.write_all(&[0xF0, 0x00]).await.unwrap();
+    pub_writer.flush().await.unwrap();
+
+    match read_packet(&mut sub_reader).await {
+        Packet::Publish(p) => {
+            assert_eq!("gone/dies-badly", &*p.topic);
+            assert_eq!(&b"offline"[..], &p.payload[..]);
+        }
+        other => panic!("expected the will publish, got {other:?}"),
+    }
+}
