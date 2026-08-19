@@ -113,6 +113,100 @@ impl MqttSession {
     /// session of the newer one — silently clearing an inflight entry that
     /// was never actually delivered. The caller already holds the channel the
     /// ack arrived on, so there is nothing to look up.
+    /// Park a waiter for a publish-flow ack (PUBACK / PUBREC / PUBCOMP) under
+    /// `packet_id`, and hand back the receiving half to await.
+    ///
+    /// The oneshot pair is created in here so that a call site cannot pair the
+    /// wrong sender with the wrong slot kind — the kind decides the slot, in
+    /// one place.
+    pub fn park_publish_ack_waiter(
+        &self,
+        packet_id: PacketId,
+        kind: AckKind,
+    ) -> oneshot::Receiver<PacketId> {
+        let (sender, receiver) = oneshot::channel();
+        let slot = match kind {
+            AckKind::Puback => AckSlot::Puback(sender),
+            AckKind::Pubrec => AckSlot::Pubrec(sender),
+            AckKind::Pubcomp => AckSlot::Pubcomp(sender),
+        };
+        self.pending_acks.insert(packet_id, slot);
+        receiver
+    }
+
+    /// Park a waiter for the SUBACK answering the SUBSCRIBE sent as `packet_id`.
+    pub fn park_suback_waiter(&self, packet_id: PacketId) -> oneshot::Receiver<Vec<SubackCode>> {
+        let (sender, receiver) = oneshot::channel();
+        self.pending_acks.insert(packet_id, AckSlot::Suback(sender));
+        receiver
+    }
+
+    /// Park a waiter for the UNSUBACK answering the UNSUBSCRIBE sent as `packet_id`.
+    pub fn park_unsuback_waiter(&self, packet_id: PacketId) -> oneshot::Receiver<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.pending_acks.insert(packet_id, AckSlot::Unsuback(sender));
+        receiver
+    }
+
+    /// Give up on a parked waiter (ack timeout). Removing the slot drops its
+    /// sender, which resolves the abandoned receiver immediately — but the
+    /// caller that parked it is the one abandoning it, so nobody is waiting.
+    pub fn cancel_ack_waiter(&self, packet_id: PacketId) {
+        self.pending_acks.remove(&packet_id);
+    }
+
+    /// Wake the waiter parked for the SUBACK of `packet_id`, delivering the
+    /// per-filter verdicts. A slot of any other kind is left untouched, for
+    /// the same reason `wake_ack_waiter` leaves mismatches alone: consuming a
+    /// waiter this packet cannot satisfy fabricates a `ChannelClosed`.
+    pub fn wake_suback_waiter(&self, packet_id: PacketId, return_codes: Vec<SubackCode>) {
+        let Some(entry) = self.pending_acks.get(&packet_id) else {
+            return; // nobody parked here — W §4 silent
+        };
+        let parked_is_suback = matches!(entry.value(), AckSlot::Suback(_));
+        drop(entry); // release the read guard before removing under the same key
+        if !parked_is_suback {
+            return;
+        }
+        let Some((_, slot)) = self.pending_acks.remove(&packet_id) else {
+            return; // raced with another waker; it did the work
+        };
+        match slot {
+            AckSlot::Suback(waiter) => {
+                let _ = waiter.send(return_codes); // W policy §3
+            }
+            other => {
+                // Kind changed between the two lookups; this packet does not
+                // own the slot. Put it back.
+                self.pending_acks.insert(packet_id, other);
+            }
+        }
+    }
+
+    /// Wake the waiter parked for the UNSUBACK of `packet_id`. Same contract
+    /// as [`MqttSession::wake_suback_waiter`].
+    pub fn wake_unsuback_waiter(&self, packet_id: PacketId) {
+        let Some(entry) = self.pending_acks.get(&packet_id) else {
+            return; // nobody parked here — W §4 silent
+        };
+        let parked_is_unsuback = matches!(entry.value(), AckSlot::Unsuback(_));
+        drop(entry);
+        if !parked_is_unsuback {
+            return;
+        }
+        let Some((_, slot)) = self.pending_acks.remove(&packet_id) else {
+            return;
+        };
+        match slot {
+            AckSlot::Unsuback(waiter) => {
+                let _ = waiter.send(()); // W policy §3
+            }
+            other => {
+                self.pending_acks.insert(packet_id, other);
+            }
+        }
+    }
+
     pub fn wake_ack_waiter(&self, packet_id: PacketId, expected: AckKind) {
         let Some(entry) = self.pending_acks.get(&packet_id) else {
             return; // nobody parked here — W §4 silent

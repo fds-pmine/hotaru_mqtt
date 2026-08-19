@@ -18,7 +18,6 @@ use hotaru_core::connection::{ConnStream, TransportSpec};
 use hotaru_core::protocol::{Channel as _, CtxError, Protocol, ProtocolFlow, ProtocolRole};
 use hotaru_core::url::UrlRoot;
 use tokio::io::BufReader;
-use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 use crate::broker::{Broker, incoming_from_packet};
@@ -34,7 +33,7 @@ use crate::packet::{
 use crate::request::{
     MqttRequest, MqttResponse, PublishAck, PublishRequest, QoS, TopicFilter,
 };
-use crate::session::{AckKind, AckSlot, BindInfo};
+use crate::session::{AckKind, BindInfo};
 
 // ----------------------------------------------------------------------------
 // Constants
@@ -450,12 +449,14 @@ where
             channel.send_packet(Packet::Pubcomp(id))?;
             Ok(false)
         }
-        Packet::Suback(s) => {
-            fire_suback(&channel, s);
+        Packet::Suback(suback) => {
+            channel
+                .session()
+                .wake_suback_waiter(suback.packet_id, suback.return_codes);
             Ok(false)
         }
-        Packet::Unsuback(id) => {
-            fire_unsuback(&channel, id);
+        Packet::Unsuback(packet_id) => {
+            channel.session().wake_unsuback_waiter(packet_id);
             Ok(false)
         }
         Packet::Pingresp => Ok(false),
@@ -948,54 +949,48 @@ async fn send_publish<W: ConnStream>(
             Ok(MqttResponse::Published(PublishAck::Sent))
         }
         QoS::AtLeastOnce => {
-            let id = packet_id.expect("alloc'd above");
-            let (tx, rx) = oneshot::channel();
-            channel
+            let packet_id = packet_id.expect("alloc'd above");
+            let puback_received = channel
                 .session()
-                .pending_acks
-                .insert(id, AckSlot::Puback(tx));
+                .park_publish_ack_waiter(packet_id, AckKind::Puback);
             channel.send_publish(packet)?;
-            let acked = timeout(DEFAULT_ACK_TIMEOUT, rx)
+            let acknowledged_id = timeout(DEFAULT_ACK_TIMEOUT, puback_received)
                 .await
-                .map_err(|_| {
-                    channel.session().pending_acks.remove(&id);
+                .map_err(|_timed_out| {
+                    channel.session().cancel_ack_waiter(packet_id);
                     MqttError::Timeout(TimeoutKind::Ack)
                 })?
-                .map_err(|_| MqttError::ChannelClosed)?;
-            Ok(MqttResponse::Published(PublishAck::Acknowledged(acked)))
+                .map_err(|_sender_dropped| MqttError::ChannelClosed)?;
+            Ok(MqttResponse::Published(PublishAck::Acknowledged(acknowledged_id)))
         }
         QoS::ExactlyOnce => {
-            let id = packet_id.expect("alloc'd above");
+            let packet_id = packet_id.expect("alloc'd above");
             // Two-phase: PUBREC first, then PUBCOMP after we send PUBREL.
-            let (rec_tx, rec_rx) = oneshot::channel();
-            channel
+            let pubrec_received = channel
                 .session()
-                .pending_acks
-                .insert(id, AckSlot::Pubrec(rec_tx));
+                .park_publish_ack_waiter(packet_id, AckKind::Pubrec);
             channel.send_publish(packet)?;
-            timeout(DEFAULT_ACK_TIMEOUT, rec_rx)
+            timeout(DEFAULT_ACK_TIMEOUT, pubrec_received)
                 .await
-                .map_err(|_| {
-                    channel.session().pending_acks.remove(&id);
+                .map_err(|_timed_out| {
+                    channel.session().cancel_ack_waiter(packet_id);
                     MqttError::Timeout(TimeoutKind::Ack)
                 })?
-                .map_err(|_| MqttError::ChannelClosed)?;
+                .map_err(|_sender_dropped| MqttError::ChannelClosed)?;
 
             // PUBREL was sent by the inbound dispatch when PUBREC fired.
             // Now wait for PUBCOMP.
-            let (comp_tx, comp_rx) = oneshot::channel();
-            channel
+            let pubcomp_received = channel
                 .session()
-                .pending_acks
-                .insert(id, AckSlot::Pubcomp(comp_tx));
-            let comp_id = timeout(DEFAULT_ACK_TIMEOUT, comp_rx)
+                .park_publish_ack_waiter(packet_id, AckKind::Pubcomp);
+            let completed_id = timeout(DEFAULT_ACK_TIMEOUT, pubcomp_received)
                 .await
-                .map_err(|_| {
-                    channel.session().pending_acks.remove(&id);
+                .map_err(|_timed_out| {
+                    channel.session().cancel_ack_waiter(packet_id);
                     MqttError::Timeout(TimeoutKind::Ack)
                 })?
-                .map_err(|_| MqttError::ChannelClosed)?;
-            Ok(MqttResponse::Published(PublishAck::Completed(comp_id)))
+                .map_err(|_sender_dropped| MqttError::ChannelClosed)?;
+            Ok(MqttResponse::Published(PublishAck::Completed(completed_id)))
         }
     }
 }
@@ -1005,11 +1000,7 @@ async fn send_subscribe<W: ConnStream>(
     filters: Vec<TopicFilter>,
 ) -> Result<MqttResponse, MqttError> {
     let packet_id = channel.session().allocate_packet_id();
-    let (tx, rx) = oneshot::channel();
-    channel
-        .session()
-        .pending_acks
-        .insert(packet_id, AckSlot::Suback(tx));
+    let suback_received = channel.session().park_suback_waiter(packet_id);
     let subs: Vec<TopicSubscription> = filters
         .into_iter()
         .map(|f| TopicSubscription {
@@ -1021,14 +1012,14 @@ async fn send_subscribe<W: ConnStream>(
         packet_id,
         subscriptions: subs,
     }))?;
-    let codes = timeout(DEFAULT_ACK_TIMEOUT, rx)
+    let return_codes = timeout(DEFAULT_ACK_TIMEOUT, suback_received)
         .await
-        .map_err(|_| {
-            channel.session().pending_acks.remove(&packet_id);
+        .map_err(|_timed_out| {
+            channel.session().cancel_ack_waiter(packet_id);
             MqttError::Timeout(TimeoutKind::Ack)
         })?
-        .map_err(|_| MqttError::ChannelClosed)?;
-    Ok(MqttResponse::Subscribed(codes))
+        .map_err(|_sender_dropped| MqttError::ChannelClosed)?;
+    Ok(MqttResponse::Subscribed(return_codes))
 }
 
 async fn send_unsubscribe<W: ConnStream>(
@@ -1036,47 +1027,19 @@ async fn send_unsubscribe<W: ConnStream>(
     topics: Vec<Arc<str>>,
 ) -> Result<MqttResponse, MqttError> {
     let packet_id = channel.session().allocate_packet_id();
-    let (tx, rx) = oneshot::channel();
-    channel
-        .session()
-        .pending_acks
-        .insert(packet_id, AckSlot::Unsuback(tx));
+    let unsuback_received = channel.session().park_unsuback_waiter(packet_id);
     channel.send_packet(Packet::Unsubscribe(UnsubscribePacket {
         packet_id,
         topics,
     }))?;
-    timeout(DEFAULT_ACK_TIMEOUT, rx)
+    timeout(DEFAULT_ACK_TIMEOUT, unsuback_received)
         .await
-        .map_err(|_| {
-            channel.session().pending_acks.remove(&packet_id);
+        .map_err(|_timed_out| {
+            channel.session().cancel_ack_waiter(packet_id);
             MqttError::Timeout(TimeoutKind::Ack)
         })?
-        .map_err(|_| MqttError::ChannelClosed)?;
+        .map_err(|_sender_dropped| MqttError::ChannelClosed)?;
     Ok(MqttResponse::Unsubscribed)
-}
-
-// ============================================================================
-// Ack delivery helpers
-// ============================================================================
-
-fn fire_suback<W: ConnStream>(channel: &MqttChannel<W>, packet: SubackPacket) {
-    if let Some((_, slot)) = channel
-        .session()
-        .pending_acks
-        .remove(&packet.packet_id)
-    {
-        if let AckSlot::Suback(tx) = slot {
-            let _ = tx.send(packet.return_codes);
-        }
-    }
-}
-
-fn fire_unsuback<W: ConnStream>(channel: &MqttChannel<W>, id: u16) {
-    if let Some((_, slot)) = channel.session().pending_acks.remove(&id) {
-        if let AckSlot::Unsuback(tx) = slot {
-            let _ = tx.send(());
-        }
-    }
 }
 
 // ============================================================================

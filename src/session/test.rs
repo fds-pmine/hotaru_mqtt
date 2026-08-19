@@ -95,6 +95,53 @@ fn waking_an_unparked_id_is_a_no_op() {
     session.wake_ack_waiter(99, AckKind::Puback);
 }
 
+/// Parking hands back the receiver that the matching wake fires — the
+/// round trip that every outbound send relies on.
+#[test]
+fn parking_then_waking_delivers_the_suback_codes() {
+    let session = MqttSession::new();
+    let mut suback_received = session.park_suback_waiter(7);
+
+    session.wake_suback_waiter(7, vec![crate::request::SubackCode::Failure]);
+
+    assert_eq!(
+        Ok(vec![crate::request::SubackCode::Failure]),
+        suback_received.try_recv().map_err(|_| ())
+            .map_err(|_| panic!("waiter was not woken"))
+    );
+    assert!(session.pending_acks.get(&7).is_none());
+}
+
+/// A publish ack must not consume a SUBACK slot, and a SUBACK must not
+/// consume a publish slot — the guard works in both directions.
+#[test]
+fn suback_wake_leaves_a_publish_slot_alone() {
+    let session = MqttSession::new();
+    let mut pubcomp_received = session.park_publish_ack_waiter(7, AckKind::Pubcomp);
+
+    session.wake_suback_waiter(7, vec![]);
+    session.wake_unsuback_waiter(7);
+
+    assert!(session.pending_acks.get(&7).is_some(),
+            "a SUBACK/UNSUBACK consumed a publish-flow slot");
+    assert!(matches!(
+        pubcomp_received.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    // And the ack it is actually waiting for still works.
+    session.wake_ack_waiter(7, AckKind::Pubcomp);
+    assert_eq!(Ok(7), pubcomp_received.blocking_recv());
+}
+
+/// Cancelling (ack timeout) removes the slot so a late ack is a no-op.
+#[test]
+fn cancelling_a_waiter_empties_the_slot() {
+    let session = MqttSession::new();
+    let _unsuback_received = session.park_unsuback_waiter(9);
+    session.cancel_ack_waiter(9);
+    assert!(session.pending_acks.get(&9).is_none());
+}
+
 /// SUBACK and UNSUBACK slots share the same map but are not `AckKind`s, so
 /// no publish ack may disturb them.
 #[test]
