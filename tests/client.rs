@@ -24,8 +24,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 use hotaru_mqtt::{
-    CLIENT_CONFIG_STATICS_KEY, ConnackPacket, ConnackReturnCode, MQTT, MqttClientConfig,
-    Packet, PublishPacket, QoS, SubackCode, SubackPacket, WillMessage, codec,
+    CLIENT_CONFIG_STATICS_KEY, ConnackPacket, ConnackReturnCode, MQTT, MqttChannel,
+    MqttClientConfig, MqttContext, MqttError, MqttRequest, MqttResponse, Packet,
+    PublishAck, PublishPacket, PublishRequest, QoS, SubackCode, SubackPacket,
+    TopicFilter, WillMessage, codec,
 };
 
 /// Test reads are not exercising the size cap.
@@ -48,6 +50,18 @@ type FakeBroker = (
 /// The registry is still built, because it is what produces the `UrlRoot` the
 /// session loop dispatches inbound publishes through.
 async fn start_client(config: MqttClientConfig) -> FakeBroker {
+    start_client_with_channel(config).await.0
+}
+
+/// As `start_client`, but also hands back the session's `MqttChannel`.
+///
+/// Outbound sends need it: `Protocol::send` takes a context with a channel
+/// installed, and the channel is created inside the session task. Returning a
+/// clone is enough — `MqttChannel` is `Clone` and every clone shares one
+/// session, which is exactly the sharing the ack slots rely on.
+async fn start_client_with_channel(
+    config: MqttClientConfig,
+) -> (FakeBroker, MqttChannel<TcpStream>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
 
@@ -65,10 +79,12 @@ async fn start_client(config: MqttClientConfig) -> FakeBroker {
         statics,
     ));
 
+    let (chan_tx, chan_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let (read_half, write_half, meta) = ConnStream::split(stream);
         let channel = MQTT::client().open_channel(BufReader::new(read_half), write_half, meta);
+        let _ = chan_tx.send(channel.clone());
         let _ = <MQTT as Protocol>::handle(&channel, runtime, root).await;
     });
 
@@ -77,7 +93,29 @@ async fn start_client(config: MqttClientConfig) -> FakeBroker {
         .expect("client never dialled")
         .unwrap();
     let (r, w) = stream.into_split();
-    (BufReader::new(r), w)
+    let channel = chan_rx.await.expect("session task dropped the channel");
+    ((BufReader::new(r), w), channel)
+}
+
+/// Drive one outbound request the way `run!` would: build a context, install
+/// the channel, hand it to `Protocol::send`.
+async fn protocol_send(
+    channel: &MqttChannel<TcpStream>,
+    request: MqttRequest,
+) -> Result<MqttResponse, MqttError> {
+    let mut ctx: MqttContext = MqttContext::default();
+    ctx.request = request;
+    <MQTT as Protocol>::install_channel(&mut ctx, channel.clone());
+    <MQTT as Protocol>::send(ctx).await.map(|c| c.response)
+}
+
+fn publish_request(topic: &str, qos: QoS) -> MqttRequest {
+    MqttRequest::Publish(PublishRequest {
+        topic: Arc::from(topic),
+        payload: bytes::Bytes::from_static(b"payload"),
+        qos,
+        retain: false,
+    })
 }
 
 async fn send(writer: &mut tokio::net::tcp::OwnedWriteHalf, packet: &Packet) {
@@ -383,3 +421,224 @@ async fn a_broker_disconnect_ends_the_session() {
     );
 }
 
+// ----------------------------------------------------------------------------
+// Outbound: Protocol::send
+// ----------------------------------------------------------------------------
+//
+// These four paths allocate a packet id, park an `AckSlot` in the session, put
+// the packet on the wire, and wait. The inbound loop is what wakes them, via
+// `fire_ack` / `fire_suback` / `fire_unsuback` — so an outbound send only works
+// if the two halves agree on the slot. Nothing here had ever been executed, and
+// the matched arms of all three `fire_*` helpers were unreachable in test.
+//
+// Every case runs the send concurrently with the peer's script, because the
+// send does not return until the peer answers. Running them in sequence would
+// deadlock the test rather than the code.
+
+/// QoS 0 is fire-and-forget: no id, no slot, no wait.
+#[tokio::test]
+async fn a_qos0_publish_returns_without_waiting() {
+    let (mut peer, channel) = start_client_with_channel(MqttClientConfig::new("q0-out")).await;
+    handshake(&mut peer).await;
+
+    let response = timeout(
+        Duration::from_secs(2),
+        protocol_send(&channel, publish_request("out/0", QoS::AtMostOnce)),
+    )
+    .await
+    .expect("QoS 0 send must not wait for anything")
+    .expect("send failed");
+
+    assert!(matches!(response, MqttResponse::Published(PublishAck::Sent)));
+    match recv(&mut peer.0).await {
+        Packet::Publish(p) => {
+            assert_eq!("out/0", &*p.topic);
+            assert_eq!(QoS::AtMostOnce, p.qos);
+            assert!(p.packet_id.is_none(), "QoS 0 must carry no packet id");
+        }
+        other => panic!("expected PUBLISH, got {other:?}"),
+    }
+}
+
+/// QoS 1 parks on `AckSlot::Puback`; the PUBACK arm of `fire_ack` is what
+/// releases it.
+#[tokio::test]
+async fn a_qos1_publish_resolves_when_the_puback_arrives() {
+    let (mut peer, channel) = start_client_with_channel(MqttClientConfig::new("q1-out")).await;
+    handshake(&mut peer).await;
+
+    let script = async {
+        let id = match recv(&mut peer.0).await {
+            Packet::Publish(p) => {
+                assert_eq!(QoS::AtLeastOnce, p.qos);
+                p.packet_id.expect("QoS 1 must carry a packet id")
+            }
+            other => panic!("expected PUBLISH, got {other:?}"),
+        };
+        send(&mut peer.1, &Packet::Puback(id)).await;
+        id
+    };
+
+    let (response, id) = tokio::join!(
+        protocol_send(&channel, publish_request("out/1", QoS::AtLeastOnce)),
+        script,
+    );
+
+    match response.expect("send failed") {
+        MqttResponse::Published(PublishAck::Acknowledged(acked)) => assert_eq!(id, acked),
+        other => panic!("expected Acknowledged, got {other:?}"),
+    }
+}
+
+/// QoS 2 is two waits with a client-sent PUBREL between them, so it covers the
+/// PUBREC and PUBCOMP arms of `fire_ack` in one pass.
+#[tokio::test]
+async fn a_qos2_publish_walks_the_whole_handshake() {
+    let (mut peer, channel) = start_client_with_channel(MqttClientConfig::new("q2-out")).await;
+    handshake(&mut peer).await;
+
+    let script = async {
+        let id = match recv(&mut peer.0).await {
+            Packet::Publish(p) => {
+                assert_eq!(QoS::ExactlyOnce, p.qos);
+                p.packet_id.expect("QoS 2 must carry a packet id")
+            }
+            other => panic!("expected PUBLISH, got {other:?}"),
+        };
+        send(&mut peer.1, &Packet::Pubrec(id)).await;
+        // The client answers PUBREC with PUBREL from its inbound loop.
+        match recv(&mut peer.0).await {
+            Packet::Pubrel(rel) => assert_eq!(id, rel),
+            other => panic!("expected PUBREL, got {other:?}"),
+        }
+        send(&mut peer.1, &Packet::Pubcomp(id)).await;
+        id
+    };
+
+    let (response, id) = tokio::join!(
+        protocol_send(&channel, publish_request("out/2", QoS::ExactlyOnce)),
+        script,
+    );
+
+    match response.expect("send failed") {
+        MqttResponse::Published(PublishAck::Completed(done)) => assert_eq!(id, done),
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+/// The granted QoS codes must reach the caller. This is the one place in the
+/// crate where a SUBACK's verdict is surfaced rather than dropped — the
+/// startup path discards it (see the initial-subscription issue), so without
+/// this test nothing pins that the runtime path behaves differently.
+#[tokio::test]
+async fn subscribe_returns_the_granted_codes() {
+    let (mut peer, channel) = start_client_with_channel(MqttClientConfig::new("sub-out")).await;
+    handshake(&mut peer).await;
+
+    let script = async {
+        match recv(&mut peer.0).await {
+            Packet::Subscribe(s) => {
+                assert_eq!(2, s.subscriptions.len());
+                assert_eq!("ok/topic", &*s.subscriptions[0].topic);
+                assert_eq!("denied/topic", &*s.subscriptions[1].topic);
+                send(
+                    &mut peer.1,
+                    &Packet::Suback(SubackPacket {
+                        packet_id: s.packet_id,
+                        // One granted, one refused — a rejection must survive
+                        // the trip back to the caller, not be flattened.
+                        return_codes: vec![
+                            SubackCode::Granted(QoS::AtLeastOnce),
+                            SubackCode::Failure,
+                        ],
+                    }),
+                )
+                .await;
+            }
+            other => panic!("expected SUBSCRIBE, got {other:?}"),
+        }
+    };
+
+    let request = MqttRequest::Subscribe(vec![
+        TopicFilter::new("ok/topic", QoS::AtLeastOnce),
+        TopicFilter::new("denied/topic", QoS::AtLeastOnce),
+    ]);
+    let (response, ()) = tokio::join!(protocol_send(&channel, request), script);
+
+    match response.expect("send failed") {
+        MqttResponse::Subscribed(codes) => {
+            assert_eq!(2, codes.len());
+            assert!(matches!(codes[0], SubackCode::Granted(QoS::AtLeastOnce)));
+            assert!(
+                matches!(codes[1], SubackCode::Failure),
+                "a refused filter must reach the caller as Failure, got {:?}",
+                codes[1]
+            );
+        }
+        other => panic!("expected Subscribed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn unsubscribe_resolves_when_the_unsuback_arrives() {
+    let (mut peer, channel) = start_client_with_channel(MqttClientConfig::new("unsub-out")).await;
+    handshake(&mut peer).await;
+
+    let script = async {
+        match recv(&mut peer.0).await {
+            Packet::Unsubscribe(u) => {
+                assert_eq!(1, u.topics.len());
+                assert_eq!("drop/me", &*u.topics[0]);
+                send(&mut peer.1, &Packet::Unsuback(u.packet_id)).await;
+            }
+            other => panic!("expected UNSUBSCRIBE, got {other:?}"),
+        }
+    };
+
+    let request = MqttRequest::Unsubscribe(vec![Arc::from("drop/me")]);
+    let (response, ()) = tokio::join!(protocol_send(&channel, request), script);
+    assert!(matches!(
+        response.expect("send failed"),
+        MqttResponse::Unsubscribed
+    ));
+}
+
+/// Two outbound sends in flight at once must not collide: each parks its own
+/// slot under its own id, and each must be released by its own ack.
+#[tokio::test]
+async fn concurrent_sends_get_their_own_acks() {
+    let (mut peer, channel) = start_client_with_channel(MqttClientConfig::new("two-out")).await;
+    handshake(&mut peer).await;
+
+    let script = async {
+        let first = match recv(&mut peer.0).await {
+            Packet::Publish(p) => p.packet_id.unwrap(),
+            other => panic!("expected PUBLISH, got {other:?}"),
+        };
+        let second = match recv(&mut peer.0).await {
+            Packet::Publish(p) => p.packet_id.unwrap(),
+            other => panic!("expected PUBLISH, got {other:?}"),
+        };
+        assert_ne!(first, second, "two inflight publishes must get distinct ids");
+        // Answered out of order on purpose: resolution is by id, not arrival.
+        send(&mut peer.1, &Packet::Puback(second)).await;
+        send(&mut peer.1, &Packet::Puback(first)).await;
+        (first, second)
+    };
+
+    let (a, b, (first, second)) = tokio::join!(
+        protocol_send(&channel, publish_request("out/a", QoS::AtLeastOnce)),
+        protocol_send(&channel, publish_request("out/b", QoS::AtLeastOnce)),
+        script,
+    );
+
+    let acked = |r: Result<MqttResponse, MqttError>| match r.expect("send failed") {
+        MqttResponse::Published(PublishAck::Acknowledged(id)) => id,
+        other => panic!("expected Acknowledged, got {other:?}"),
+    };
+    let mut got = [acked(a), acked(b)];
+    got.sort_unstable();
+    let mut want = [first, second];
+    want.sort_unstable();
+    assert_eq!(want, got, "each send must resolve with its own packet id");
+}
