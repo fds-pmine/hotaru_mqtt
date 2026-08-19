@@ -433,6 +433,12 @@ where
         retain: w.retain,
     });
 
+    // The channel already carries an id that is unique per connection and
+    // stable across its clones; the client_id stops being unique the moment a
+    // takeover is in flight, so every broker call that means "this connection"
+    // rather than "this name" takes this alongside it.
+    let connection_id = channel.connection_id();
+
     // 3. Register session (broker takes channel clone)
     let session_present = broker
         .register_session(client_id.clone(), channel.clone(), will, clean_session)
@@ -452,7 +458,7 @@ where
         session_present,
         return_code: ConnackReturnCode::Accepted,
     })) {
-        broker.unregister_session(&client_id, false).await;
+        broker.unregister_session(&client_id, connection_id, false).await;
         return Err(e);
     }
 
@@ -491,6 +497,7 @@ where
                             channel.clone(),
                             broker.clone(),
                             &client_id,
+                            connection_id,
                             p,
                             runtime.clone(),
                             root.clone(),
@@ -507,7 +514,7 @@ where
 
     // 6. Unregister (graceful flag drives Will trigger). Single exit: this runs
     //    on every path out of the loop, including the failing ones.
-    broker.unregister_session(&client_id, graceful).await;
+    broker.unregister_session(&client_id, connection_id, graceful).await;
     if let Some(e) = terminal_error {
         // Still reported to the framework, just after cleanup rather than
         // instead of it. `graceful` stays false on this path, which is what
@@ -521,6 +528,7 @@ async fn dispatch_server_inbound<W, TS>(
     channel: MqttChannel<W>,
     broker: Broker<W>,
     client_id: &Arc<str>,
+    connection_id: u64,
     packet: Packet,
     runtime: Arc<RuntimeConfig>,
     root: Arc<UrlRoot<MqttContext<TS>, TS>>,
@@ -559,7 +567,7 @@ where
                     qos: ts.qos,
                 })
                 .collect();
-            let codes = broker.subscribe(client_id, &filters).await;
+            let codes = broker.subscribe(client_id, connection_id, &filters).await;
             channel.send_packet(Packet::Suback(SubackPacket {
                 packet_id: s.packet_id,
                 return_codes: codes,
@@ -567,7 +575,7 @@ where
             Ok(())
         }
         Packet::Unsubscribe(u) => {
-            broker.unsubscribe(client_id, &u.topics).await;
+            broker.unsubscribe(client_id, connection_id, &u.topics).await;
             channel.send_packet(Packet::Unsuback(u.packet_id))?;
             Ok(())
         }
@@ -576,7 +584,11 @@ where
             Ok(())
         }
         Packet::Puback(id) => {
-            broker.ack_outbound(client_id, id).await;
+            // Settled against the channel the ack arrived on, not by looking
+            // the client_id up in the broker: during a takeover that name
+            // resolves to the newer connection and this ack belongs to the
+            // earlier one. The PUBREL arm below already resolves this way.
+            channel.session().discharge_outbound_ack(id);
             Ok(())
         }
         Packet::Pubrec(id) => {
@@ -585,7 +597,7 @@ where
             Ok(())
         }
         Packet::Pubcomp(id) => {
-            broker.ack_outbound(client_id, id).await;
+            channel.session().discharge_outbound_ack(id);
             Ok(())
         }
         Packet::Pubrel(id) => {
