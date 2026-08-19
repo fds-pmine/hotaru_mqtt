@@ -34,7 +34,7 @@ use crate::packet::{
 use crate::request::{
     MqttRequest, MqttResponse, PublishAck, PublishRequest, QoS, TopicFilter,
 };
-use crate::session::{AckSlot, BindInfo};
+use crate::session::{AckKind, AckSlot, BindInfo};
 
 // ----------------------------------------------------------------------------
 // Constants
@@ -426,20 +426,20 @@ where
             dispatch_inbound_to_endpoints(channel, &publish, runtime, root, config.default_inbound.as_ref()).await;
             Ok(false)
         }
-        Packet::Puback(id) => {
-            fire_ack(&channel, id, AckKind::Puback);
-            channel.session().outbound_inflight.remove(&id);
+        Packet::Puback(packet_id) => {
+            channel.session().wake_ack_waiter(packet_id, AckKind::Puback);
+            channel.session().clear_outbound_inflight(packet_id);
             Ok(false)
         }
-        Packet::Pubrec(id) => {
+        Packet::Pubrec(packet_id) => {
             // QoS 2 phase 1: send PUBREL, wait for PUBCOMP
-            fire_ack(&channel, id, AckKind::Pubrec);
-            channel.send_packet(Packet::Pubrel(id))?;
+            channel.session().wake_ack_waiter(packet_id, AckKind::Pubrec);
+            channel.send_packet(Packet::Pubrel(packet_id))?;
             Ok(false)
         }
-        Packet::Pubcomp(id) => {
-            fire_ack(&channel, id, AckKind::Pubcomp);
-            channel.session().outbound_inflight.remove(&id);
+        Packet::Pubcomp(packet_id) => {
+            channel.session().wake_ack_waiter(packet_id, AckKind::Pubcomp);
+            channel.session().clear_outbound_inflight(packet_id);
             Ok(false)
         }
         Packet::Pubrel(id) => {
@@ -677,21 +677,28 @@ where
             channel.send_packet(Packet::Pingresp)?;
             Ok(())
         }
-        Packet::Puback(id) => {
+        Packet::Puback(packet_id) => {
             // Settled against the channel the ack arrived on, not by looking
             // the client_id up in the broker: during a takeover that name
             // resolves to the newer connection and this ack belongs to the
             // earlier one. The PUBREL arm below already resolves this way.
-            channel.session().discharge_outbound_ack(id);
+            channel.session().wake_ack_waiter(packet_id, AckKind::Puback);
+            channel.session().clear_outbound_inflight(packet_id);
             Ok(())
         }
-        Packet::Pubrec(id) => {
-            // QoS 2 outbound from broker to this sub, phase 1
-            channel.send_packet(Packet::Pubrel(id))?;
+        Packet::Pubrec(packet_id) => {
+            // QoS 2 phase 1. Waking the waiter is what lets `send_publish`
+            // proceed to park its PUBCOMP waiter; without it the flow stalls
+            // for the full ack timeout even though the peer answered.
+            channel.session().wake_ack_waiter(packet_id, AckKind::Pubrec);
+            // Deliberately no `clear_outbound_inflight`: the flow is half done,
+            // and the message has to stay retransmittable until PUBCOMP.
+            channel.send_packet(Packet::Pubrel(packet_id))?;
             Ok(())
         }
-        Packet::Pubcomp(id) => {
-            channel.session().discharge_outbound_ack(id);
+        Packet::Pubcomp(packet_id) => {
+            channel.session().wake_ack_waiter(packet_id, AckKind::Pubcomp);
+            channel.session().clear_outbound_inflight(packet_id);
             Ok(())
         }
         Packet::Pubrel(id) => {
@@ -1051,31 +1058,6 @@ async fn send_unsubscribe<W: ConnStream>(
 // ============================================================================
 // Ack delivery helpers
 // ============================================================================
-
-enum AckKind {
-    Puback,
-    Pubrec,
-    Pubcomp,
-}
-
-fn fire_ack<W: ConnStream>(channel: &MqttChannel<W>, id: u16, kind: AckKind) {
-    if let Some((_, slot)) = channel.session().pending_acks.remove(&id) {
-        match (slot, kind) {
-            (AckSlot::Puback(tx), AckKind::Puback) => {
-                let _ = tx.send(id); // W §3
-            }
-            (AckSlot::Pubrec(tx), AckKind::Pubrec) => {
-                let _ = tx.send(id);
-            }
-            (AckSlot::Pubcomp(tx), AckKind::Pubcomp) => {
-                let _ = tx.send(id);
-            }
-            _ => {
-                // Mismatched ack kind — protocol noise (W §4 silent)
-            }
-        }
-    }
-}
 
 fn fire_suback<W: ConnStream>(channel: &MqttChannel<W>, packet: SubackPacket) {
     if let Some((_, slot)) = channel
