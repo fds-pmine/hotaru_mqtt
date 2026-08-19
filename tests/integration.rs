@@ -1205,3 +1205,142 @@ async fn an_idle_connection_with_a_keep_alive_is_still_dropped() {
         "broker kept an idle keep_alive=1 connection past its 1.5s grace"
     );
 }
+
+// ----------------------------------------------------------------------------
+// Authentication refusal
+// ----------------------------------------------------------------------------
+
+/// An `Authenticator` that refuses everyone except one username, so both the
+/// deny path and the code it declares are exercised. Before this, no test
+/// implemented `Authenticator`, `AuthResult::reject` had zero callers anywhere,
+/// and the refusal branch in `handle_server` had never run.
+struct OnlyAlice;
+
+#[hotaru_mqtt::async_trait]
+impl hotaru_mqtt::Authenticator for OnlyAlice {
+    async fn authenticate(
+        &self,
+        connect: &ConnectPacket,
+        _remote_addr: Option<std::net::SocketAddr>,
+    ) -> hotaru_mqtt::AuthResult {
+        match connect.username.as_deref() {
+            Some("alice") => hotaru_mqtt::AuthResult::accept(),
+            _ => hotaru_mqtt::AuthResult::reject(ConnackReturnCode::NotAuthorized),
+        }
+    }
+}
+
+fn broker_with_auth() -> Broker<TcpStream> {
+    Broker::with_authenticator(Arc::new(OnlyAlice))
+}
+
+/// A refused CONNECT gets the authenticator's declared return code, leaves no
+/// session behind, and the connection closes.
+#[tokio::test]
+async fn a_refused_connect_gets_the_declared_code_and_no_session() {
+    let (port, broker) = start_broker_with(broker_with_auth()).await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    // No credentials at all — OnlyAlice refuses this.
+    send_packet(&mut writer, &connect_packet("stranger")).await;
+
+    match read_packet(&mut reader).await {
+        Packet::Connack(connack) => {
+            assert_eq!(ConnackReturnCode::NotAuthorized, connack.return_code);
+            assert!(!connack.session_present, "a refused CONNECT has no session");
+        }
+        other => panic!("expected the refusal CONNACK, got {other:?}"),
+    }
+
+    // The connection closes after the refusal...
+    let mut leftover = Vec::new();
+    let closed = timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut leftover),
+    )
+    .await;
+    assert!(closed.is_ok(), "connection should close after a refusal");
+    // ...and nothing was registered on the broker.
+    assert_eq!(0, broker.session_count(), "a refused CONNECT must not register");
+}
+
+/// A refused client's Will must not fire: it never had a session, so there is
+/// nothing whose death a Will could announce.
+#[tokio::test]
+async fn a_refused_connect_never_publishes_its_will() {
+    let (port, _broker) = start_broker_with(broker_with_auth()).await;
+
+    // Watcher connects as alice and subscribes to the would-be will topic.
+    let (mut watcher_reader, mut watcher_writer) = connect_raw(port).await;
+    let mut watcher_connect = match connect_packet("watcher") {
+        Packet::Connect(connect) => connect,
+        _ => unreachable!(),
+    };
+    watcher_connect.username = Some(Arc::from("alice"));
+    watcher_connect.password = Some(bytes::Bytes::from_static(b"pw"));
+    send_packet(&mut watcher_writer, &Packet::Connect(watcher_connect)).await;
+    match read_packet(&mut watcher_reader).await {
+        Packet::Connack(connack) => assert_eq!(ConnackReturnCode::Accepted, connack.return_code),
+        other => panic!("expected CONNACK, got {other:?}"),
+    }
+    send_packet(
+        &mut watcher_writer,
+        &Packet::Subscribe(SubscribePacket {
+            packet_id: 1,
+            subscriptions: vec![TopicSubscription {
+                topic: Arc::from("gone/#"),
+                qos: QoS::AtMostOnce,
+            }],
+        }),
+    )
+    .await;
+    let _ = read_packet(&mut watcher_reader).await;
+
+    // A stranger with a Will is refused.
+    let (mut refused_reader, mut refused_writer) = connect_raw(port).await;
+    let mut refused_connect = match connect_packet("stranger") {
+        Packet::Connect(connect) => connect,
+        _ => unreachable!(),
+    };
+    refused_connect.will = Some(hotaru_mqtt::WillPacket {
+        topic: Arc::from("gone/stranger"),
+        payload: bytes::Bytes::from_static(b"should never appear"),
+        qos: QoS::AtMostOnce,
+        retain: false,
+    });
+    send_packet(&mut refused_writer, &Packet::Connect(refused_connect)).await;
+    let _ = read_packet(&mut refused_reader).await; // the refusal CONNACK
+
+    // The watcher must hear nothing.
+    let waited = timeout(
+        Duration::from_millis(600),
+        codec::read_packet(&mut watcher_reader, ANY_SIZE),
+    )
+    .await;
+    assert!(
+        waited.is_err(),
+        "a refused client's Will was published: {waited:?}"
+    );
+}
+
+/// The accept half of the same authenticator still works — the refusal path
+/// must not have turned into "refuse everyone".
+#[tokio::test]
+async fn the_same_authenticator_still_accepts_valid_credentials() {
+    let (port, broker) = start_broker_with(broker_with_auth()).await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    let mut connect = match connect_packet("alice-client") {
+        Packet::Connect(connect) => connect,
+        _ => unreachable!(),
+    };
+    connect.username = Some(Arc::from("alice"));
+    connect.password = Some(bytes::Bytes::from_static(b"pw"));
+    send_packet(&mut writer, &Packet::Connect(connect)).await;
+
+    match read_packet(&mut reader).await {
+        Packet::Connack(connack) => assert_eq!(ConnackReturnCode::Accepted, connack.return_code),
+        other => panic!("expected CONNACK, got {other:?}"),
+    }
+    assert_eq!(1, broker.session_count());
+}
