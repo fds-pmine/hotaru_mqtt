@@ -120,7 +120,7 @@ fn publish_request(topic: &str, qos: QoS) -> MqttRequest {
 
 async fn send(writer: &mut tokio::net::tcp::OwnedWriteHalf, packet: &Packet) {
     writer
-        .write_all(&codec::encode_packet(packet))
+        .write_all(&codec::encode_packet(packet).expect("test packet must encode"))
         .await
         .unwrap();
     writer.flush().await.unwrap();

@@ -85,7 +85,7 @@ async fn connect_raw(
 }
 
 async fn send_packet(writer: &mut tokio::net::tcp::OwnedWriteHalf, packet: &Packet) {
-    let bytes = codec::encode_packet(packet);
+    let bytes = codec::encode_packet(packet).expect("test packet must encode");
     writer.write_all(&bytes).await.unwrap();
     writer.flush().await.unwrap();
 }
