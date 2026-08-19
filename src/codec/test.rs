@@ -2,6 +2,16 @@
 
 use super::*;
 
+use std::sync::Arc;
+
+use bytes::{Bytes, BytesMut};
+
+use crate::packet::{
+    ConnectPacket, Packet, PublishPacket, SubscribePacket, TopicSubscription,
+    UnsubscribePacket, WillPacket,
+};
+use crate::request::QoS;
+
 #[test]
 fn encode_decode_connect_round_trip() {
     let original = ConnectPacket {
