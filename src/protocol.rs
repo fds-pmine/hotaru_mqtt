@@ -18,6 +18,7 @@ use hotaru_core::connection::{ConnStream, TransportSpec};
 use hotaru_core::protocol::{Channel as _, CtxError, Protocol, ProtocolFlow, ProtocolRole};
 use hotaru_core::url::UrlRoot;
 use tokio::io::BufReader;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::broker::{Broker, incoming_from_packet};
@@ -560,6 +561,22 @@ where
     // 5. Main select loop with keep-alive deadline (1.5× grace per spec, and
     //    no deadline at all when the client declared keep_alive = 0)
     let read_deadline = server_read_deadline(keep_alive);
+
+    // Endpoint chains and fanout run on their own task (finding: an endpoint
+    // publishing QoS >= 1 over this same connection parks waiting for an ack
+    // that only this reader can deliver — with the chain inline, the reader
+    // was the thing being blocked). The queue is the handoff; see
+    // `run_publish_chain_worker` for the ordering contract.
+    let (publish_work_queue, publish_work) = mpsc::unbounded_channel::<PublishPacket>();
+    let chain_worker = tokio::spawn(run_publish_chain_worker(
+        channel.clone(),
+        broker.clone(),
+        client_id.clone(),
+        runtime.clone(),
+        root.clone(),
+        publish_work,
+    ));
+
     let mut graceful = false;
     // Every terminal condition sets state and breaks; nothing returns from
     // inside the loop. Teardown is written after the loop, so a `return` there
@@ -594,8 +611,7 @@ where
                             &client_id,
                             connection_id,
                             inbound,
-                            runtime.clone(),
-                            root.clone(),
+                            &publish_work_queue,
                         ).await {
                             terminal_error = Some(error);
                             break;
@@ -607,7 +623,19 @@ where
         }
     }
 
-    // 6. Unregister (graceful flag drives Will trigger). Single exit: this runs
+    // 6. Wind down the chain worker before unregistering, so the Will cannot
+    //    overtake publishes this connection already delivered. Dropping the
+    //    queue ends the worker's input; closing the channel resolves any ack
+    //    the worker is parked on (abandon drops the slot senders, which the
+    //    send path reports as ChannelClosed) — without the close, a worker
+    //    stuck waiting for an ack only our now-stopped reader could deliver
+    //    would hold teardown for the full ack timeout. Close is idempotent;
+    //    the framework closes again after handle() returns.
+    drop(publish_work_queue);
+    channel.close();
+    let _ = chain_worker.await;
+
+    //    Unregister (graceful flag drives Will trigger). Single exit: this runs
     //    on every path out of the loop, including the failing ones.
     broker.unregister_session(&client_id, connection_id, graceful).await;
     if let Some(e) = terminal_error {
@@ -619,38 +647,70 @@ where
     Ok(ProtocolFlow::Close)
 }
 
-async fn dispatch_server_inbound<W, TS>(
+/// The per-connection worker that runs endpoint chains and fanout, off the
+/// reader task.
+///
+/// One worker per connection, fed in arrival order over an unbounded queue, so
+/// this connection's publishes still reach the chain and the broker in the
+/// order they were sent — a `tokio::spawn` per publish would lose that. What
+/// the handoff buys is that the reader keeps draining the socket while a chain
+/// runs: the acks a chain-originated publish waits for can now actually
+/// arrive, which is the deadlock this split removes.
+///
+/// Exits when the sender side is dropped (connection teardown) and the queue
+/// is drained.
+async fn run_publish_chain_worker<W, TS>(
+    channel: MqttChannel<W>,
+    broker: Broker<W>,
+    source_client_id: Arc<str>,
+    runtime: Arc<RuntimeConfig>,
+    root: Arc<UrlRoot<MqttContext<TS>, TS>>,
+    mut publish_work: mpsc::UnboundedReceiver<PublishPacket>,
+) where
+    W: ConnStream,
+    TS: TransportSpec<Wire = W>,
+{
+    while let Some(publish) = publish_work.recv().await {
+        let fanout_packet = run_server_chain_then_decide_fanout(
+            channel.clone(),
+            publish,
+            runtime.clone(),
+            root.clone(),
+        )
+        .await;
+        if let Some(packet) = fanout_packet {
+            broker.publish(&source_client_id, packet).await;
+        }
+    }
+}
+
+async fn dispatch_server_inbound<W>(
     channel: MqttChannel<W>,
     broker: Broker<W>,
     client_id: &Arc<str>,
     connection_id: u64,
     packet: Packet,
-    runtime: Arc<RuntimeConfig>,
-    root: Arc<UrlRoot<MqttContext<TS>, TS>>,
+    publish_work_queue: &mpsc::UnboundedSender<PublishPacket>,
 ) -> Result<(), MqttError>
 where
     W: ConnStream,
-    TS: TransportSpec<Wire = W>,
 {
     match packet {
         Packet::Publish(publish) => {
-            // Ack BEFORE chain (O.2)
+            // Ack BEFORE chain (O.2) — still on the reader, before the
+            // handoff, so the ordering invariant is untouched by the split.
             ack_inbound_publish_pre_chain(&channel, &publish)?;
             // For QoS 2: stored in qos2_recv on ack; fanout happens when PUBREL arrives.
             if publish.qos == QoS::ExactlyOnce {
                 return Ok(());
             }
-            // QoS 0 / 1: Run endpoint chain then broker fanout
-            let fanout_packet = run_server_chain_then_decide_fanout(
-                channel.clone(),
-                publish.clone(),
-                runtime,
-                root,
-            )
-            .await;
-            if let Some(p) = fanout_packet {
-                broker.publish(client_id, p).await;
-            }
+            // QoS 0 / 1: hand the chain + fanout to the worker. The reader
+            // must not run user code — an endpoint publishing QoS >= 1 back
+            // over this connection waits for an ack only this reader can
+            // deliver.
+            publish_work_queue
+                .send(publish)
+                .map_err(|_worker_gone| MqttError::ChannelClosed)?;
             Ok(())
         }
         Packet::Subscribe(s) => {
@@ -702,30 +762,24 @@ where
             channel.session().clear_outbound_inflight(packet_id);
             Ok(())
         }
-        Packet::Pubrel(id) => {
-            // QoS 2 inbound publish phase 2: dispatch stored qos2_recv
-            if let Some((_, stored)) = channel.session().qos2_recv.remove(&id) {
-                // Re-build into a wire PublishPacket to run chain + fanout
+        Packet::Pubrel(packet_id) => {
+            // QoS 2 inbound publish phase 2: release the stored publish to the
+            // worker. PUBCOMP is sent from the reader right away — the peer's
+            // handshake must not wait on the chain.
+            if let Some((_, stored)) = channel.session().qos2_recv.remove(&packet_id) {
                 let publish = PublishPacket {
                     topic: stored.topic.clone(),
                     payload: stored.payload.clone(),
                     dup: false,
                     qos: stored.qos,
                     retain: stored.retain,
-                    packet_id: Some(id),
+                    packet_id: Some(packet_id),
                 };
-                let fanout_packet = run_server_chain_then_decide_fanout(
-                    channel.clone(),
-                    publish,
-                    runtime.clone(),
-                    root.clone(),
-                )
-                .await;
-                if let Some(p) = fanout_packet {
-                    broker.publish(client_id, p).await;
-                }
+                publish_work_queue
+                    .send(publish)
+                    .map_err(|_worker_gone| MqttError::ChannelClosed)?;
             }
-            channel.send_packet(Packet::Pubcomp(id))?;
+            channel.send_packet(Packet::Pubcomp(packet_id))?;
             Ok(())
         }
         Packet::Connect(_) => Err(Violation::SessionAlreadyBound.into()),
