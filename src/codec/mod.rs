@@ -14,12 +14,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use hotaru_core::protocol::Message;
 
-use crate::error::{CodecError, MqttError};
+use crate::error::{CodecError, MqttError, Violation};
 use crate::packet::{
     Packet,
     PacketType, PublishPacket,
 };
 use crate::request::QoS;
+use crate::safety::MqttSafety;
 
 mod decode;
 mod encode;
@@ -41,7 +42,15 @@ use varint::{decode_remaining_length_from_slice, encode_remaining_length,
 
 /// Read one complete MQTT packet from the async reader. Used by handle_*
 /// loops that own the reader directly (single-take pattern).
-pub async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Packet, MqttError> {
+///
+/// `max_size` bounds the declared remaining-length. The check sits between
+/// decoding that length and allocating the body, so an oversized declaration
+/// costs one fixed header and no heap — the peer never gets to pick an
+/// allocation size. Callers pass the value from their `MqttSafety`.
+pub async fn read_packet<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_size: usize,
+) -> Result<Packet, MqttError> {
     let mut header_byte = [0u8; 1];
     reader.read_exact(&mut header_byte).await?;
     let first = header_byte[0];
@@ -51,6 +60,15 @@ pub async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Packet,
         PacketType::try_from(raw_type).map_err(|_| CodecError::InvalidPacketType(raw_type))?;
 
     let remaining = read_remaining_length(reader).await?;
+    // Must stay above `vec![0u8; remaining]`. Moving it below would restore
+    // the exact defect it exists to close.
+    if remaining > max_size {
+        return Err(Violation::PacketTooLarge {
+            len: remaining,
+            max: max_size,
+        }
+        .into());
+    }
     let mut body = vec![0u8; remaining];
     reader.read_exact(&mut body).await?;
 
@@ -59,8 +77,13 @@ pub async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Packet,
 
 /// Try to decode one MQTT packet from a buffer. Returns `Ok(None)` if more
 /// bytes are needed. On success consumes the packet bytes from the buffer.
+///
+/// `max_size` carries the same meaning as in [`read_packet`]. The buffered
+/// path needs its own check: without it, framing this way would be a way
+/// around the cap rather than a second place enforcing it.
 pub fn decode_packet_from_bytes(
     buf: &mut BytesMut,
+    max_size: usize,
 ) -> Result<Option<Packet>, Box<dyn Error + Send + Sync>> {
     if buf.len() < 2 {
         return Ok(None);
@@ -74,6 +97,15 @@ pub fn decode_packet_from_bytes(
         Some(v) => v,
         None => return Ok(None),
     };
+
+    // Before the `buf.len() < total` wait: an oversized declaration must fail
+    // now, not sit here holding the connection open until the bytes arrive.
+    if remaining > max_size {
+        return Err(Box::new(MqttError::Protocol(Violation::PacketTooLarge {
+            len: remaining,
+            max: max_size,
+        })));
+    }
 
     let header_len = 1 + rl_bytes;
     let total = header_len + remaining;
@@ -170,7 +202,12 @@ impl Message for Packet {
         Ok(())
     }
 
+    /// The framework's `Message::decode` signature carries no configuration,
+    /// so there is no per-connection `MqttSafety` to read here. It applies the
+    /// default cap rather than the spec ceiling: this path is not reachable
+    /// with an operator's chosen value, and defaulting to "whatever the wire
+    /// format can express" would leave a 256 MiB hole beside a 1 MiB door.
     fn decode(buf: &mut Self::BytesMut) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
-        decode_packet_from_bytes(buf)
+        decode_packet_from_bytes(buf, MqttSafety::new().max_packet_size())
     }
 }

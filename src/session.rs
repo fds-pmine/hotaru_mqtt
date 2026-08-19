@@ -90,6 +90,25 @@ impl MqttSession {
         if id == 0 { 1 } else { id }
     }
 
+    /// Settle one outbound QoS>=1 ack against *this* session: drop the
+    /// inflight record and wake any waiter.
+    ///
+    /// Resolution is connection-local by construction. The broker's session
+    /// map is keyed on client_id alone, which stops telling two connections
+    /// apart the moment a takeover is in flight, so a by-name lookup can
+    /// settle an ack that belongs to the earlier connection against the
+    /// session of the newer one — silently clearing an inflight entry that
+    /// was never actually delivered. The caller already holds the channel the
+    /// ack arrived on, so there is nothing to look up.
+    pub fn discharge_outbound_ack(&self, packet_id: PacketId) {
+        self.outbound_inflight.remove(&packet_id);
+        if let Some((_, slot)) = self.pending_acks.remove(&packet_id)
+            && let AckSlot::Puback(tx) = slot
+        {
+            let _ = tx.send(packet_id); // W policy §3
+        }
+    }
+
     /// Tear down session inflight state, dropping all pending ack senders.
     /// Awaiting `P::send` calls will resolve to `Err(ChannelClosed)`.
     ///
@@ -141,3 +160,6 @@ impl Default for OnceLockBindInfo {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod test;

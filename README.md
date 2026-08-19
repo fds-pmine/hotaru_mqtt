@@ -89,12 +89,12 @@ let config = MqttClientConfig::new("device-42")
 
 // Register `config` under CLIENT_CONFIG_STATICS_KEY in your RuntimeConfig
 // statics, then run MQTT::client() as a protocol entry against the connection
-// to your broker. See tests/integration.rs for the wiring.
+// to your broker. See tests/client.rs for the wiring.
 ```
 
 ## Examples & tests
 
-End-to-end examples live in [`tests/integration.rs`](tests/integration.rs), which exercises the broker and client against real TCP loopback connections. Run them with:
+End-to-end examples live in [`tests/integration.rs`](tests/integration.rs), which drives the broker against real TCP loopback connections, and [`tests/client.rs`](tests/client.rs), which drives a client session against a scripted peer. Run them with:
 
 ```sh
 cargo test

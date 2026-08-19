@@ -195,6 +195,92 @@ where
 }
 
 // ============================================================================
+// keep-alive
+// ============================================================================
+
+/// The inactivity deadline a server enforces for a client's declared
+/// `keep_alive`, or `None` when the client asked for none.
+///
+/// Spec §3.1.2.10: the client owes traffic at least every `keep_alive` seconds,
+/// and the server disconnects it after 1.5× that without hearing anything. The
+/// 1.5 is the grace — a client pinging on schedule must survive ordinary jitter.
+/// `keep_alive == 0` turns the mechanism off, and the server must then NOT
+/// disconnect for inactivity, so it is `None` rather than any duration.
+///
+/// Milliseconds rather than `(secs * 3) / 2`: integer division truncates, which
+/// loses half a second on every odd value and the whole grace at `keep_alive`
+/// of 1. Multiplying 1500 ms per second is exact for every input, and `u64`
+/// leaves the largest legal value — 65535 × 1500 ms, roughly 27 hours — nowhere
+/// near overflow.
+fn server_read_deadline(keep_alive: u16) -> Option<Duration> {
+    if keep_alive == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(keep_alive as u64 * 1500))
+    }
+}
+
+/// How often a client sends PINGREQ, or `None` when it declared no keep-alive.
+///
+/// The client's obligation is its own `keep_alive`, not the server's 1.5× grace:
+/// pinging on the grace period would be late by construction.
+fn client_ping_interval(keep_alive: u16) -> Option<Duration> {
+    if keep_alive == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(keep_alive as u64))
+    }
+}
+
+/// What one attempt to read a packet under a deadline can end as.
+///
+/// A named three-way outcome instead of `Option<Result<Packet, MqttError>>`:
+/// the nesting made callers pattern-match through two layers whose meanings
+/// are easy to confuse, and none of the three cases is an "absence" or a
+/// generic failure — each has a name of its own.
+enum ReadOutcome {
+    /// A whole packet arrived before the deadline.
+    Packet(Packet),
+    /// The read itself failed (wire closed, malformed bytes, ...).
+    Failed(MqttError),
+    /// The deadline elapsed with nothing read. Only possible when a deadline
+    /// exists — with `keep_alive = 0` there is none and this never happens.
+    DeadlineElapsed,
+}
+
+/// Read one packet, giving up if `deadline` elapses first.
+/// A `deadline` of `None` waits forever, which is what `keep_alive = 0` asks for.
+async fn read_packet_before<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    max_size: usize,
+    deadline: Option<Duration>,
+) -> ReadOutcome {
+    let read_result = match deadline {
+        Some(limit) => match timeout(limit, read_packet(reader, max_size)).await {
+            Ok(finished_in_time) => finished_in_time,
+            Err(_elapsed) => return ReadOutcome::DeadlineElapsed,
+        },
+        None => read_packet(reader, max_size).await,
+    };
+    match read_result {
+        Ok(packet) => ReadOutcome::Packet(packet),
+        Err(error) => ReadOutcome::Failed(error),
+    }
+}
+
+/// Tick, or never fire at all when the client declared no keep-alive.
+/// `pending()` is a future that never completes, so the `select!` arm holding it
+/// simply never wins — no timer, no wakeups.
+async fn tick_or_never(timer: &mut Option<tokio::time::Interval>) {
+    match timer {
+        Some(t) => {
+            t.tick().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+// ============================================================================
 // handle_client — client-side persistent session loop
 // ============================================================================
 
@@ -215,6 +301,8 @@ where
             )
         })?;
 
+    let max_packet_size = config.safety.max_packet_size();
+
     // 1. Take exclusive reader ownership (single-take).
     let mut reader = channel
         .take_reader()
@@ -226,7 +314,8 @@ where
     channel.send_packet(Packet::Connect(connect))?;
 
     // 3. Wait for CONNACK with timeout
-    let connack_packet = timeout(config.connect_timeout, read_packet(&mut reader))
+    let connack_packet =
+        timeout(config.connect_timeout, read_packet(&mut reader, max_packet_size))
         .await
         .map_err(|_| MqttError::Timeout(TimeoutKind::Connack))??;
     let Packet::Connack(ack) = connack_packet else {
@@ -243,14 +332,21 @@ where
     });
 
     // 4. Initial subscriptions (if any)
+    //
+    // Sent, not awaited. Waiting for the SUBACK here cannot work: this function
+    // owns the reader and does not poll it until the loop below, so nothing
+    // drains the socket while the wait is in progress and `fire_suback` — the
+    // only thing that resolves the slot — is only reachable from that loop. An
+    // awaited SUBACK therefore always expired, and the session died with
+    // `Timeout(Ack)`, so every client configured with an initial subscription
+    // failed to connect.
+    //
+    // Nothing was lost by dropping the wait: the SUBACK's return codes were
+    // discarded (`let _ =`) rather than surfaced, so the wait bought delay and
+    // no information. The loop dispatches the SUBACK normally; with no slot
+    // registered for it, `fire_suback` ignores it per the W §4 silent policy.
     if !config.initial_subscriptions.is_empty() {
-        // Use the same path P::send takes — via cmd_tx + pending_acks.
         let pkt_id = channel.session().allocate_packet_id();
-        let (tx, rx) = oneshot::channel();
-        channel
-            .session()
-            .pending_acks
-            .insert(pkt_id, AckSlot::Suback(tx));
         let subs: Vec<TopicSubscription> = config
             .initial_subscriptions
             .iter()
@@ -263,16 +359,17 @@ where
             packet_id: pkt_id,
             subscriptions: subs,
         }))?;
-        let _ = timeout(DEFAULT_ACK_TIMEOUT, rx)
-            .await
-            .map_err(|_| MqttError::Timeout(TimeoutKind::Ack))?
-            .map_err(|_| MqttError::ChannelClosed)?;
     }
 
     // 5. Main select loop
-    let ping_interval = Duration::from_secs(config.keep_alive_secs.max(1) as u64);
-    let mut ping_timer = tokio::time::interval(ping_interval);
-    ping_timer.tick().await; // skip first immediate tick
+    let mut ping_timer = match client_ping_interval(config.keep_alive_secs) {
+        Some(interval) => {
+            let mut t = tokio::time::interval(interval);
+            t.tick().await; // skip first immediate tick
+            Some(t)
+        }
+        None => None,
+    };
     let shutdown = channel.shutdown_signal();
 
     loop {
@@ -280,7 +377,7 @@ where
             break;
         }
         tokio::select! {
-            inbound = read_packet(&mut reader) => {
+            inbound = read_packet(&mut reader, max_packet_size) => {
                 match inbound {
                     Ok(p) => {
                         if dispatch_client_inbound(channel.clone(), p, runtime.clone(), root.clone(), &config).await? {
@@ -291,7 +388,7 @@ where
                     Err(e) => return Err(e),
                 }
             }
-            _ = ping_timer.tick() => {
+            _ = tick_or_never(&mut ping_timer) => {
                 // PINGREQ failure means writer is dead → break (W must-propagate)
                 if channel.send_packet(Packet::Pingreq).is_err() {
                     break;
@@ -389,8 +486,14 @@ where
         .await
         .ok_or_else(|| MqttError::Configuration("reader already taken".into()))?;
 
+    // Read the cap before the first packet: it has to bind on the CONNECT
+    // read itself, which happens before authentication, so the peer that
+    // gets to declare a body size has not proven anything yet.
+    let max_packet_size = broker.safety().max_packet_size();
+
     // 1. Read CONNECT with timeout
-    let connect_packet = timeout(CONNECT_RECEIVE_TIMEOUT, read_packet(&mut reader))
+    let connect_packet =
+        timeout(CONNECT_RECEIVE_TIMEOUT, read_packet(&mut reader, max_packet_size))
         .await
         .map_err(|_| MqttError::Timeout(TimeoutKind::ConnectReceive))??;
     let Packet::Connect(connect) = connect_packet else {
@@ -424,6 +527,12 @@ where
         retain: w.retain,
     });
 
+    // The channel already carries an id that is unique per connection and
+    // stable across its clones; the client_id stops being unique the moment a
+    // takeover is in flight, so every broker call that means "this connection"
+    // rather than "this name" takes this alongside it.
+    let connection_id = channel.connection_id();
+
     // 3. Register session (broker takes channel clone)
     let session_present = broker
         .register_session(client_id.clone(), channel.clone(), will, clean_session)
@@ -435,15 +544,29 @@ where
     });
 
     // 4. Send CONNACK
-    channel.send_packet(Packet::Connack(ConnackPacket {
+    //
+    // The session is already registered at this point, so a failure here has
+    // to unregister before it propagates — the same obligation the read loop
+    // below discharges through `terminal_error`.
+    if let Err(e) = channel.send_packet(Packet::Connack(ConnackPacket {
         session_present,
         return_code: ConnackReturnCode::Accepted,
-    }))?;
+    })) {
+        broker.unregister_session(&client_id, connection_id, false).await;
+        return Err(e);
+    }
 
-    // 5. Main select loop with keep-alive timeout (1.5× grace per spec)
-    let keep_alive_secs = keep_alive.max(1) as u64;
-    let read_timeout = Duration::from_secs((keep_alive_secs * 3) / 2);
+    // 5. Main select loop with keep-alive deadline (1.5× grace per spec, and
+    //    no deadline at all when the client declared keep_alive = 0)
+    let read_deadline = server_read_deadline(keep_alive);
     let mut graceful = false;
+    // Every terminal condition sets state and breaks; nothing returns from
+    // inside the loop. Teardown is written after the loop, so a `return` there
+    // would skip it — which is exactly what used to happen on a malformed
+    // packet: the session stayed in the broker's table with its subscriptions
+    // live, and the Will was never published even though the connection had
+    // died non-gracefully.
+    let mut terminal_error: Option<MqttError> = None;
     let shutdown = channel.shutdown_signal();
 
     loop {
@@ -451,24 +574,31 @@ where
             break;
         }
         tokio::select! {
-            packet = timeout(read_timeout, read_packet(&mut reader)) => {
-                match packet {
-                    Err(_) => break,                              // keep-alive timeout = crash
-                    Ok(Err(MqttError::Io(_))) => break,           // wire closed = crash
-                    Ok(Err(e)) => return Err(e),
-                    Ok(Ok(Packet::Disconnect)) => {
+            outcome = read_packet_before(&mut reader, max_packet_size, read_deadline) => {
+                match outcome {
+                    ReadOutcome::DeadlineElapsed => break,             // keep-alive deadline = crash
+                    ReadOutcome::Failed(MqttError::Io(_)) => break,    // wire closed = crash
+                    ReadOutcome::Failed(error) => {
+                        terminal_error = Some(error);
+                        break;
+                    }
+                    ReadOutcome::Packet(Packet::Disconnect) => {
                         graceful = true;
                         break;
                     }
-                    Ok(Ok(p)) => {
-                        dispatch_server_inbound(
+                    ReadOutcome::Packet(inbound) => {
+                        if let Err(error) = dispatch_server_inbound(
                             channel.clone(),
                             broker.clone(),
                             &client_id,
-                            p,
+                            connection_id,
+                            inbound,
                             runtime.clone(),
                             root.clone(),
-                        ).await?;
+                        ).await {
+                            terminal_error = Some(error);
+                            break;
+                        }
                     }
                 }
             }
@@ -476,8 +606,15 @@ where
         }
     }
 
-    // 6. Unregister (graceful flag drives Will trigger)
-    broker.unregister_session(&client_id, graceful).await;
+    // 6. Unregister (graceful flag drives Will trigger). Single exit: this runs
+    //    on every path out of the loop, including the failing ones.
+    broker.unregister_session(&client_id, connection_id, graceful).await;
+    if let Some(e) = terminal_error {
+        // Still reported to the framework, just after cleanup rather than
+        // instead of it. `graceful` stays false on this path, which is what
+        // makes the Will fire (MQTT-3.1.2-5).
+        return Err(e);
+    }
     Ok(ProtocolFlow::Close)
 }
 
@@ -485,6 +622,7 @@ async fn dispatch_server_inbound<W, TS>(
     channel: MqttChannel<W>,
     broker: Broker<W>,
     client_id: &Arc<str>,
+    connection_id: u64,
     packet: Packet,
     runtime: Arc<RuntimeConfig>,
     root: Arc<UrlRoot<MqttContext<TS>, TS>>,
@@ -523,7 +661,7 @@ where
                     qos: ts.qos,
                 })
                 .collect();
-            let codes = broker.subscribe(client_id, &filters).await;
+            let codes = broker.subscribe(client_id, connection_id, &filters).await;
             channel.send_packet(Packet::Suback(SubackPacket {
                 packet_id: s.packet_id,
                 return_codes: codes,
@@ -531,7 +669,7 @@ where
             Ok(())
         }
         Packet::Unsubscribe(u) => {
-            broker.unsubscribe(client_id, &u.topics).await;
+            broker.unsubscribe(client_id, connection_id, &u.topics).await;
             channel.send_packet(Packet::Unsuback(u.packet_id))?;
             Ok(())
         }
@@ -540,7 +678,11 @@ where
             Ok(())
         }
         Packet::Puback(id) => {
-            broker.ack_outbound(client_id, id).await;
+            // Settled against the channel the ack arrived on, not by looking
+            // the client_id up in the broker: during a takeover that name
+            // resolves to the newer connection and this ack belongs to the
+            // earlier one. The PUBREL arm below already resolves this way.
+            channel.session().discharge_outbound_ack(id);
             Ok(())
         }
         Packet::Pubrec(id) => {
@@ -549,7 +691,7 @@ where
             Ok(())
         }
         Packet::Pubcomp(id) => {
-            broker.ack_outbound(client_id, id).await;
+            channel.session().discharge_outbound_ack(id);
             Ok(())
         }
         Packet::Pubrel(id) => {
@@ -983,3 +1125,6 @@ pub trait DefaultInboundHandler: Send + Sync + 'static {
 }
 
 // (shutdown_signal lives on MqttChannel as pub(crate))
+
+#[cfg(test)]
+mod test;
