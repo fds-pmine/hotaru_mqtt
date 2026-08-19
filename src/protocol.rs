@@ -215,6 +215,8 @@ where
             )
         })?;
 
+    let max_packet_size = config.safety.max_packet_size();
+
     // 1. Take exclusive reader ownership (single-take).
     let mut reader = channel
         .take_reader()
@@ -226,7 +228,8 @@ where
     channel.send_packet(Packet::Connect(connect))?;
 
     // 3. Wait for CONNACK with timeout
-    let connack_packet = timeout(config.connect_timeout, read_packet(&mut reader))
+    let connack_packet =
+        timeout(config.connect_timeout, read_packet(&mut reader, max_packet_size))
         .await
         .map_err(|_| MqttError::Timeout(TimeoutKind::Connack))??;
     let Packet::Connack(ack) = connack_packet else {
@@ -280,7 +283,7 @@ where
             break;
         }
         tokio::select! {
-            inbound = read_packet(&mut reader) => {
+            inbound = read_packet(&mut reader, max_packet_size) => {
                 match inbound {
                     Ok(p) => {
                         if dispatch_client_inbound(channel.clone(), p, runtime.clone(), root.clone(), &config).await? {
@@ -389,8 +392,14 @@ where
         .await
         .ok_or_else(|| MqttError::Configuration("reader already taken".into()))?;
 
+    // Read the cap before the first packet: it has to bind on the CONNECT
+    // read itself, which happens before authentication, so the peer that
+    // gets to declare a body size has not proven anything yet.
+    let max_packet_size = broker.safety().max_packet_size();
+
     // 1. Read CONNECT with timeout
-    let connect_packet = timeout(CONNECT_RECEIVE_TIMEOUT, read_packet(&mut reader))
+    let connect_packet =
+        timeout(CONNECT_RECEIVE_TIMEOUT, read_packet(&mut reader, max_packet_size))
         .await
         .map_err(|_| MqttError::Timeout(TimeoutKind::ConnectReceive))??;
     let Packet::Connect(connect) = connect_packet else {
@@ -451,7 +460,7 @@ where
             break;
         }
         tokio::select! {
-            packet = timeout(read_timeout, read_packet(&mut reader)) => {
+            packet = timeout(read_timeout, read_packet(&mut reader, max_packet_size)) => {
                 match packet {
                     Err(_) => break,                              // keep-alive timeout = crash
                     Ok(Err(MqttError::Io(_))) => break,           // wire closed = crash

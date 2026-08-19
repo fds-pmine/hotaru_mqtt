@@ -58,6 +58,9 @@ pub enum Violation {
     HashWildcardNotTerminal,
     WildcardMixedWithLiteral,
     SessionAlreadyBound,
+    /// A fixed header declared a body larger than the configured cap. Raised
+    /// before the body buffer is allocated, so refusing costs the header only.
+    PacketTooLarge { len: usize, max: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

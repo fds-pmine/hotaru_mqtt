@@ -20,6 +20,7 @@ use crate::packet::{ConnackReturnCode, ConnectPacket, PublishPacket};
 use crate::request::{
     IncomingPublish, PacketId, QoS, SubackCode, TopicFilter, WillMessage,
 };
+use crate::safety::MqttSafety;
 
 // ----------------------------------------------------------------------------
 // Authenticator hook
@@ -175,6 +176,7 @@ struct BrokerInner<W: ConnStream> {
     sessions: DashMap<Arc<str>, SubscriberEntry<W>>,
     subscriptions: SubscriptionTree,
     authenticator: Arc<dyn Authenticator>,
+    safety: MqttSafety,
 }
 
 impl<W: ConnStream> Clone for Broker<W> {
@@ -193,21 +195,41 @@ impl<W: ConnStream> Default for Broker<W> {
 
 impl<W: ConnStream> Broker<W> {
     pub fn new() -> Self {
-        Self::with_authenticator_inner(Arc::new(AcceptAllAuthenticator))
+        Self::build(Arc::new(AcceptAllAuthenticator), MqttSafety::new())
     }
 
     pub fn with_authenticator(auth: Arc<dyn Authenticator>) -> Self {
-        Self::with_authenticator_inner(auth)
+        Self::build(auth, MqttSafety::new())
     }
 
-    fn with_authenticator_inner(auth: Arc<dyn Authenticator>) -> Self {
+    pub fn with_safety(safety: MqttSafety) -> Self {
+        Self::build(Arc::new(AcceptAllAuthenticator), safety)
+    }
+
+    pub fn with_authenticator_and_safety(
+        auth: Arc<dyn Authenticator>,
+        safety: MqttSafety,
+    ) -> Self {
+        Self::build(auth, safety)
+    }
+
+    // Constructors rather than chained setters: `inner` is behind an `Arc` the
+    // moment a broker exists, so a `self`-consuming setter would have to
+    // rebuild it and would silently drop any sessions already registered.
+    fn build(auth: Arc<dyn Authenticator>, safety: MqttSafety) -> Self {
         Self {
             inner: Arc::new(BrokerInner {
                 sessions: DashMap::new(),
                 subscriptions: SubscriptionTree::new(),
                 authenticator: auth,
+                safety,
             }),
         }
+    }
+
+    /// Wire-layer limits for connections this broker serves.
+    pub fn safety(&self) -> &MqttSafety {
+        &self.inner.safety
     }
 
     // ── Session lifecycle ────────────────────────────────────────
