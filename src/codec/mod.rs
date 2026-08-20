@@ -16,10 +16,8 @@ use hotaru_core::protocol::Message;
 
 use crate::error::{CodecError, MqttError, Violation};
 use crate::packet::{
-    Packet,
-    PacketType, PublishPacket,
+    MQTT_SPEC_MAX_PACKET_SIZE, Packet, PacketType, PublishPacket,
 };
-use crate::request::QoS;
 use crate::safety::MqttSafety;
 
 mod decode;
@@ -30,8 +28,9 @@ mod varint;
 #[cfg(test)]
 mod test;
 
+
 use decode::parse_packet;
-use encode::{encode_connack, encode_connect, encode_publish, encode_suback,
+use encode::{validate_publish_for_encode, encode_connack, encode_connect, encode_publish, encode_suback,
     encode_subscribe, encode_unsubscribe, pack_publish_flags};
 use varint::{decode_remaining_length_from_slice, encode_remaining_length,
     read_remaining_length};
@@ -123,23 +122,28 @@ pub fn decode_packet_from_bytes(
 /// Encode any packet into a fresh `Vec<u8>`. Convenience for tests and the
 /// `Message::encode` trait impl. Hot paths use `write_packet` /
 /// `write_publish_packet` directly to avoid the intermediate Vec.
-pub fn encode_packet(packet: &Packet) -> Vec<u8> {
-    match packet {
-        Packet::Connect(c) => encode_connect(c),
-        Packet::Connack(c) => encode_connack(c),
-        Packet::Publish(p) => encode_publish(p),
+///
+/// Fallible because PUBLISH is: an invalid `PublishPacket` (QoS >= 1 with no
+/// packet id, id 0, oversized topic or body) is refused rather than silently
+/// emitted malformed. Every other variant cannot fail and simply wraps in Ok.
+pub fn encode_packet(packet: &Packet) -> Result<Vec<u8>, CodecError> {
+    let bytes = match packet {
+        Packet::Connect(connect) => encode_connect(connect),
+        Packet::Connack(connack) => encode_connack(connack),
+        Packet::Publish(publish) => return encode_publish(publish),
         Packet::Puback(id) => vec![0x40, 0x02, (*id >> 8) as u8, (*id & 0xFF) as u8],
         Packet::Pubrec(id) => vec![0x50, 0x02, (*id >> 8) as u8, (*id & 0xFF) as u8],
         Packet::Pubrel(id) => vec![0x62, 0x02, (*id >> 8) as u8, (*id & 0xFF) as u8],
         Packet::Pubcomp(id) => vec![0x70, 0x02, (*id >> 8) as u8, (*id & 0xFF) as u8],
-        Packet::Subscribe(s) => encode_subscribe(s),
-        Packet::Suback(s) => encode_suback(s),
-        Packet::Unsubscribe(u) => encode_unsubscribe(u),
+        Packet::Subscribe(subscribe) => encode_subscribe(subscribe),
+        Packet::Suback(suback) => encode_suback(suback),
+        Packet::Unsubscribe(unsubscribe) => encode_unsubscribe(unsubscribe),
         Packet::Unsuback(id) => vec![0xB0, 0x02, (*id >> 8) as u8, (*id & 0xFF) as u8],
         Packet::Pingreq => vec![0xC0, 0x00],
         Packet::Pingresp => vec![0xD0, 0x00],
         Packet::Disconnect => vec![0xE0, 0x00],
-    }
+    };
+    Ok(bytes)
 }
 
 /// Write a packet to an async writer. Used by the writer actor for control
@@ -148,7 +152,7 @@ pub async fn write_packet<W: AsyncWrite + Unpin>(
     writer: &mut W,
     packet: &Packet,
 ) -> Result<(), MqttError> {
-    let buf = encode_packet(packet);
+    let buf = encode_packet(packet)?;
     writer.write_all(&buf).await?;
     Ok(())
 }
@@ -160,14 +164,24 @@ pub async fn write_publish_packet<W: AsyncWrite + Unpin>(
     writer: &mut W,
     packet: &PublishPacket,
 ) -> Result<(), MqttError> {
+    // Validate before committing a single byte: refusing after a partial
+    // write would leave half a frame on the wire.
+    let packet_id = validate_publish_for_encode(packet).map_err(MqttError::Codec)?;
+
     // Build header + variable header into a small buffer; payload streamed
     // separately from the Bytes directly.
     let topic_bytes = packet.topic.as_bytes();
     let mut var_header_len = 2 + topic_bytes.len();
-    if packet.qos != QoS::AtMostOnce {
+    if packet_id.is_some() {
         var_header_len += 2;
     }
     let body_len = var_header_len + packet.payload.len();
+    if body_len > MQTT_SPEC_MAX_PACKET_SIZE {
+        return Err(MqttError::Codec(CodecError::BodyTooLong {
+            len: body_len,
+            max: MQTT_SPEC_MAX_PACKET_SIZE,
+        }));
+    }
 
     let mut header = Vec::with_capacity(1 + 4 + var_header_len);
     let flags = pack_publish_flags(packet);
@@ -175,11 +189,8 @@ pub async fn write_publish_packet<W: AsyncWrite + Unpin>(
     header.extend(encode_remaining_length(body_len));
     header.extend_from_slice(&(topic_bytes.len() as u16).to_be_bytes());
     header.extend_from_slice(topic_bytes);
-    if packet.qos != QoS::AtMostOnce {
-        let id = packet
-            .packet_id
-            .ok_or_else(|| MqttError::Codec(CodecError::PayloadTooLong { len: 0, max: 0 }))?;
-        header.extend_from_slice(&id.to_be_bytes());
+    if let Some(packet_id) = packet_id {
+        header.extend_from_slice(&packet_id.to_be_bytes());
     }
 
     writer.write_all(&header).await?;
@@ -198,7 +209,7 @@ impl Message for Packet {
     type BytesMut = BytesMut;
 
     fn encode(&self, buf: &mut Self::BytesMut) -> Result<(), Box<dyn Error + Send + Sync>> {
-        buf.extend_from_slice(&encode_packet(self));
+        buf.extend_from_slice(&encode_packet(self).map_err(MqttError::Codec)?);
         Ok(())
     }
 

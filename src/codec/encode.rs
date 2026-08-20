@@ -2,6 +2,7 @@
 
 
 
+use crate::error::CodecError;
 use crate::packet::{
     ConnackPacket, ConnectFlags, ConnectPacket, FixedHeaderFlags,
     PacketType, PublishPacket, SubackPacket, SubscribePacket,
@@ -11,6 +12,8 @@ use crate::request::QoS;
 
 use super::primitives::{write_arc_str, write_bytes};
 use super::varint::encode_remaining_length;
+use crate::packet::MQTT_SPEC_MAX_PACKET_SIZE;
+use crate::request::PacketId;
 
 pub(super) fn encode_connect(conn: &ConnectPacket) -> Vec<u8> {
     let mut body = Vec::new();
@@ -61,23 +64,59 @@ pub(super) fn encode_connack(ack: &ConnackPacket) -> Vec<u8> {
     ]
 }
 
-pub(super) fn encode_publish(p: &PublishPacket) -> Vec<u8> {
-    let topic_bytes = p.topic.as_bytes();
-    let mut body = Vec::with_capacity(2 + topic_bytes.len() + 2 + p.payload.len());
+/// Everything both PUBLISH encoders must refuse, decided in one place.
+///
+/// Returns the packet id to write (`None` for QoS 0, whose packets carry no
+/// id). Both `encode_publish` and `write_publish_packet` call this before
+/// committing a single byte, so a `PublishPacket` is either emitted correctly
+/// by both paths or refused identically by both — the two encoders can no
+/// longer disagree about what is legal.
+pub(super) fn validate_publish_for_encode(
+    publish: &PublishPacket,
+) -> Result<Option<PacketId>, CodecError> {
+    let topic_length = publish.topic.as_bytes().len();
+    if topic_length > u16::MAX as usize {
+        return Err(CodecError::TopicTooLong {
+            len: topic_length,
+            max: u16::MAX as usize,
+        });
+    }
+    if publish.qos == QoS::AtMostOnce {
+        // QoS 0 carries no packet id on the wire; a stray one in the struct is
+        // simply not emitted, which both encoders already agreed on.
+        return Ok(None);
+    }
+    match publish.packet_id {
+        None => Err(CodecError::MissingPacketId),
+        Some(0) => Err(CodecError::ZeroPacketId),
+        Some(packet_id) => Ok(Some(packet_id)),
+    }
+}
+
+pub(super) fn encode_publish(publish: &PublishPacket) -> Result<Vec<u8>, CodecError> {
+    let packet_id = validate_publish_for_encode(publish)?;
+
+    let topic_bytes = publish.topic.as_bytes();
+    let mut body = Vec::with_capacity(2 + topic_bytes.len() + 2 + publish.payload.len());
     body.extend_from_slice(&(topic_bytes.len() as u16).to_be_bytes());
     body.extend_from_slice(topic_bytes);
-    if p.qos != QoS::AtMostOnce
-        && let Some(id) = p.packet_id
-    {
-        body.extend_from_slice(&id.to_be_bytes());
+    if let Some(packet_id) = packet_id {
+        body.extend_from_slice(&packet_id.to_be_bytes());
     }
-    body.extend_from_slice(&p.payload[..]);
+    body.extend_from_slice(&publish.payload[..]);
 
-    let flags = pack_publish_flags(p);
+    if body.len() > MQTT_SPEC_MAX_PACKET_SIZE {
+        return Err(CodecError::BodyTooLong {
+            len: body.len(),
+            max: MQTT_SPEC_MAX_PACKET_SIZE,
+        });
+    }
+
+    let flags = pack_publish_flags(publish);
     let mut buf = vec![((PacketType::Publish as u8) << 4) | flags];
     buf.extend(encode_remaining_length(body.len()));
     buf.extend(body);
-    buf
+    Ok(buf)
 }
 
 pub(super) fn encode_subscribe(s: &SubscribePacket) -> Vec<u8> {

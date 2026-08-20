@@ -26,6 +26,19 @@ use crate::request::{IncomingPublish, PacketId, SubackCode};
 /// When the channel closes, `MqttSession::abandon` clears all pending acks,
 /// dropping every sender — every awaiter then receives `RecvError`, which
 /// the P::send wrapper converts to `MqttError::ChannelClosed`.
+/// Which ack a parked waiter is expecting.
+///
+/// A packet-id names a *flow*, not a step. A QoS 2 flow parks a `Pubrec`
+/// waiter, then a `Pubcomp` waiter, under the same id — so "the slot for id 7"
+/// is not enough to know what to do with it, and waking the wrong kind is not
+/// a near miss. `AckKind` is what makes the question answerable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckKind {
+    Puback,
+    Pubrec,
+    Pubcomp,
+}
+
 pub enum AckSlot {
     Puback(oneshot::Sender<PacketId>),
     Pubrec(oneshot::Sender<PacketId>),
@@ -90,8 +103,8 @@ impl MqttSession {
         if id == 0 { 1 } else { id }
     }
 
-    /// Settle one outbound QoS>=1 ack against *this* session: drop the
-    /// inflight record and wake any waiter.
+    /// Wake the waiter parked on `packet_id`, but only if it is waiting for
+    /// `expected`. An ack of any other kind leaves the slot untouched.
     ///
     /// Resolution is connection-local by construction. The broker's session
     /// map is keyed on client_id alone, which stops telling two connections
@@ -100,13 +113,144 @@ impl MqttSession {
     /// session of the newer one — silently clearing an inflight entry that
     /// was never actually delivered. The caller already holds the channel the
     /// ack arrived on, so there is nothing to look up.
-    pub fn discharge_outbound_ack(&self, packet_id: PacketId) {
-        self.outbound_inflight.remove(&packet_id);
-        if let Some((_, slot)) = self.pending_acks.remove(&packet_id)
-            && let AckSlot::Puback(tx) = slot
-        {
-            let _ = tx.send(packet_id); // W policy §3
+    /// Park a waiter for a publish-flow ack (PUBACK / PUBREC / PUBCOMP) under
+    /// `packet_id`, and hand back the receiving half to await.
+    ///
+    /// The oneshot pair is created in here so that a call site cannot pair the
+    /// wrong sender with the wrong slot kind — the kind decides the slot, in
+    /// one place.
+    pub fn park_publish_ack_waiter(
+        &self,
+        packet_id: PacketId,
+        kind: AckKind,
+    ) -> oneshot::Receiver<PacketId> {
+        let (sender, receiver) = oneshot::channel();
+        let slot = match kind {
+            AckKind::Puback => AckSlot::Puback(sender),
+            AckKind::Pubrec => AckSlot::Pubrec(sender),
+            AckKind::Pubcomp => AckSlot::Pubcomp(sender),
+        };
+        self.pending_acks.insert(packet_id, slot);
+        receiver
+    }
+
+    /// Park a waiter for the SUBACK answering the SUBSCRIBE sent as `packet_id`.
+    pub fn park_suback_waiter(&self, packet_id: PacketId) -> oneshot::Receiver<Vec<SubackCode>> {
+        let (sender, receiver) = oneshot::channel();
+        self.pending_acks.insert(packet_id, AckSlot::Suback(sender));
+        receiver
+    }
+
+    /// Park a waiter for the UNSUBACK answering the UNSUBSCRIBE sent as `packet_id`.
+    pub fn park_unsuback_waiter(&self, packet_id: PacketId) -> oneshot::Receiver<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.pending_acks.insert(packet_id, AckSlot::Unsuback(sender));
+        receiver
+    }
+
+    /// Give up on a parked waiter (ack timeout). Removing the slot drops its
+    /// sender, which resolves the abandoned receiver immediately — but the
+    /// caller that parked it is the one abandoning it, so nobody is waiting.
+    pub fn cancel_ack_waiter(&self, packet_id: PacketId) {
+        self.pending_acks.remove(&packet_id);
+    }
+
+    /// Wake the waiter parked for the SUBACK of `packet_id`, delivering the
+    /// per-filter verdicts. A slot of any other kind is left untouched, for
+    /// the same reason `wake_ack_waiter` leaves mismatches alone: consuming a
+    /// waiter this packet cannot satisfy fabricates a `ChannelClosed`.
+    pub fn wake_suback_waiter(&self, packet_id: PacketId, return_codes: Vec<SubackCode>) {
+        let Some(entry) = self.pending_acks.get(&packet_id) else {
+            return; // nobody parked here — W §4 silent
+        };
+        let parked_is_suback = matches!(entry.value(), AckSlot::Suback(_));
+        drop(entry); // release the read guard before removing under the same key
+        if !parked_is_suback {
+            return;
         }
+        let Some((_, slot)) = self.pending_acks.remove(&packet_id) else {
+            return; // raced with another waker; it did the work
+        };
+        match slot {
+            AckSlot::Suback(waiter) => {
+                let _ = waiter.send(return_codes); // W policy §3
+            }
+            other => {
+                // Kind changed between the two lookups; this packet does not
+                // own the slot. Put it back.
+                self.pending_acks.insert(packet_id, other);
+            }
+        }
+    }
+
+    /// Wake the waiter parked for the UNSUBACK of `packet_id`. Same contract
+    /// as [`MqttSession::wake_suback_waiter`].
+    pub fn wake_unsuback_waiter(&self, packet_id: PacketId) {
+        let Some(entry) = self.pending_acks.get(&packet_id) else {
+            return; // nobody parked here — W §4 silent
+        };
+        let parked_is_unsuback = matches!(entry.value(), AckSlot::Unsuback(_));
+        drop(entry);
+        if !parked_is_unsuback {
+            return;
+        }
+        let Some((_, slot)) = self.pending_acks.remove(&packet_id) else {
+            return;
+        };
+        match slot {
+            AckSlot::Unsuback(waiter) => {
+                let _ = waiter.send(()); // W policy §3
+            }
+            other => {
+                self.pending_acks.insert(packet_id, other);
+            }
+        }
+    }
+
+    pub fn wake_ack_waiter(&self, packet_id: PacketId, expected: AckKind) {
+        let Some(entry) = self.pending_acks.get(&packet_id) else {
+            return; // nobody parked here — W §4 silent
+        };
+        let parked_kind = match entry.value() {
+            AckSlot::Puback(_) => Some(AckKind::Puback),
+            AckSlot::Pubrec(_) => Some(AckKind::Pubrec),
+            AckSlot::Pubcomp(_) => Some(AckKind::Pubcomp),
+            AckSlot::Suback(_) | AckSlot::Unsuback(_) => None,
+        };
+        drop(entry); // release the read guard before removing under the same key
+
+        if parked_kind != Some(expected) {
+            // Leave it where it is. Removing a slot this ack cannot satisfy is
+            // worse than ignoring the ack: dropping the sending half of the
+            // oneshot resolves the waiter immediately with `RecvError`, which
+            // the send path reports as `ChannelClosed` — a disconnection that
+            // never happened, on a flow that may still be perfectly healthy.
+            return;
+        }
+
+        let Some((_, slot)) = self.pending_acks.remove(&packet_id) else {
+            return; // raced with another waker; it did the work
+        };
+        let waiter = match slot {
+            AckSlot::Puback(waiter) | AckSlot::Pubrec(waiter) | AckSlot::Pubcomp(waiter) => waiter,
+            other => {
+                // Re-park what we removed: this ack does not own it. Reachable
+                // only if the kind changed between the two lookups above.
+                self.pending_acks.insert(packet_id, other);
+                return;
+            }
+        };
+        let _ = waiter.send(packet_id); // W policy §3
+    }
+
+    /// The outbound flow for `packet_id` is finished; drop its retransmit record.
+    ///
+    /// Separate from [`MqttSession::wake_ack_waiter`] because the two do not
+    /// coincide. A QoS 2 PUBREC wakes a waiter but does *not* finish the flow —
+    /// PUBREL and PUBCOMP are still to come, and the message must stay
+    /// retransmittable until they do. Only PUBACK and PUBCOMP end a flow.
+    pub fn clear_outbound_inflight(&self, packet_id: PacketId) {
+        self.outbound_inflight.remove(&packet_id);
     }
 
     /// Tear down session inflight state, dropping all pending ack senders.
