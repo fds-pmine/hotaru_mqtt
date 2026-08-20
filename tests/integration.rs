@@ -29,7 +29,7 @@ use hotaru_mqtt::{
 /// Spin up a broker on a random port via raw TCP accept loop. Returns the
 /// bound port plus the broker handle (for in-process assertions).
 async fn start_broker() -> (u16, Broker<TcpStream>) {
-    start_broker_with(Broker::<TcpStream>::new()).await
+    start_broker_with(Broker::<TcpStream>::accept_all()).await
 }
 
 async fn start_broker_with(broker: Broker<TcpStream>) -> (u16, Broker<TcpStream>) {
@@ -119,7 +119,7 @@ fn connect_packet(client_id: &str) -> Packet {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn smoke_lib_constructible() {
-    let _broker = Broker::<TcpStream>::new();
+    let _broker = Broker::<TcpStream>::accept_all();
     let _config = hotaru_mqtt::MqttClientConfig::new("test-client");
     let _proto = MQTT::server();
     let _proto = MQTT::client();
@@ -435,7 +435,7 @@ async fn self_fanout_suppression() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn broker_constructs_cleanly() {
-    let _broker = Broker::<TcpStream>::new();
+    let _broker = Broker::<TcpStream>::accept_all();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -622,7 +622,7 @@ async fn start_multi_protocol_broker() -> (u16, Broker<TcpStream>) {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let broker = Broker::<TcpStream>::new();
+    let broker = Broker::<TcpStream>::accept_all();
 
     let registry: ProtocolEntryRegistry<hotaru_core::connection::tcp::TcpTransport> =
         ProtocolRegistryBuilder::new()
@@ -794,7 +794,10 @@ async fn will_message_fires_on_abrupt_disconnect() {
 #[tokio::test]
 async fn oversize_declaration_is_refused_before_authentication() {
     let (port, _broker) =
-        start_broker_with(Broker::with_safety(MqttSafety::new().with_max_packet_size(1024))).await;
+        start_broker_with(Broker::accept_all_with_safety(
+            MqttSafety::new().with_max_packet_size(1024),
+        ))
+        .await;
     let (mut reader, mut writer) = connect_raw(port).await;
 
     // 0x10 = CONNECT, then FF FF FF 7F = the largest 4-byte VBI. No body follows.
@@ -823,7 +826,10 @@ is parked waiting for 256 MiB that will never arrive"
 #[tokio::test]
 async fn oversize_declaration_is_refused_after_connect() {
     let (port, _broker) =
-        start_broker_with(Broker::with_safety(MqttSafety::new().with_max_packet_size(1024))).await;
+        start_broker_with(Broker::accept_all_with_safety(
+            MqttSafety::new().with_max_packet_size(1024),
+        ))
+        .await;
     let (mut reader, mut writer) = connect_raw(port).await;
 
     send_packet(&mut writer, &connect_packet("oversize-after-connect")).await;
@@ -1366,7 +1372,7 @@ type ServerRoot = Arc<
 async fn start_broker_with_root() -> (u16, Broker<TcpStream>, ServerRoot) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let broker = Broker::<TcpStream>::new();
+    let broker = Broker::<TcpStream>::accept_all();
 
     let registry: ProtocolEntryRegistry<hotaru_core::connection::tcp::TcpTransport> =
         ProtocolRegistryBuilder::new()
@@ -1592,4 +1598,82 @@ async fn publishes_keep_their_order_through_the_worker() {
             other => panic!("expected PUBLISH, got {other:?}"),
         }
     }
+}
+
+// ----------------------------------------------------------------------------
+// Default admission policy (RFC #73)
+// ----------------------------------------------------------------------------
+
+/// An unconfigured broker refuses every CONNECT. A broker that was never told
+/// who may connect cannot answer the question, and the safe answer to a
+/// question you cannot answer is no.
+#[tokio::test]
+async fn an_unconfigured_broker_refuses_every_connect() {
+    let (port, broker) = start_broker_with(Broker::<TcpStream>::new()).await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    send_packet(&mut writer, &connect_packet("anyone")).await;
+
+    match read_packet(&mut reader).await {
+        Packet::Connack(connack) => {
+            assert_eq!(ConnackReturnCode::NotAuthorized, connack.return_code);
+            assert!(!connack.session_present);
+        }
+        other => panic!("expected the refusal CONNACK, got {other:?}"),
+    }
+    assert_eq!(0, broker.session_count(), "a refused CONNECT must not register");
+}
+
+/// `Default` must agree with `new` — otherwise `Broker::default()` would be a
+/// quiet way back to the permissive behaviour.
+#[tokio::test]
+async fn default_agrees_with_new() {
+    let (port, broker) = start_broker_with(Broker::<TcpStream>::default()).await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    send_packet(&mut writer, &connect_packet("anyone")).await;
+
+    match read_packet(&mut reader).await {
+        Packet::Connack(connack) => {
+            assert_eq!(ConnackReturnCode::NotAuthorized, connack.return_code)
+        }
+        other => panic!("expected the refusal CONNACK, got {other:?}"),
+    }
+    assert_eq!(0, broker.session_count());
+}
+
+/// The permissive behaviour stays reachable, by a name that says what it is.
+#[tokio::test]
+async fn accept_all_still_accepts() {
+    let (port, broker) = start_broker_with(Broker::<TcpStream>::accept_all()).await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    send_packet(&mut writer, &connect_packet("anyone")).await;
+
+    match read_packet(&mut reader).await {
+        Packet::Connack(connack) => {
+            assert_eq!(ConnackReturnCode::Accepted, connack.return_code)
+        }
+        other => panic!("expected an accepting CONNACK, got {other:?}"),
+    }
+    assert_eq!(1, broker.session_count());
+}
+
+/// Safety limits and admission policy are independent knobs: asking for one
+/// must not silently hand back the other's permissive default.
+#[tokio::test]
+async fn with_safety_keeps_the_deny_all_default() {
+    let safety = MqttSafety::new().with_max_packet_size(1024);
+    let (port, broker) = start_broker_with(Broker::<TcpStream>::with_safety(safety)).await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    send_packet(&mut writer, &connect_packet("anyone")).await;
+
+    match read_packet(&mut reader).await {
+        Packet::Connack(connack) => {
+            assert_eq!(ConnackReturnCode::NotAuthorized, connack.return_code)
+        }
+        other => panic!("expected the refusal CONNACK, got {other:?}"),
+    }
+    assert_eq!(0, broker.session_count());
 }

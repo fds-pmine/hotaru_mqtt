@@ -37,7 +37,8 @@ pub use hotaru_core::url::UrlNode;
 // ─── Re-exports for user-facing API ───────────────────────────────
 
 pub use broker::{
-    AcceptAllAuthenticator, AuthResult, Authenticator, Broker, SubscriberEntry,
+    AcceptAllAuthenticator, AuthResult, Authenticator, Broker, DenyAllAuthenticator,
+    SubscriberEntry,
 };
 pub use channel::{MqttChannel, WriteCmd};
 pub use client::MqttClientConfig;

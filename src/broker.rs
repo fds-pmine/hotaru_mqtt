@@ -58,8 +58,10 @@ pub trait Authenticator: Send + Sync + 'static {
     ) -> AuthResult;
 }
 
-/// Default authenticator — accepts every CONNECT. Override in production
-/// via `Broker::with_authenticator(Arc::new(YourAuth))`.
+/// Accepts every CONNECT, credentials or not.
+///
+/// No longer what `Broker::new` installs — reach it through
+/// [`Broker::accept_all`], whose name says what it does at the call site.
 pub struct AcceptAllAuthenticator;
 
 #[async_trait]
@@ -70,6 +72,25 @@ impl Authenticator for AcceptAllAuthenticator {
         _remote_addr: Option<SocketAddr>,
     ) -> AuthResult {
         AuthResult::accept()
+    }
+}
+
+/// Refuses every CONNECT with `NotAuthorized`. What `Broker::new` installs.
+///
+/// A broker that was never told who may connect cannot answer the question, and
+/// the safe answer to a question you cannot answer is no. `NotAuthorized`
+/// rather than `ServerUnavailable`: the server is up and the request was
+/// well-formed; the peer simply is not on any list.
+pub struct DenyAllAuthenticator;
+
+#[async_trait]
+impl Authenticator for DenyAllAuthenticator {
+    async fn authenticate(
+        &self,
+        _connect: &ConnectPacket,
+        _remote_addr: Option<SocketAddr>,
+    ) -> AuthResult {
+        AuthResult::reject(ConnackReturnCode::NotAuthorized)
     }
 }
 
@@ -195,7 +216,23 @@ impl<W: ConnStream> Default for Broker<W> {
 }
 
 impl<W: ConnStream> Broker<W> {
+    /// A broker that refuses every CONNECT until it is given an authenticator.
+    ///
+    /// This deliberately breaks with 0.8.2, where `new()` accepted everyone: a
+    /// deployment that forgot to configure authentication was open, and nothing
+    /// about the call site said so. Use [`Broker::with_authenticator`] to
+    /// declare a policy, or [`Broker::accept_all`] to ask for the old
+    /// behaviour by name.
     pub fn new() -> Self {
+        Self::build(Arc::new(DenyAllAuthenticator), MqttSafety::new())
+    }
+
+    /// A broker that accepts every CONNECT, credentials or not.
+    ///
+    /// Kept in the public API rather than hidden behind a feature flag: tests,
+    /// local development, and closed networks legitimately want it, and a
+    /// caller that writes this name has said out loud what it is doing.
+    pub fn accept_all() -> Self {
         Self::build(Arc::new(AcceptAllAuthenticator), MqttSafety::new())
     }
 
@@ -204,6 +241,11 @@ impl<W: ConnStream> Broker<W> {
     }
 
     pub fn with_safety(safety: MqttSafety) -> Self {
+        Self::build(Arc::new(DenyAllAuthenticator), safety)
+    }
+
+    /// [`Broker::accept_all`] with wire-layer limits attached.
+    pub fn accept_all_with_safety(safety: MqttSafety) -> Self {
         Self::build(Arc::new(AcceptAllAuthenticator), safety)
     }
 
