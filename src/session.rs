@@ -61,20 +61,25 @@ pub struct BindInfo {
 /// will store sessions in a `SessionStore` and rebind to new channels.
 pub struct MqttSession {
     /// Outbound packet-id counter. Wraps at u16::MAX; allocation logic skips
-    /// 0 and (future) checks inflight set for collisions.
-    pub pkt_counter: AtomicU16,
+    /// 0 and (future) checks inflight set for collisions. Reachable only
+    /// through `allocate_packet_id`, which is the whole of its contract.
+    pkt_counter: AtomicU16,
     /// One-time bind: written once on CONNACK completion. Private so the
     /// one-shot discipline stays enforceable; reach it through `bind()`.
     bind: OnceLockBindInfo,
     /// Inbound QoS 2 half-state: keyed by peer-allocated packet-id, holds
-    /// the PUBLISH awaiting PUBREL.
-    pub qos2_recv: DashMap<u16, IncomingPublish>,
+    /// the PUBLISH awaiting PUBREL. Reach it through `stash_qos2_publish` and
+    /// `take_qos2_publish`.
+    qos2_recv: DashMap<u16, IncomingPublish>,
     /// Outbound inflight: keyed by our allocated packet-id, holds the
-    /// pending ack slot. Cleared on `abandon`.
-    pub pending_acks: DashMap<u16, AckSlot>,
+    /// pending ack slot. Cleared on `abandon`. Reach it through the
+    /// `park_*` / `wake_*` / `cancel_ack_waiter` methods, which are what keep
+    /// a slot's kind and its waiter in agreement.
+    pending_acks: DashMap<u16, AckSlot>,
     /// Outbound QoS≥1 inflight publishes — held for retransmit and to allow
-    /// session resume (M phase). Indexed by our packet-id.
-    pub outbound_inflight: DashMap<u16, PublishPacket>,
+    /// session resume (M phase). Indexed by our packet-id. Reach it through
+    /// `track_outbound_inflight` and `clear_outbound_inflight`.
+    outbound_inflight: DashMap<u16, PublishPacket>,
 }
 
 impl MqttSession {
@@ -251,6 +256,38 @@ impl MqttSession {
     /// retransmittable until they do. Only PUBACK and PUBCOMP end a flow.
     pub fn clear_outbound_inflight(&self, packet_id: PacketId) {
         self.outbound_inflight.remove(&packet_id);
+    }
+
+    /// Hold an inbound QoS 2 PUBLISH until its PUBREL arrives.
+    ///
+    /// Keyed by the *peer's* packet-id, which is a different id space from the
+    /// one `allocate_packet_id` hands out — the two tables can hold the same
+    /// number at the same time meaning different messages.
+    pub fn stash_qos2_publish(&self, packet_id: PacketId, publish: IncomingPublish) {
+        self.qos2_recv.insert(packet_id, publish);
+    }
+
+    /// Release the PUBLISH held for `packet_id`, if PUBREL is the first one to
+    /// ask. Returns `None` for a PUBREL that names an id we are not holding —
+    /// a duplicate release, or one that was never stashed.
+    pub fn take_qos2_publish(&self, packet_id: PacketId) -> Option<IncomingPublish> {
+        self.qos2_recv.remove(&packet_id).map(|(_, publish)| publish)
+    }
+
+    /// Record an outbound QoS>=1 publish as inflight, so it stays
+    /// retransmittable until the flow that owns `packet_id` finishes.
+    ///
+    /// Paired with [`MqttSession::clear_outbound_inflight`], which is the only
+    /// thing that should end that record's life.
+    pub fn track_outbound_inflight(&self, packet_id: PacketId, publish: PublishPacket) {
+        self.outbound_inflight.insert(packet_id, publish);
+    }
+
+    /// Whether an outbound flow is still holding a retransmit record under
+    /// `packet_id`. Exists so a caller can observe the record's lifetime
+    /// without being handed the table it lives in.
+    pub fn has_outbound_inflight(&self, packet_id: PacketId) -> bool {
+        self.outbound_inflight.contains_key(&packet_id)
     }
 
     /// Tear down session inflight state, dropping all pending ack senders.
