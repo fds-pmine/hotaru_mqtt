@@ -14,6 +14,11 @@ use hotaru_core::executable::registry::ProtocolEntryRegistry;
 use hotaru_core::extensions::Locals;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+// The broker's wire type: the framework side of a connection. The raw
+// tokio::net::TcpStream stays in use for the *peer* side of every test -
+// the fake client that speaks bytes at the broker - because 0.8.5's
+// ConnStream is implemented on the newtype, not on tokio's type.
+use hotaru_io_tokio::TcpStream as Wire;
 use tokio::time::timeout;
 
 use hotaru_mqtt::{
@@ -28,16 +33,16 @@ use hotaru_mqtt::{
 
 /// Spin up a broker on a random port via raw TCP accept loop. Returns the
 /// bound port plus the broker handle (for in-process assertions).
-async fn start_broker() -> (u16, Broker<TcpStream>) {
-    start_broker_with(Broker::<TcpStream>::accept_all()).await
+async fn start_broker() -> (u16, Broker<Wire>) {
+    start_broker_with(Broker::<Wire>::accept_all()).await
 }
 
-async fn start_broker_with(broker: Broker<TcpStream>) -> (u16, Broker<TcpStream>) {
+async fn start_broker_with(broker: Broker<Wire>) -> (u16, Broker<Wire>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
 
     // Build a one-protocol registry holding MQTT::server() + the broker statics.
-    let registry: ProtocolEntryRegistry<hotaru_core::connection::tcp::TcpTransport> =
+    let registry: ProtocolEntryRegistry<hotaru_io_tokio::TcpTransport> =
         ProtocolRegistryBuilder::new()
             .protocol(ProtocolEntryBuilder::new(MQTT::server()))
             .build();
@@ -108,7 +113,7 @@ async fn read_packet(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> 
 /// so that it keeps meaning accept-all regardless of what the default
 /// admission policy is — these keep-alive tests are about the keep-alive
 /// policy, not about who is allowed in.
-fn accept_all_with(safety: MqttSafety) -> Broker<TcpStream> {
+fn accept_all_with(safety: MqttSafety) -> Broker<Wire> {
     Broker::with_authenticator_and_safety(Arc::new(AcceptAllAuthenticator), safety)
 }
 
@@ -129,7 +134,7 @@ fn connect_packet(client_id: &str) -> Packet {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn smoke_lib_constructible() {
-    let _broker = Broker::<TcpStream>::accept_all();
+    let _broker = Broker::<Wire>::accept_all();
     let _config = hotaru_mqtt::MqttClientConfig::new("test-client");
     let _proto = MQTT::server();
     let _proto = MQTT::client();
@@ -445,7 +450,7 @@ async fn self_fanout_suppression() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn broker_constructs_cleanly() {
-    let _broker = Broker::<TcpStream>::accept_all();
+    let _broker = Broker::<Wire>::accept_all();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -626,15 +631,15 @@ async fn fanout_to_multiple_subscribers() {
 /// port + broker handle so the test can also call broker.publish directly
 /// (simulating any non-MQTT code path that has a broker handle — e.g. an
 /// HTTP endpoint reading it from runtime statics).
-async fn start_multi_protocol_broker() -> (u16, Broker<TcpStream>) {
+async fn start_multi_protocol_broker() -> (u16, Broker<Wire>) {
     use hotaru_http::HTTP;
     use hotaru_http::security::safety::HttpSafety;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let broker = Broker::<TcpStream>::accept_all();
+    let broker = Broker::<Wire>::accept_all();
 
-    let registry: ProtocolEntryRegistry<hotaru_core::connection::tcp::TcpTransport> =
+    let registry: ProtocolEntryRegistry<hotaru_io_tokio::TcpTransport> =
         ProtocolRegistryBuilder::new()
             .protocol(ProtocolEntryBuilder::new(HTTP::server(HttpSafety::default())))
             .protocol(ProtocolEntryBuilder::new(MQTT::server()))
@@ -1254,7 +1259,7 @@ impl hotaru_mqtt::Authenticator for OnlyAlice {
     }
 }
 
-fn broker_with_auth() -> Broker<TcpStream> {
+fn broker_with_auth() -> Broker<Wire> {
     Broker::with_authenticator(Arc::new(OnlyAlice))
 }
 
@@ -1380,19 +1385,19 @@ use hotaru_core::protocol::Protocol;
 
 type ServerRoot = Arc<
     hotaru_core::url::UrlRoot<
-        MqttContext<hotaru_core::connection::tcp::TcpTransport>,
-        hotaru_core::connection::tcp::TcpTransport,
+        MqttContext<hotaru_io_tokio::TcpTransport>,
+        hotaru_io_tokio::TcpTransport,
     >,
 >;
 
 /// As `start_broker_with`, but also returns the `UrlRoot` so a test can
 /// register server-side endpoints on it before clients arrive.
-async fn start_broker_with_root() -> (u16, Broker<TcpStream>, ServerRoot) {
+async fn start_broker_with_root() -> (u16, Broker<Wire>, ServerRoot) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let broker = Broker::<TcpStream>::accept_all();
+    let broker = Broker::<Wire>::accept_all();
 
-    let registry: ProtocolEntryRegistry<hotaru_core::connection::tcp::TcpTransport> =
+    let registry: ProtocolEntryRegistry<hotaru_io_tokio::TcpTransport> =
         ProtocolRegistryBuilder::new()
             .protocol(ProtocolEntryBuilder::new(MQTT::server()))
             .build();
@@ -1436,7 +1441,7 @@ async fn start_broker_with_root() -> (u16, Broker<TcpStream>, ServerRoot) {
 fn register_endpoint(
     root: &ServerRoot,
     path: &str,
-    binding: ExecutableBinding<MqttContext<hotaru_core::connection::tcp::TcpTransport>>,
+    binding: ExecutableBinding<MqttContext<hotaru_io_tokio::TcpTransport>>,
     params: ParamsClone,
 ) {
     root.sub_url(path, binding, params)
@@ -1627,7 +1632,7 @@ async fn publishes_keep_their_order_through_the_worker() {
 /// question you cannot answer is no.
 #[tokio::test]
 async fn an_unconfigured_broker_refuses_every_connect() {
-    let (port, broker) = start_broker_with(Broker::<TcpStream>::new()).await;
+    let (port, broker) = start_broker_with(Broker::<Wire>::new()).await;
     let (mut reader, mut writer) = connect_raw(port).await;
 
     send_packet(&mut writer, &connect_packet("anyone")).await;
@@ -1674,7 +1679,7 @@ async fn a_disabled_keep_alive_is_refused_by_default() {
 /// quiet way back to the permissive behaviour.
 #[tokio::test]
 async fn default_agrees_with_new() {
-    let (port, broker) = start_broker_with(Broker::<TcpStream>::default()).await;
+    let (port, broker) = start_broker_with(Broker::<Wire>::default()).await;
     let (mut reader, mut writer) = connect_raw(port).await;
 
     send_packet(&mut writer, &connect_packet("anyone")).await;
@@ -1691,7 +1696,7 @@ async fn default_agrees_with_new() {
 /// The permissive behaviour stays reachable, by a name that says what it is.
 #[tokio::test]
 async fn accept_all_still_accepts() {
-    let (port, broker) = start_broker_with(Broker::<TcpStream>::accept_all()).await;
+    let (port, broker) = start_broker_with(Broker::<Wire>::accept_all()).await;
     let (mut reader, mut writer) = connect_raw(port).await;
 
     send_packet(&mut writer, &connect_packet("anyone")).await;
@@ -1780,7 +1785,7 @@ async fn a_keep_alive_at_the_ceiling_is_accepted() {
 #[tokio::test]
 async fn with_safety_keeps_the_deny_all_default() {
     let safety = MqttSafety::new().with_max_packet_size(1024);
-    let (port, broker) = start_broker_with(Broker::<TcpStream>::with_safety(safety)).await;
+    let (port, broker) = start_broker_with(Broker::<Wire>::with_safety(safety)).await;
     let (mut reader, mut writer) = connect_raw(port).await;
 
     send_packet(&mut writer, &connect_packet("anyone")).await;
