@@ -14,10 +14,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use hotaru_core::app::common::RuntimeConfig;
-use hotaru_core::connection::{ConnStream, TransportSpec};
+use hotaru_core::connection::{ConnStream, HotaruRead, HotaruWrite, TransportSpec};
 use hotaru_core::protocol::{Channel as _, CtxError, Protocol, ProtocolFlow, ProtocolRole};
 use hotaru_core::url::UrlRoot;
-use tokio::io::BufReader;
 
 use crate::broker::incoming_from_packet;
 use crate::channel::MqttChannel;
@@ -91,11 +90,17 @@ impl<W: ConnStream, TS: TransportSpec<Wire = W>> MqttProtocol<W, TS> {
     }
 }
 
-#[async_trait]
 impl<W, TS> Protocol for MqttProtocol<W, TS>
 where
     W: ConnStream,
     TS: TransportSpec<Wire = W>,
+    // 0.8.5 dropped the global `RequestContext::Error: From<std::io::Error>`
+    // bound in favour of a per-transport one; the trait now demands this of
+    // every implementor. Pinned to std::io::Error for the same reason as the
+    // codec bounds - the per-transport generalisation is #103's decision.
+    MqttError: From<<TS as TransportSpec>::IoError>,
+    W::ReadHalf: HotaruRead<Error = std::io::Error>,
+    W::WriteHalf: HotaruWrite<Error = std::io::Error>,
 {
     type Wire = W;
     type TS = TS;
@@ -126,8 +131,8 @@ where
 
     fn open_channel(
         self,
-        reader: BufReader<<<Self::TS as TransportSpec>::Wire as ConnStream>::ReadHalf>,
-        writer: <<Self::TS as TransportSpec>::Wire as ConnStream>::WriteHalf,
+        reader: <<<Self::TS as TransportSpec>::Wire as ConnStream>::ReadHalf as HotaruRead>::Buffered,
+        writer: <<<Self::TS as TransportSpec>::Wire as ConnStream>::WriteHalf as HotaruWrite>::Buffered,
         meta: <<Self::TS as TransportSpec>::Wire as ConnStream>::Meta,
     ) -> Self::Channel {
         let channel = MqttChannel::new(reader, writer, &meta, self.role);
