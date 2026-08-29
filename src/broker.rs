@@ -459,8 +459,7 @@ impl<W: ConnStream> Broker<W> {
                 entry
                     .channel
                     .session()
-                    .outbound_inflight
-                    .insert(id, packet.clone());
+                    .track_outbound_inflight(id, packet.clone());
                 Some(id)
             } else {
                 None

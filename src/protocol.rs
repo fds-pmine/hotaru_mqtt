@@ -444,7 +444,7 @@ where
         }
         Packet::Pubrel(id) => {
             // Inbound QoS 2: take stored qos2_recv and dispatch
-            if let Some((_, publish)) = channel.session().qos2_recv.remove(&id) {
+            if let Some(publish) = channel.session().take_qos2_publish(id) {
                 dispatch_incoming_to_endpoints_owned(channel.clone(), publish, runtime, root, config.default_inbound.as_ref()).await;
             }
             channel.send_packet(Packet::Pubcomp(id))?;
@@ -788,7 +788,7 @@ where
             // QoS 2 inbound publish phase 2: release the stored publish to the
             // worker. PUBCOMP is sent from the reader right away — the peer's
             // handshake must not wait on the chain.
-            if let Some((_, stored)) = channel.session().qos2_recv.remove(&packet_id) {
+            if let Some(stored) = channel.session().take_qos2_publish(packet_id) {
                 let publish = PublishPacket {
                     topic: stored.topic.clone(),
                     payload: stored.payload.clone(),
@@ -832,8 +832,7 @@ fn ack_inbound_publish_pre_chain<W: ConnStream>(
                 // Stash for PUBREL dispatch
                 channel
                     .session()
-                    .qos2_recv
-                    .insert(id, incoming_from_packet(publish));
+                    .stash_qos2_publish(id, incoming_from_packet(publish));
                 channel.send_packet(Packet::Pubrec(id))?;
             }
             Ok(())

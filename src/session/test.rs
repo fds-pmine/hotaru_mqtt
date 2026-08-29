@@ -14,6 +14,17 @@ fn publish(id: PacketId) -> PublishPacket {
     }
 }
 
+fn incoming(id: PacketId) -> IncomingPublish {
+    IncomingPublish {
+        topic: Arc::from("t"),
+        payload: Bytes::from_static(b"x"),
+        qos: crate::request::QoS::ExactlyOnce,
+        retain: false,
+        dup: false,
+        packet_id: Some(id),
+    }
+}
+
 /// Clearing inflight must reach only the session it was called on. Two
 /// connections sharing a client_id both exist during a takeover and share
 /// one packet-id space, so a resolver that finds its session by name can
@@ -159,4 +170,61 @@ fn a_publish_ack_never_touches_a_subscribe_slot() {
         receiver.try_recv(),
         Err(oneshot::error::TryRecvError::Empty)
     ));
+}
+
+// ----------------------------------------------------------------------------
+// Encapsulation (RFC #72)
+// ----------------------------------------------------------------------------
+
+/// The QoS 2 inbound stash round-trips through its accessors, and a second
+/// release finds nothing — a duplicate PUBREL must not dispatch twice.
+#[test]
+fn a_stashed_qos2_publish_is_released_exactly_once() {
+    let session = MqttSession::new();
+    session.stash_qos2_publish(9, incoming(9));
+
+    assert!(session.take_qos2_publish(9).is_some(), "the first PUBREL releases it");
+    assert!(
+        session.take_qos2_publish(9).is_none(),
+        "a duplicate PUBREL finds the slot already emptied"
+    );
+}
+
+/// A PUBREL naming an id that was never stashed releases nothing rather than
+/// misfiring on a neighbouring entry.
+#[test]
+fn releasing_an_unknown_packet_id_yields_nothing() {
+    let session = MqttSession::new();
+    session.stash_qos2_publish(9, incoming(9));
+
+    assert!(session.take_qos2_publish(10).is_none());
+    assert!(session.take_qos2_publish(9).is_some(), "the real entry is untouched");
+}
+
+/// The outbound retransmit record is observable through its accessor across
+/// exactly the window the flow owns it.
+#[test]
+fn an_outbound_inflight_record_spans_track_to_clear() {
+    let session = MqttSession::new();
+    assert!(!session.has_outbound_inflight(3));
+
+    session.track_outbound_inflight(3, publish(3));
+    assert!(session.has_outbound_inflight(3));
+
+    session.clear_outbound_inflight(3);
+    assert!(!session.has_outbound_inflight(3));
+}
+
+/// `abandon` drops the QoS 2 stash along with everything else, so a torn-down
+/// session cannot release a publish into a connection that is gone.
+#[test]
+fn abandon_empties_the_qos2_stash() {
+    let session = MqttSession::new();
+    session.stash_qos2_publish(9, incoming(9));
+    session.track_outbound_inflight(3, publish(3));
+
+    session.abandon();
+
+    assert!(session.take_qos2_publish(9).is_none());
+    assert!(!session.has_outbound_inflight(3));
 }
