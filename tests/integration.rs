@@ -1651,6 +1651,18 @@ async fn an_unconfigured_broker_refuses_every_connect() {
 /// the process.
 #[tokio::test]
 async fn a_disabled_keep_alive_is_refused_by_default() {
+    let (port, broker) = start_broker_with(Broker::new()).await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    let mut connect = connect_packet("forever");
+    if let Packet::Connect(ref mut c) = connect {
+        c.keep_alive = 0;
+    }
+    send_packet(&mut writer, &connect).await;
+
+    match read_packet(&mut reader).await {
+        Packet::Connack(connack) => {
+            assert_eq!(ConnackReturnCode::ServerUnavailable, connack.return_code);
             assert!(!connack.session_present);
         }
         other => panic!("expected the refusal CONNACK, got {other:?}"),
@@ -1712,4 +1724,72 @@ async fn a_disabled_keep_alive_is_accepted_when_opted_into() {
     match read_packet(&mut reader).await {
         Packet::Connack(connack) => {
             assert_eq!(ConnackReturnCode::Accepted, connack.return_code)
+        }
+        other => panic!("expected an accepting CONNACK, got {other:?}"),
+    }
+    assert_eq!(1, broker.session_count());
+}
+
+/// A keep-alive above the ceiling is refused outright rather than clamped down
+/// to it — the client must not be left believing it has a grace period the
+/// server will not honour.
+#[tokio::test]
+async fn a_keep_alive_above_the_ceiling_is_refused_not_clamped() {
+    let (port, broker) =
+        start_broker_with(accept_all_with(MqttSafety::new().with_max_keep_alive(120))).await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    let mut connect = connect_packet("patient");
+    if let Packet::Connect(ref mut c) = connect {
+        c.keep_alive = 121;
+    }
+    send_packet(&mut writer, &connect).await;
+
+    match read_packet(&mut reader).await {
+        Packet::Connack(connack) => {
+            assert_eq!(ConnackReturnCode::ServerUnavailable, connack.return_code)
+        }
+        other => panic!("expected the refusal CONNACK, got {other:?}"),
+    }
+    assert_eq!(0, broker.session_count());
+}
+
+/// The boundary itself is accepted: the ceiling is inclusive.
+#[tokio::test]
+async fn a_keep_alive_at_the_ceiling_is_accepted() {
+    let (port, _broker) =
+        start_broker_with(accept_all_with(MqttSafety::new().with_max_keep_alive(120))).await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    let mut connect = connect_packet("punctual");
+    if let Packet::Connect(ref mut c) = connect {
+        c.keep_alive = 120;
+    }
+    send_packet(&mut writer, &connect).await;
+
+    match read_packet(&mut reader).await {
+        Packet::Connack(connack) => {
+            assert_eq!(ConnackReturnCode::Accepted, connack.return_code)
+        }
+        other => panic!("expected an accepting CONNACK, got {other:?}"),
+    }
+}
+
+/// Safety limits and admission policy are independent knobs: asking for one
+/// must not silently hand back the other's permissive default.
+#[tokio::test]
+async fn with_safety_keeps_the_deny_all_default() {
+    let safety = MqttSafety::new().with_max_packet_size(1024);
+    let (port, broker) = start_broker_with(Broker::<TcpStream>::with_safety(safety)).await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    send_packet(&mut writer, &connect_packet("anyone")).await;
+
+    match read_packet(&mut reader).await {
+        Packet::Connack(connack) => {
+            assert_eq!(ConnackReturnCode::NotAuthorized, connack.return_code)
+        }
+        other => panic!("expected the refusal CONNACK, got {other:?}"),
+    }
+    assert_eq!(0, broker.session_count());
 }
