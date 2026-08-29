@@ -43,7 +43,6 @@ pub(crate) fn next_connection_id() -> u64 {
 pub enum WriteCmd {
     Packet(Packet),
     Publish(PublishPacket),
-    Flush,
     Shutdown,
 }
 
@@ -218,14 +217,21 @@ async fn writer_actor<W: ConnStream>(
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 match cmd {
+                    // Flush after every packet. The writer 0.8.5 hands us is
+                    // buffered (8 KiB on the tokio backend); without this,
+                    // CONNACK (4 bytes), PUBACK (4), PINGRESP (2) sit in the
+                    // buffer until the connection accumulates 8 KiB of output.
+                    // MQTT packets are small and latency-sensitive - there is
+                    // no batching win here worth a stuck handshake. A batching
+                    // policy, if ever wanted, needs its own issue and its own
+                    // measurements.
                     Some(WriteCmd::Packet(p)) => {
                         if write_packet(&mut writer, &p).await.is_err() { break; }
+                        if writer.flush().await.is_err() { break; }
                     }
                     Some(WriteCmd::Publish(p)) => {
                         if write_publish_packet(&mut writer, &p).await.is_err() { break; }
-                    }
-                    Some(WriteCmd::Flush) => {
-                        let _ = writer.flush().await;  // W policy §1: shutdown-ish path
+                        if writer.flush().await.is_err() { break; }
                     }
                     Some(WriteCmd::Shutdown) | None => break,
                 }
