@@ -2,9 +2,11 @@
 
 use super::*;
 
+use std::io::Cursor;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
+use hotaru_io_tokio::TokioIo;
 
 use crate::error::{CodecError, MqttError, Violation};
 use crate::packet::{
@@ -188,13 +190,16 @@ fn both_encoders_refuse_a_qos1_publish_with_no_packet_id() {
     ));
     // The same packet through write_publish_packet: refused the same way,
     // and not one byte reaches the writer.
-    let mut written: Vec<u8> = Vec::new();
-    let refused = futures_block_on(write_publish_packet(&mut written, &invalid));
+    let mut writer = TokioIo::new(Vec::<u8>::new());
+    let refused = futures_block_on(write_publish_packet(&mut writer, &invalid));
     assert!(matches!(
         refused,
         Err(MqttError::Codec(CodecError::MissingPacketId))
     ));
-    assert!(written.is_empty(), "refusal must not leave half a frame");
+    assert!(
+        writer.into_inner().is_empty(),
+        "refusal must not leave half a frame"
+    );
 }
 
 #[test]
@@ -291,7 +296,7 @@ async fn read_packet_refuses_oversize_before_allocating() {
     // The reader supplies only the fixed header. If the cap were checked
     // after `vec![0u8; remaining]`, this would allocate ~256 MiB first and
     // then block on read_exact; the test would hang rather than fail.
-    let mut reader = &[0x30u8, 0xFF, 0xFF, 0xFF, 0x7F][..];
+    let mut reader = TokioIo::new(Cursor::new(vec![0x30u8, 0xFF, 0xFF, 0xFF, 0x7F]));
     let err = read_packet(&mut reader, 1024).await.unwrap_err();
     assert!(
         matches!(
@@ -314,7 +319,7 @@ async fn packet_exactly_at_the_cap_is_accepted() {
     });
     let wire = encode_packet(&publish).expect("fixture packet must encode");
     let body_len = wire.len() - 2; // one-byte fixed header + one-byte VBI
-    let mut reader = &wire[..];
+    let mut reader = TokioIo::new(Cursor::new(wire.clone()));
     assert!(read_packet(&mut reader, body_len).await.is_ok());
 }
 
