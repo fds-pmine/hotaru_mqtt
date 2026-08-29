@@ -715,7 +715,7 @@ async fn a_qos2_flow_keeps_its_inflight_record_until_pubcomp() {
             other => panic!("expected PUBLISH, got {other:?}"),
         };
         // Stand in for a fanout record under the same id.
-        session.outbound_inflight.insert(
+        session.track_outbound_inflight(
             packet_id,
             PublishPacket {
                 topic: Arc::from("seeded/for/this/test"),
@@ -734,7 +734,7 @@ async fn a_qos2_flow_keeps_its_inflight_record_until_pubcomp() {
         }
         // PUBREL is out, PUBCOMP is not in: the flow is mid-air.
         assert!(
-            session.outbound_inflight.get(&packet_id).is_some(),
+            session.has_outbound_inflight(packet_id),
             "the record was cleared at PUBREC, so the message is no longer \
 retransmittable even though the peer has not confirmed release"
         );
@@ -752,7 +752,7 @@ retransmittable even though the peer has not confirmed release"
         MqttResponse::Published(PublishAck::Completed(_))
     ));
     assert!(
-        channel.session().outbound_inflight.get(&packet_id).is_none(),
+        !channel.session().has_outbound_inflight(packet_id),
         "the record should be cleared once PUBCOMP completes the flow"
     );
 }

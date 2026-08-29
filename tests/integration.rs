@@ -17,9 +17,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 use hotaru_mqtt::{
-    BROKER_STATICS_KEY, Broker, ConnackPacket, ConnackReturnCode, ConnectPacket, MQTT,
-    MqttSafety, Packet, PublishPacket, QoS, SubackPacket, SubscribePacket,
-    TopicSubscription, codec,
+    AcceptAllAuthenticator, BROKER_STATICS_KEY, Broker, ConnackPacket, ConnackReturnCode,
+    ConnectPacket, MQTT, MqttSafety, Packet, PublishPacket, QoS, SubackPacket,
+    SubscribePacket, TopicSubscription, codec,
 };
 
 // ----------------------------------------------------------------------------
@@ -100,6 +100,16 @@ async fn read_packet(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> 
         .await
         .expect("read_packet timeout")
         .expect("read_packet error")
+}
+
+/// A broker that accepts every CONNECT, with `safety` attached.
+///
+/// Spelled through `with_authenticator_and_safety` rather than `with_safety`
+/// so that it keeps meaning accept-all regardless of what the default
+/// admission policy is — these keep-alive tests are about the keep-alive
+/// policy, not about who is allowed in.
+fn accept_all_with(safety: MqttSafety) -> Broker<TcpStream> {
+    Broker::with_authenticator_and_safety(Arc::new(AcceptAllAuthenticator), safety)
 }
 
 fn connect_packet(client_id: &str) -> Packet {
@@ -1150,9 +1160,17 @@ async fn a_superseded_connection_id_cannot_touch_the_live_session() {
 /// the most aggressive the expression could produce, and the exact opposite of
 /// what was requested. A connection that declared "never time me out" was
 /// dropped after a second.
+///
+/// Reaching that path now takes an explicit opt-in: as of the #78 policy the
+/// default refuses `keep_alive = 0` outright. What this test covers is the
+/// deadline mechanism, not the admission policy, so it opts in and keeps
+/// asserting exactly what it always did.
 #[tokio::test]
 async fn a_zero_keep_alive_connection_is_not_dropped_for_being_idle() {
-    let (port, broker) = start_broker().await;
+    let (port, broker) = start_broker_with(accept_all_with(
+        MqttSafety::new().allow_disabled_keep_alive(),
+    ))
+    .await;
     let (mut reader, mut writer) = connect_raw(port).await;
 
     let mut connect = match connect_packet("patient") {
@@ -1624,6 +1642,22 @@ async fn an_unconfigured_broker_refuses_every_connect() {
     assert_eq!(0, broker.session_count(), "a refused CONNECT must not register");
 }
 
+// Keep-alive policy (RFC #78)
+// ----------------------------------------------------------------------------
+
+/// `keep_alive = 0` asks the server to hold the connection open with no
+/// inactivity deadline at all. The default policy refuses it: an
+/// unauthenticated peer must not be able to pin a connection for the life of
+/// the process.
+#[tokio::test]
+async fn a_disabled_keep_alive_is_refused_by_default() {
+            assert!(!connack.session_present);
+        }
+        other => panic!("expected the refusal CONNACK, got {other:?}"),
+    }
+    assert_eq!(0, broker.session_count(), "a refused CONNECT must not register");
+}
+
 /// `Default` must agree with `new` — otherwise `Broker::default()` would be a
 /// quiet way back to the permissive behaviour.
 #[tokio::test]
@@ -1659,21 +1693,23 @@ async fn accept_all_still_accepts() {
     assert_eq!(1, broker.session_count());
 }
 
-/// Safety limits and admission policy are independent knobs: asking for one
-/// must not silently hand back the other's permissive default.
+/// The refusal is policy, not a hard rule: an operator can restore the letter
+/// of §3.1.2.10 for deployments that need it.
 #[tokio::test]
-async fn with_safety_keeps_the_deny_all_default() {
-    let safety = MqttSafety::new().with_max_packet_size(1024);
-    let (port, broker) = start_broker_with(Broker::<TcpStream>::with_safety(safety)).await;
+async fn a_disabled_keep_alive_is_accepted_when_opted_into() {
+    let (port, broker) = start_broker_with(accept_all_with(
+        MqttSafety::new().allow_disabled_keep_alive(),
+    ))
+    .await;
     let (mut reader, mut writer) = connect_raw(port).await;
 
-    send_packet(&mut writer, &connect_packet("anyone")).await;
+    let mut connect = connect_packet("forever");
+    if let Packet::Connect(ref mut c) = connect {
+        c.keep_alive = 0;
+    }
+    send_packet(&mut writer, &connect).await;
 
     match read_packet(&mut reader).await {
         Packet::Connack(connack) => {
-            assert_eq!(ConnackReturnCode::NotAuthorized, connack.return_code)
-        }
-        other => panic!("expected the refusal CONNACK, got {other:?}"),
-    }
-    assert_eq!(0, broker.session_count());
+            assert_eq!(ConnackReturnCode::Accepted, connack.return_code)
 }

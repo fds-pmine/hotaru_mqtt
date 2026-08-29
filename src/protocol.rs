@@ -444,7 +444,7 @@ where
         }
         Packet::Pubrel(id) => {
             // Inbound QoS 2: take stored qos2_recv and dispatch
-            if let Some((_, publish)) = channel.session().qos2_recv.remove(&id) {
+            if let Some(publish) = channel.session().take_qos2_publish(id) {
                 dispatch_incoming_to_endpoints_owned(channel.clone(), publish, runtime, root, config.default_inbound.as_ref()).await;
             }
             channel.send_packet(Packet::Pubcomp(id))?;
@@ -502,7 +502,28 @@ where
         return Err(Violation::ExpectedConnect.into());
     };
 
-    // 2. Authenticate
+    // 2. Enforce the keep-alive policy before anything is allocated for this
+    //    peer. A keep-alive is the peer's own declaration, so an out-of-policy
+    //    value is refused rather than clamped: clamping would leave the client
+    //    believing it has a grace period it does not have. `ServerUnavailable`
+    //    is the closest 3.1.1 return code — the connection is refused on the
+    //    server's terms, not because the credentials or the identifier are bad.
+    let safety = broker.safety();
+    let keep_alive_refused = if connect.keep_alive == 0 {
+        !safety.allows_disabled_keep_alive()
+    } else {
+        connect.keep_alive > safety.max_keep_alive()
+    };
+    if keep_alive_refused {
+        let return_code = ConnackReturnCode::ServerUnavailable;
+        let _ = channel.send_packet(Packet::Connack(ConnackPacket {
+            session_present: false,
+            return_code,
+        }));
+        return Err(Violation::ConnectionRefused(return_code).into());
+    }
+
+    // 3. Authenticate
     let auth = broker.authenticate(&connect, channel.remote_addr()).await;
     if !auth.accepted {
         let _ = channel.send_packet(Packet::Connack(ConnackPacket {
@@ -535,7 +556,7 @@ where
     // rather than "this name" takes this alongside it.
     let connection_id = channel.connection_id();
 
-    // 3. Register session (broker takes channel clone)
+    // 4. Register session (broker takes channel clone)
     let session_present = broker
         .register_session(client_id.clone(), channel.clone(), will, clean_session)
         .await;
@@ -545,7 +566,7 @@ where
         keep_alive,
     });
 
-    // 4. Send CONNACK
+    // 5. Send CONNACK
     //
     // The session is already registered at this point, so a failure here has
     // to unregister before it propagates — the same obligation the read loop
@@ -558,8 +579,9 @@ where
         return Err(e);
     }
 
-    // 5. Main select loop with keep-alive deadline (1.5× grace per spec, and
-    //    no deadline at all when the client declared keep_alive = 0)
+    // 6. Main select loop with keep-alive deadline (1.5× grace per spec). A
+    //    `None` deadline means keep_alive = 0, which only reaches here when the
+    //    operator opted in through `MqttSafety::allow_disabled_keep_alive`.
     let read_deadline = server_read_deadline(keep_alive);
 
     // Endpoint chains and fanout run on their own task (finding: an endpoint
@@ -766,7 +788,7 @@ where
             // QoS 2 inbound publish phase 2: release the stored publish to the
             // worker. PUBCOMP is sent from the reader right away — the peer's
             // handshake must not wait on the chain.
-            if let Some((_, stored)) = channel.session().qos2_recv.remove(&packet_id) {
+            if let Some(stored) = channel.session().take_qos2_publish(packet_id) {
                 let publish = PublishPacket {
                     topic: stored.topic.clone(),
                     payload: stored.payload.clone(),
@@ -810,8 +832,7 @@ fn ack_inbound_publish_pre_chain<W: ConnStream>(
                 // Stash for PUBREL dispatch
                 channel
                     .session()
-                    .qos2_recv
-                    .insert(id, incoming_from_packet(publish));
+                    .stash_qos2_publish(id, incoming_from_packet(publish));
                 channel.send_packet(Packet::Pubrec(id))?;
             }
             Ok(())
