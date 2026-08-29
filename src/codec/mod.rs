@@ -10,7 +10,7 @@
 use std::error::Error;
 
 use bytes::BytesMut;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use hotaru_core::connection::{HotaruRead, HotaruWrite};
 
 use hotaru_core::protocol::Message;
 
@@ -46,7 +46,7 @@ use varint::{decode_remaining_length_from_slice, encode_remaining_length,
 /// decoding that length and allocating the body, so an oversized declaration
 /// costs one fixed header and no heap — the peer never gets to pick an
 /// allocation size. Callers pass the value from their `MqttSafety`.
-pub async fn read_packet<R: AsyncRead + Unpin>(
+pub async fn read_packet<R: HotaruRead<Error = std::io::Error> + Unpin + Send>(
     reader: &mut R,
     max_size: usize,
 ) -> Result<Packet, MqttError> {
@@ -148,7 +148,7 @@ pub fn encode_packet(packet: &Packet) -> Result<Vec<u8>, CodecError> {
 
 /// Write a packet to an async writer. Used by the writer actor for control
 /// packets.
-pub async fn write_packet<W: AsyncWrite + Unpin>(
+pub async fn write_packet<W: HotaruWrite<Error = std::io::Error> + Unpin + Send>(
     writer: &mut W,
     packet: &Packet,
 ) -> Result<(), MqttError> {
@@ -160,7 +160,7 @@ pub async fn write_packet<W: AsyncWrite + Unpin>(
 /// Optimized write path for PUBLISH: writes the header in one syscall, then
 /// the payload `Bytes` directly with `write_all(&payload[..])` — no copy
 /// from `Bytes` to intermediate buffer.
-pub async fn write_publish_packet<W: AsyncWrite + Unpin>(
+pub async fn write_publish_packet<W: HotaruWrite<Error = std::io::Error> + Unpin + Send>(
     writer: &mut W,
     packet: &PublishPacket,
 ) -> Result<(), MqttError> {
