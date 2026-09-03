@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hotaru_core::app::common::RuntimeConfig;
-use hotaru_core::connection::{ConnStream, TransportSpec};
+use hotaru_core::connection::{ConnStream, HotaruRead, TransportSpec};
 use hotaru_core::protocol::{Channel as _, ProtocolFlow};
 use hotaru_core::url::UrlRoot;
 use tokio::time::timeout;
@@ -62,6 +62,7 @@ pub(super) async fn handle_client<W, TS>(
 ) -> Result<ProtocolFlow, MqttError>
 where
     W: ConnStream,
+    W::ReadHalf: HotaruRead<Error = std::io::Error>,
     TS: TransportSpec<Wire = W>,
 {
     let config = runtime

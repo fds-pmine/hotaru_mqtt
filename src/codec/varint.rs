@@ -1,12 +1,14 @@
 //! Variable-byte-integer remaining-length codec (spec 2.2.3).
 
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use hotaru_core::connection::HotaruRead;
 
 use crate::error::{CodecError, MqttError};
 
 
-pub(super) async fn read_remaining_length<R: AsyncRead + Unpin>(reader: &mut R) -> Result<usize, MqttError> {
+pub(super) async fn read_remaining_length<R: HotaruRead<Error = std::io::Error> + Unpin + Send>(
+    reader: &mut R,
+) -> Result<usize, MqttError> {
     let mut result = 0usize;
     let mut multiplier = 1usize;
     for i in 0..4 {
