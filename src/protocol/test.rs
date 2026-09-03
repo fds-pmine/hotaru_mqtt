@@ -1,6 +1,9 @@
 //! Protocol tests: keep-alive deadline and ping-interval arithmetic.
 
-use super::*;
+use std::time::Duration;
+
+use super::client::client_ping_interval;
+use super::server::server_read_deadline;
 
 /// Spec §3.1.2.10: `keep_alive = 0` turns the mechanism off, so the server
 /// must not disconnect for inactivity. The old `keep_alive.max(1)` turned
