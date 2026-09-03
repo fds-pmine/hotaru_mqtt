@@ -21,6 +21,7 @@ use hotaru_core::extensions::Locals;
 use hotaru_core::protocol::Protocol;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use hotaru_io_tokio::TcpStream as Wire;
 use tokio::time::timeout;
 
 use hotaru_mqtt::{
@@ -61,11 +62,11 @@ async fn start_client(config: MqttClientConfig) -> FakeBroker {
 /// session, which is exactly the sharing the ack slots rely on.
 async fn start_client_with_channel(
     config: MqttClientConfig,
-) -> (FakeBroker, MqttChannel<TcpStream>) {
+) -> (FakeBroker, MqttChannel<Wire>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
 
-    let registry: ProtocolEntryRegistry<hotaru_core::connection::tcp::TcpTransport> =
+    let registry: ProtocolEntryRegistry<hotaru_io_tokio::TcpTransport> =
         ProtocolRegistryBuilder::new()
             .protocol(ProtocolEntryBuilder::new(MQTT::client()))
             .build();
@@ -81,7 +82,7 @@ async fn start_client_with_channel(
 
     let (chan_tx, chan_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let stream = Wire::new(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
         let (read_half, write_half, meta) = ConnStream::split(stream);
         let channel = MQTT::client().open_channel(BufReader::new(read_half), write_half, meta);
         let _ = chan_tx.send(channel.clone());
@@ -100,7 +101,7 @@ async fn start_client_with_channel(
 /// Drive one outbound request the way `run!` would: build a context, install
 /// the channel, hand it to `Protocol::send`.
 async fn protocol_send(
-    channel: &MqttChannel<TcpStream>,
+    channel: &MqttChannel<Wire>,
     request: MqttRequest,
 ) -> Result<MqttResponse, MqttError> {
     let mut ctx: MqttContext = MqttContext::default();
