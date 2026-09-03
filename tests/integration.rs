@@ -12,7 +12,8 @@ use hotaru_core::app::common::RuntimeConfig;
 use hotaru_core::executable::{ProtocolEntryBuilder, ProtocolRegistryBuilder};
 use hotaru_core::executable::registry::ProtocolEntryRegistry;
 use hotaru_core::extensions::Locals;
-use tokio::io::{AsyncWriteExt, BufReader};
+use hotaru_io_tokio::TokioIo;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 // The broker's wire type: the framework side of a connection. The raw
 // tokio::net::TcpStream stays in use for the *peer* side of every test -
@@ -64,7 +65,7 @@ async fn start_broker_with(broker: Broker<Wire>) -> (u16, Broker<Wire>) {
                     let registry = registry.clone();
                     let runtime = runtime.clone();
                     tokio::spawn(async move {
-                        registry.serve(runtime, stream).await;
+                        registry.serve(runtime, Wire::new(stream)).await;
                     });
                 }
                 Err(_) => break,
@@ -81,12 +82,12 @@ async fn start_broker_with(broker: Broker<Wire>) -> (u16, Broker<Wire>) {
 async fn connect_raw(
     port: u16,
 ) -> (
-    BufReader<tokio::net::tcp::OwnedReadHalf>,
+    TokioIo<tokio::net::tcp::OwnedReadHalf>,
     tokio::net::tcp::OwnedWriteHalf,
 ) {
     let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     let (r, w) = stream.into_split();
-    (BufReader::new(r), w)
+    (TokioIo::new(r), w)
 }
 
 async fn send_packet(writer: &mut tokio::net::tcp::OwnedWriteHalf, packet: &Packet) {
@@ -100,7 +101,7 @@ async fn send_packet(writer: &mut tokio::net::tcp::OwnedWriteHalf, packet: &Pack
 /// one test that cares, and it drives the wire directly.
 const ANY_SIZE: usize = hotaru_mqtt::SPEC_MAX_PACKET_SIZE;
 
-async fn read_packet(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Packet {
+async fn read_packet(reader: &mut TokioIo<tokio::net::tcp::OwnedReadHalf>) -> Packet {
     timeout(Duration::from_secs(5), codec::read_packet(reader, ANY_SIZE))
         .await
         .expect("read_packet timeout")
@@ -661,7 +662,7 @@ async fn start_multi_protocol_broker() -> (u16, Broker<Wire>) {
                     let registry = registry.clone();
                     let runtime = runtime.clone();
                     tokio::spawn(async move {
-                        registry.serve(runtime, stream).await;
+                        registry.serve(runtime, Wire::new(stream)).await;
                     });
                 }
                 Err(_) => break,
@@ -822,7 +823,7 @@ async fn oversize_declaration_is_refused_before_authentication() {
     let mut sink = Vec::new();
     let closed = timeout(
         Duration::from_secs(2),
-        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut sink),
+        tokio::io::AsyncReadExt::read_to_end(reader.inner_mut(), &mut sink),
     )
     .await;
 
@@ -860,7 +861,7 @@ async fn oversize_declaration_is_refused_after_connect() {
     let mut sink = Vec::new();
     let closed = timeout(
         Duration::from_secs(2),
-        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut sink),
+        tokio::io::AsyncReadExt::read_to_end(reader.inner_mut(), &mut sink),
     )
     .await;
     assert!(closed.is_ok(), "connection still open after 2s");
@@ -895,7 +896,7 @@ async fn malformed_packet_after_connect_unregisters_the_session() {
     let mut sink = Vec::new();
     let _ = timeout(
         Duration::from_secs(2),
-        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut sink),
+        tokio::io::AsyncReadExt::read_to_end(reader.inner_mut(), &mut sink),
     )
     .await;
     // The teardown runs after the loop exits; give the task a moment to finish.
@@ -985,7 +986,7 @@ async fn takeover_closes_the_earlier_connection() {
     let mut sink = Vec::new();
     let closed = timeout(
         Duration::from_secs(2),
-        tokio::io::AsyncReadExt::read_to_end(&mut first_reader, &mut sink),
+        tokio::io::AsyncReadExt::read_to_end(first_reader.inner_mut(), &mut sink),
     )
     .await;
     assert!(
@@ -1014,7 +1015,7 @@ async fn earlier_teardown_does_not_evict_the_live_session() {
     let mut sink = Vec::new();
     let _ = timeout(
         Duration::from_secs(2),
-        tokio::io::AsyncReadExt::read_to_end(&mut first_reader, &mut sink),
+        tokio::io::AsyncReadExt::read_to_end(first_reader.inner_mut(), &mut sink),
     )
     .await;
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1194,7 +1195,7 @@ async fn a_zero_keep_alive_connection_is_not_dropped_for_being_idle() {
     let mut sink = Vec::new();
     let closed = timeout(
         Duration::from_millis(2_500),
-        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut sink),
+        tokio::io::AsyncReadExt::read_to_end(reader.inner_mut(), &mut sink),
     )
     .await;
     assert!(
@@ -1226,7 +1227,7 @@ async fn an_idle_connection_with_a_keep_alive_is_still_dropped() {
     let mut sink = Vec::new();
     let closed = timeout(
         Duration::from_secs(4),
-        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut sink),
+        tokio::io::AsyncReadExt::read_to_end(reader.inner_mut(), &mut sink),
     )
     .await;
     assert!(
@@ -1285,7 +1286,7 @@ async fn a_refused_connect_gets_the_declared_code_and_no_session() {
     let mut leftover = Vec::new();
     let closed = timeout(
         Duration::from_secs(2),
-        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut leftover),
+        tokio::io::AsyncReadExt::read_to_end(reader.inner_mut(), &mut leftover),
     )
     .await;
     assert!(closed.is_ok(), "connection should close after a refusal");
@@ -1421,7 +1422,7 @@ async fn start_broker_with_root() -> (u16, Broker<Wire>, ServerRoot) {
                     let registry = registry.clone();
                     let runtime = runtime.clone();
                     tokio::spawn(async move {
-                        registry.serve(runtime, stream).await;
+                        registry.serve(runtime, Wire::new(stream)).await;
                     });
                 }
                 Err(_) => break,

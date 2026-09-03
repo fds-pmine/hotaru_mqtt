@@ -19,7 +19,9 @@ use hotaru_core::executable::registry::ProtocolEntryRegistry;
 use hotaru_core::executable::{ProtocolEntryBuilder, ProtocolRegistryBuilder};
 use hotaru_core::extensions::Locals;
 use hotaru_core::protocol::Protocol;
-use tokio::io::{AsyncWriteExt, BufReader};
+use hotaru_core::connection::{HotaruRead as _, HotaruWrite as _};
+use hotaru_io_tokio::TokioIo;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use hotaru_io_tokio::TcpStream as Wire;
 use tokio::time::timeout;
@@ -35,7 +37,7 @@ use hotaru_mqtt::{
 const ANY_SIZE: usize = hotaru_mqtt::SPEC_MAX_PACKET_SIZE;
 
 type FakeBroker = (
-    BufReader<tokio::net::tcp::OwnedReadHalf>,
+    TokioIo<tokio::net::tcp::OwnedReadHalf>,
     tokio::net::tcp::OwnedWriteHalf,
 );
 
@@ -84,7 +86,8 @@ async fn start_client_with_channel(
     tokio::spawn(async move {
         let stream = Wire::new(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
         let (read_half, write_half, meta) = ConnStream::split(stream);
-        let channel = MQTT::client().open_channel(BufReader::new(read_half), write_half, meta);
+        let channel =
+            MQTT::client().open_channel(read_half.into_buf(), write_half.into_buf_write(), meta);
         let _ = chan_tx.send(channel.clone());
         let _ = <MQTT as Protocol>::handle(&channel, runtime, root).await;
     });
@@ -95,7 +98,7 @@ async fn start_client_with_channel(
         .unwrap();
     let (r, w) = stream.into_split();
     let channel = chan_rx.await.expect("session task dropped the channel");
-    ((BufReader::new(r), w), channel)
+    ((TokioIo::new(r), w), channel)
 }
 
 /// Drive one outbound request the way `run!` would: build a context, install
@@ -127,7 +130,7 @@ async fn send(writer: &mut tokio::net::tcp::OwnedWriteHalf, packet: &Packet) {
     writer.flush().await.unwrap();
 }
 
-async fn recv(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Packet {
+async fn recv(reader: &mut TokioIo<tokio::net::tcp::OwnedReadHalf>) -> Packet {
     timeout(Duration::from_secs(5), codec::read_packet(reader, ANY_SIZE))
         .await
         .expect("timed out waiting for the client to send something")
@@ -220,7 +223,7 @@ async fn a_refused_connack_ends_the_session() {
     let mut sink = Vec::new();
     let closed = timeout(
         Duration::from_secs(3),
-        tokio::io::AsyncReadExt::read_to_end(&mut peer.0, &mut sink),
+        tokio::io::AsyncReadExt::read_to_end(peer.0.inner_mut(), &mut sink),
     )
     .await;
     assert!(closed.is_ok(), "client stayed connected after a refusal");
@@ -407,7 +410,7 @@ async fn a_broker_disconnect_ends_the_session() {
     let mut sink = Vec::new();
     let closed = timeout(
         Duration::from_secs(3),
-        tokio::io::AsyncReadExt::read_to_end(&mut peer.0, &mut sink),
+        tokio::io::AsyncReadExt::read_to_end(peer.0.inner_mut(), &mut sink),
     )
     .await;
     assert!(
