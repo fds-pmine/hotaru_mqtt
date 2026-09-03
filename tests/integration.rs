@@ -1799,3 +1799,51 @@ async fn with_safety_keeps_the_deny_all_default() {
     }
     assert_eq!(0, broker.session_count());
 }
+
+// ----------------------------------------------------------------------------
+// #98's acceptance gate: round trips have hard upper bounds.
+//
+// The writer the framework hands open_channel is buffered from 0.8.5 on
+// (8 KiB on the tokio backend). Without a flush after each packet, these two
+// tests MUST time out - a CONNACK is 4 bytes and a PINGRESP is 2, and neither
+// comes close to filling the buffer. With the flush they MUST pass. The
+// seconds-scale timeouts on every other test cannot catch buffer retention;
+// these bounds are deliberately tight for exactly that reason.
+//
+// Do not widen these bounds or add sleeps to make them green: a failure here
+// is the flush regression itself, not flakiness.
+// ----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_connack_arrives_within_half_a_second() {
+    let (port, _broker) = start_broker().await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    send_packet(&mut writer, &connect_packet("prompt-connack")).await;
+    let connack = timeout(
+        Duration::from_millis(500),
+        codec::read_packet(&mut reader, ANY_SIZE),
+    )
+    .await
+    .expect("CONNACK did not arrive within 500ms - the writer is not flushing")
+    .expect("broker sent an undecodable CONNACK");
+    assert!(matches!(connack, Packet::Connack(_)));
+}
+
+#[tokio::test]
+async fn a_pingresp_arrives_within_two_hundred_millis() {
+    let (port, _broker) = start_broker().await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+    send_packet(&mut writer, &connect_packet("prompt-ping")).await;
+    let _connack = read_packet(&mut reader).await;
+
+    send_packet(&mut writer, &Packet::Pingreq).await;
+    let pingresp = timeout(
+        Duration::from_millis(200),
+        codec::read_packet(&mut reader, ANY_SIZE),
+    )
+    .await
+    .expect("PINGRESP did not arrive within 200ms - the writer is not flushing")
+    .expect("broker sent an undecodable PINGRESP");
+    assert!(matches!(pingresp, Packet::Pingresp));
+}
