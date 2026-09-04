@@ -89,18 +89,22 @@ let config = MqttClientConfig::new("device-42")
 
 // Register `config` under CLIENT_CONFIG_STATICS_KEY in your RuntimeConfig
 // statics, then run MQTT::client() as a protocol entry against the connection
-// to your broker. See tests/integration.rs for the wiring.
+// to your broker. See tests/client.rs for the wiring.
 ```
 
 ## Examples & tests
 
-End-to-end examples live in [`tests/integration.rs`](tests/integration.rs), which exercises the broker and client against real TCP loopback connections. Run them with:
+End-to-end examples live in [`tests/integration.rs`](tests/integration.rs), which drives the broker against real TCP loopback connections, and [`tests/client.rs`](tests/client.rs), which drives a client session against a scripted peer. Run them with:
 
 ```sh
 cargo test
 ```
 
-## Module layout
+## Internal layout
+
+These are internal modules, not addressable paths. Everything supported is
+re-exported at the crate root; `codec` is the one module you can name, for
+low-level wire encode/decode.
 
 | Module      | Responsibility                                                   |
 | ----------- | ---------------------------------------------------------------- |
@@ -115,7 +119,9 @@ cargo test
 | `session`   | `MqttSession`, packet-id tracking, `AckSlot`.                    |
 | `topic`     | Topic / filter parsing and validation.                           |
 | `error`     | `MqttError`, `CodecError`, `Violation`, `TimeoutKind`.           |
-| `transport` | Transport trait glue for `hotaru_core::connection`.              |
+
+Custom transports are supplied through the protocol's type parameters,
+`MqttProtocol<W, TS>`, rather than through a dedicated module.
 
 ## License
 

@@ -17,8 +17,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 use hotaru_mqtt::{
-    BROKER_STATICS_KEY, Broker, ConnackPacket, ConnackReturnCode, ConnectPacket, MQTT, Packet,
-    PublishPacket, QoS, SubackPacket, SubscribePacket, TopicSubscription, codec,
+    AcceptAllAuthenticator, BROKER_STATICS_KEY, Broker, ConnackPacket, ConnackReturnCode,
+    ConnectPacket, MQTT, MqttSafety, Packet, PublishPacket, QoS, SubackPacket,
+    SubscribePacket, TopicSubscription, codec,
 };
 
 // ----------------------------------------------------------------------------
@@ -28,9 +29,12 @@ use hotaru_mqtt::{
 /// Spin up a broker on a random port via raw TCP accept loop. Returns the
 /// bound port plus the broker handle (for in-process assertions).
 async fn start_broker() -> (u16, Broker<TcpStream>) {
+    start_broker_with(Broker::<TcpStream>::accept_all()).await
+}
+
+async fn start_broker_with(broker: Broker<TcpStream>) -> (u16, Broker<TcpStream>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let broker = Broker::<TcpStream>::new();
 
     // Build a one-protocol registry holding MQTT::server() + the broker statics.
     let registry: ProtocolEntryRegistry<hotaru_core::connection::tcp::TcpTransport> =
@@ -81,16 +85,31 @@ async fn connect_raw(
 }
 
 async fn send_packet(writer: &mut tokio::net::tcp::OwnedWriteHalf, packet: &Packet) {
-    let bytes = codec::encode_packet(packet);
+    let bytes = codec::encode_packet(packet).expect("test packet must encode");
     writer.write_all(&bytes).await.unwrap();
     writer.flush().await.unwrap();
 }
 
+/// Test reads are not exercising the size cap, so they use the widest value a
+/// conforming packet can declare. `oversize_publish_header_is_refused` is the
+/// one test that cares, and it drives the wire directly.
+const ANY_SIZE: usize = hotaru_mqtt::SPEC_MAX_PACKET_SIZE;
+
 async fn read_packet(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Packet {
-    timeout(Duration::from_secs(5), codec::read_packet(reader))
+    timeout(Duration::from_secs(5), codec::read_packet(reader, ANY_SIZE))
         .await
         .expect("read_packet timeout")
         .expect("read_packet error")
+}
+
+/// A broker that accepts every CONNECT, with `safety` attached.
+///
+/// Spelled through `with_authenticator_and_safety` rather than `with_safety`
+/// so that it keeps meaning accept-all regardless of what the default
+/// admission policy is — these keep-alive tests are about the keep-alive
+/// policy, not about who is allowed in.
+fn accept_all_with(safety: MqttSafety) -> Broker<TcpStream> {
+    Broker::with_authenticator_and_safety(Arc::new(AcceptAllAuthenticator), safety)
 }
 
 fn connect_packet(client_id: &str) -> Packet {
@@ -110,7 +129,7 @@ fn connect_packet(client_id: &str) -> Packet {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn smoke_lib_constructible() {
-    let _broker = Broker::<TcpStream>::new();
+    let _broker = Broker::<TcpStream>::accept_all();
     let _config = hotaru_mqtt::MqttClientConfig::new("test-client");
     let _proto = MQTT::server();
     let _proto = MQTT::client();
@@ -360,7 +379,7 @@ async fn unsubscribe_stops_delivery() {
     )
     .await;
 
-    let waited = timeout(Duration::from_millis(300), codec::read_packet(&mut sub_reader)).await;
+    let waited = timeout(Duration::from_millis(300), codec::read_packet(&mut sub_reader, ANY_SIZE)).await;
     assert!(
         waited.is_err(),
         "subscriber should not receive after UNSUBSCRIBE; got {:?}",
@@ -416,7 +435,7 @@ async fn self_fanout_suppression() {
     )
     .await;
 
-    let waited = timeout(Duration::from_millis(300), codec::read_packet(&mut reader)).await;
+    let waited = timeout(Duration::from_millis(300), codec::read_packet(&mut reader, ANY_SIZE)).await;
     assert!(
         waited.is_err(),
         "self-publish should be suppressed; got {:?}",
@@ -426,7 +445,7 @@ async fn self_fanout_suppression() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn broker_constructs_cleanly() {
-    let _broker = Broker::<TcpStream>::new();
+    let _broker = Broker::<TcpStream>::accept_all();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -613,7 +632,7 @@ async fn start_multi_protocol_broker() -> (u16, Broker<TcpStream>) {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let broker = Broker::<TcpStream>::new();
+    let broker = Broker::<TcpStream>::accept_all();
 
     let registry: ProtocolEntryRegistry<hotaru_core::connection::tcp::TcpTransport> =
         ProtocolRegistryBuilder::new()
@@ -767,4 +786,1010 @@ async fn will_message_fires_on_abrupt_disconnect() {
         }
         other => panic!("expected will PUBLISH, got {:?}", other),
     }
+}
+
+// ----------------------------------------------------------------------------
+// Wire-layer limits
+// ----------------------------------------------------------------------------
+
+/// An unauthenticated peer must not be able to choose the server's allocation
+/// size. Five bytes declare a ~256 MiB body; the cap has to bite on the CONNECT
+/// read itself, before authentication and before `vec![0u8; remaining]`.
+///
+/// The assertion is timing-shaped on purpose: without the cap the server
+/// allocates and then blocks in `read_exact` waiting for a body that never
+/// arrives, so the connection stays open for the full 10s CONNECT_RECEIVE
+/// timeout. With the cap it is refused on the header alone and the socket
+/// closes immediately.
+#[tokio::test]
+async fn oversize_declaration_is_refused_before_authentication() {
+    let (port, _broker) =
+        start_broker_with(Broker::accept_all_with_safety(
+            MqttSafety::new().with_max_packet_size(1024),
+        ))
+        .await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    // 0x10 = CONNECT, then FF FF FF 7F = the largest 4-byte VBI. No body follows.
+    writer.write_all(&[0x10, 0xFF, 0xFF, 0xFF, 0x7F]).await.unwrap();
+    writer.flush().await.unwrap();
+
+    let mut sink = Vec::new();
+    let closed = timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut sink),
+    )
+    .await;
+
+    assert!(
+        closed.is_ok(),
+        "connection still open after 2s: the body was allocated and the read \
+is parked waiting for 256 MiB that will never arrive"
+    );
+    assert!(
+        sink.is_empty(),
+        "server must not answer a malformed CONNECT, got {sink:?}"
+    );
+}
+
+/// The same guard on the steady-state loop, i.e. after CONNECT succeeded.
+#[tokio::test]
+async fn oversize_declaration_is_refused_after_connect() {
+    let (port, _broker) =
+        start_broker_with(Broker::accept_all_with_safety(
+            MqttSafety::new().with_max_packet_size(1024),
+        ))
+        .await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    send_packet(&mut writer, &connect_packet("oversize-after-connect")).await;
+    match read_packet(&mut reader).await {
+        Packet::Connack(ack) => assert_eq!(ConnackReturnCode::Accepted, ack.return_code),
+        other => panic!("expected CONNACK, got {other:?}"),
+    }
+
+    // 0x30 = PUBLISH with the same oversized declaration.
+    writer.write_all(&[0x30, 0xFF, 0xFF, 0xFF, 0x7F]).await.unwrap();
+    writer.flush().await.unwrap();
+
+    let mut sink = Vec::new();
+    let closed = timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut sink),
+    )
+    .await;
+    assert!(closed.is_ok(), "connection still open after 2s");
+}
+
+// ----------------------------------------------------------------------------
+// Connection teardown
+// ----------------------------------------------------------------------------
+
+/// A malformed packet after CONNECT must still tear the session down.
+///
+/// The read loop used to `return Err(e)` here, jumping over the
+/// `unregister_session` call written below the loop, so the entry stayed in the
+/// broker's table with its subscriptions live and its channel `Arc` held.
+#[tokio::test]
+async fn malformed_packet_after_connect_unregisters_the_session() {
+    let (port, broker) = start_broker().await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    send_packet(&mut writer, &connect_packet("leaky")).await;
+    match read_packet(&mut reader).await {
+        Packet::Connack(ack) => assert_eq!(ConnackReturnCode::Accepted, ack.return_code),
+        other => panic!("expected CONNACK, got {other:?}"),
+    }
+    assert_eq!(1, broker.session_count(), "session should be registered");
+
+    // 0xF0 is not a valid MQTT 3.1.1 packet type — the codec refuses it and the
+    // read loop takes its error path.
+    writer.write_all(&[0xF0, 0x00]).await.unwrap();
+    writer.flush().await.unwrap();
+
+    let mut sink = Vec::new();
+    let _ = timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut sink),
+    )
+    .await;
+    // The teardown runs after the loop exits; give the task a moment to finish.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    assert_eq!(
+        0,
+        broker.session_count(),
+        "malformed packet left the session registered — teardown was skipped"
+    );
+}
+
+/// The Will is the other half of the same defect, and the more visible one:
+/// a Will exists precisely to announce a connection that ended badly, and a
+/// malformed packet is exactly that case (MQTT-3.1.2-5).
+#[tokio::test]
+async fn malformed_packet_after_connect_publishes_the_will() {
+    let (port, _broker) = start_broker().await;
+
+    // Subscriber waits on the will topic.
+    let (mut sub_reader, mut sub_writer) = connect_raw(port).await;
+    send_packet(&mut sub_writer, &connect_packet("will-watcher")).await;
+    let _ = read_packet(&mut sub_reader).await;
+    send_packet(
+        &mut sub_writer,
+        &Packet::Subscribe(SubscribePacket {
+            packet_id: 1,
+            subscriptions: vec![TopicSubscription {
+                topic: Arc::from("gone/#"),
+                qos: QoS::AtMostOnce,
+            }],
+        }),
+    )
+    .await;
+    let _ = read_packet(&mut sub_reader).await;
+
+    // Publisher connects with a will, then sends garbage.
+    let (mut pub_reader, mut pub_writer) = connect_raw(port).await;
+    let mut connect = match connect_packet("dies-badly") {
+        Packet::Connect(c) => c,
+        _ => unreachable!(),
+    };
+    connect.will = Some(hotaru_mqtt::WillPacket {
+        topic: Arc::from("gone/dies-badly"),
+        payload: bytes::Bytes::from_static(b"offline"),
+        qos: QoS::AtMostOnce,
+        retain: false,
+    });
+    send_packet(&mut pub_writer, &Packet::Connect(connect)).await;
+    let _ = read_packet(&mut pub_reader).await;
+
+    pub_writer.write_all(&[0xF0, 0x00]).await.unwrap();
+    pub_writer.flush().await.unwrap();
+
+    match read_packet(&mut sub_reader).await {
+        Packet::Publish(p) => {
+            assert_eq!("gone/dies-badly", &*p.topic);
+            assert_eq!(&b"offline"[..], &p.payload[..]);
+        }
+        other => panic!("expected the will publish, got {other:?}"),
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Connection identity under takeover
+// ----------------------------------------------------------------------------
+
+/// MQTT-3.1.4-2: a second CONNECT carrying a client_id that is already
+/// connected must close the earlier connection.
+///
+/// Dropping the map entry does not do that — the earlier `handle_server` holds
+/// its own channel clone and reader, and would sit there until keep-alive
+/// elapsed, which the client picks and may set to 65535 seconds.
+#[tokio::test]
+async fn takeover_closes_the_earlier_connection() {
+    let (port, broker) = start_broker().await;
+
+    let (mut first_reader, mut first_writer) = connect_raw(port).await;
+    send_packet(&mut first_writer, &connect_packet("twins")).await;
+    let _ = read_packet(&mut first_reader).await;
+    assert_eq!(1, broker.session_count());
+
+    let (mut second_reader, mut second_writer) = connect_raw(port).await;
+    send_packet(&mut second_writer, &connect_packet("twins")).await;
+    let _ = read_packet(&mut second_reader).await;
+
+    let mut sink = Vec::new();
+    let closed = timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_to_end(&mut first_reader, &mut sink),
+    )
+    .await;
+    assert!(
+        closed.is_ok(),
+        "earlier connection still open 2s after being taken over"
+    );
+}
+
+/// The earlier connection runs its own teardown after being closed. Removal is
+/// keyed on client_id, which by then names the *newer* session, so an
+/// unconditional remove deletes the live session and takes its subscriptions
+/// with it. The generation guard is what stops that.
+#[tokio::test]
+async fn earlier_teardown_does_not_evict_the_live_session() {
+    let (port, broker) = start_broker().await;
+
+    let (mut first_reader, mut first_writer) = connect_raw(port).await;
+    send_packet(&mut first_writer, &connect_packet("twins")).await;
+    let _ = read_packet(&mut first_reader).await;
+
+    let (mut second_reader, mut second_writer) = connect_raw(port).await;
+    send_packet(&mut second_writer, &connect_packet("twins")).await;
+    let _ = read_packet(&mut second_reader).await;
+
+    // Let the earlier connection notice it was closed and finish tearing down.
+    let mut sink = Vec::new();
+    let _ = timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_to_end(&mut first_reader, &mut sink),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert_eq!(
+        1,
+        broker.session_count(),
+        "the earlier connection's teardown deleted the session that replaced it"
+    );
+
+    // And the survivor is still functional, not just present in the table.
+    send_packet(
+        &mut second_writer,
+        &Packet::Subscribe(SubscribePacket {
+            packet_id: 7,
+            subscriptions: vec![TopicSubscription {
+                topic: Arc::from("after/takeover"),
+                qos: QoS::AtMostOnce,
+            }],
+        }),
+    )
+    .await;
+    match read_packet(&mut second_reader).await {
+        Packet::Suback(ack) => assert_eq!(7, ack.packet_id),
+        other => panic!("expected SUBACK on the surviving session, got {other:?}"),
+    }
+}
+
+/// A takeover ends the earlier connection non-gracefully by construction, so
+/// MQTT-3.1.2-5 requires its Will.
+///
+/// This is the half that the generation guard silently breaks: once the earlier
+/// connection's `unregister_session` no-ops, the Will publishing that lived
+/// inside it stops happening, and nothing fails loudly — the connection closes
+/// either way and no existing test goes red.
+#[tokio::test]
+async fn takeover_publishes_the_earlier_connection_will() {
+    let (port, _broker) = start_broker().await;
+
+    let (mut watcher_reader, mut watcher_writer) = connect_raw(port).await;
+    send_packet(&mut watcher_writer, &connect_packet("will-watcher")).await;
+    let _ = read_packet(&mut watcher_reader).await;
+    send_packet(
+        &mut watcher_writer,
+        &Packet::Subscribe(SubscribePacket {
+            packet_id: 1,
+            subscriptions: vec![TopicSubscription {
+                topic: Arc::from("gone/#"),
+                qos: QoS::AtMostOnce,
+            }],
+        }),
+    )
+    .await;
+    let _ = read_packet(&mut watcher_reader).await;
+
+    let (mut first_reader, mut first_writer) = connect_raw(port).await;
+    let mut connect = match connect_packet("twins") {
+        Packet::Connect(c) => c,
+        _ => unreachable!(),
+    };
+    connect.will = Some(hotaru_mqtt::WillPacket {
+        topic: Arc::from("gone/twins"),
+        payload: bytes::Bytes::from_static(b"taken over"),
+        qos: QoS::AtMostOnce,
+        retain: false,
+    });
+    send_packet(&mut first_writer, &Packet::Connect(connect)).await;
+    let _ = read_packet(&mut first_reader).await;
+
+    let (mut second_reader, mut second_writer) = connect_raw(port).await;
+    send_packet(&mut second_writer, &connect_packet("twins")).await;
+    let _ = read_packet(&mut second_reader).await;
+
+    match read_packet(&mut watcher_reader).await {
+        Packet::Publish(p) => {
+            assert_eq!("gone/twins", &*p.topic);
+            assert_eq!(&b"taken over"[..], &p.payload[..]);
+        }
+        other => panic!("expected the earlier connection's will, got {other:?}"),
+    }
+}
+
+/// `subscribe` and `unsubscribe` resolve a session the same by-name way the
+/// ack path did, and both are public API. A caller holding a connection_id
+/// that has been superseded must not be able to mutate the live session's
+/// subscription set — the newer client never asked for that filter and would
+/// then receive traffic it did not subscribe to.
+///
+/// Driven through the broker API rather than over the wire: `close()` on the
+/// takeover path makes the earlier read loop exit promptly, so a stale
+/// SUBSCRIBE rarely gets dispatched at all. That narrows the window; it does
+/// not make the guard unnecessary, and it would make a wire-level test pass
+/// for the wrong reason.
+#[tokio::test]
+async fn a_superseded_connection_id_cannot_touch_the_live_session() {
+    let (port, broker) = start_broker().await;
+
+    let (mut reader, mut writer) = connect_raw(port).await;
+    send_packet(&mut writer, &connect_packet("twins")).await;
+    let _ = read_packet(&mut reader).await;
+
+    let client_id: Arc<str> = Arc::from("twins");
+    let filters = vec![hotaru_mqtt::TopicFilter::new("stale/topic", QoS::AtMostOnce)];
+
+    // u64::MAX can never have been issued: ids come from a counter starting at 0.
+    let codes = broker.subscribe(&client_id, u64::MAX, &filters).await;
+    assert!(
+        codes.iter().all(|c| matches!(c, hotaru_mqtt::SubackCode::Failure)),
+        "a superseded connection_id was allowed to subscribe: {codes:?}"
+    );
+
+    // And nothing was registered: a publish to that filter must not be routed.
+    let (mut pub_reader, mut pub_writer) = connect_raw(port).await;
+    send_packet(&mut pub_writer, &connect_packet("publisher")).await;
+    let _ = read_packet(&mut pub_reader).await;
+    send_packet(
+        &mut pub_writer,
+        &Packet::Publish(PublishPacket {
+            topic: Arc::from("stale/topic"),
+            payload: bytes::Bytes::from_static(b"should not arrive"),
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            packet_id: None,
+        }),
+    )
+    .await;
+
+    let waited = timeout(
+        Duration::from_millis(400),
+        codec::read_packet(&mut reader, ANY_SIZE),
+    )
+    .await;
+    assert!(
+        waited.is_err(),
+        "the live session received traffic for a filter it never asked for; got {waited:?}"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// keep-alive
+// ----------------------------------------------------------------------------
+
+/// A client that declared `keep_alive = 0` asked not to be timed out, so the
+/// broker must not disconnect it for saying nothing (spec §3.1.2.10).
+///
+/// The old code ran `keep_alive.max(1)`, so zero became a one-second deadline —
+/// the most aggressive the expression could produce, and the exact opposite of
+/// what was requested. A connection that declared "never time me out" was
+/// dropped after a second.
+///
+/// Reaching that path now takes an explicit opt-in: as of the #78 policy the
+/// default refuses `keep_alive = 0` outright. What this test covers is the
+/// deadline mechanism, not the admission policy, so it opts in and keeps
+/// asserting exactly what it always did.
+#[tokio::test]
+async fn a_zero_keep_alive_connection_is_not_dropped_for_being_idle() {
+    let (port, broker) = start_broker_with(accept_all_with(
+        MqttSafety::new().allow_disabled_keep_alive(),
+    ))
+    .await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    let mut connect = match connect_packet("patient") {
+        Packet::Connect(c) => c,
+        _ => unreachable!(),
+    };
+    connect.keep_alive = 0;
+    send_packet(&mut writer, &Packet::Connect(connect)).await;
+    match read_packet(&mut reader).await {
+        Packet::Connack(ack) => assert_eq!(ConnackReturnCode::Accepted, ack.return_code),
+        other => panic!("expected CONNACK, got {other:?}"),
+    }
+
+    // Then say nothing. Under the old deadline this connection was gone after
+    // one second; two and a half is well past that and well short of flaky.
+    let mut sink = Vec::new();
+    let closed = timeout(
+        Duration::from_millis(2_500),
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut sink),
+    )
+    .await;
+    assert!(
+        closed.is_err(),
+        "broker disconnected an idle keep_alive=0 client; it read {sink:?}"
+    );
+    assert_eq!(1, broker.session_count(), "the session should still be live");
+}
+
+/// The grace still bites when a keep-alive was actually asked for: a client
+/// declaring 1 second and then going quiet is disconnected.
+///
+/// This is the other half of the same change — turning zero into "no deadline"
+/// must not turn every deadline off.
+#[tokio::test]
+async fn an_idle_connection_with_a_keep_alive_is_still_dropped() {
+    let (port, _broker) = start_broker().await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    let mut connect = match connect_packet("impatient") {
+        Packet::Connect(c) => c,
+        _ => unreachable!(),
+    };
+    connect.keep_alive = 1;
+    send_packet(&mut writer, &Packet::Connect(connect)).await;
+    let _ = read_packet(&mut reader).await;
+
+    // Deadline is 1.5s; 4s leaves room without being slow.
+    let mut sink = Vec::new();
+    let closed = timeout(
+        Duration::from_secs(4),
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut sink),
+    )
+    .await;
+    assert!(
+        closed.is_ok(),
+        "broker kept an idle keep_alive=1 connection past its 1.5s grace"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// Authentication refusal
+// ----------------------------------------------------------------------------
+
+/// An `Authenticator` that refuses everyone except one username, so both the
+/// deny path and the code it declares are exercised. Before this, no test
+/// implemented `Authenticator`, `AuthResult::reject` had zero callers anywhere,
+/// and the refusal branch in `handle_server` had never run.
+struct OnlyAlice;
+
+#[hotaru_mqtt::async_trait]
+impl hotaru_mqtt::Authenticator for OnlyAlice {
+    async fn authenticate(
+        &self,
+        connect: &ConnectPacket,
+        _remote_addr: Option<std::net::SocketAddr>,
+    ) -> hotaru_mqtt::AuthResult {
+        match connect.username.as_deref() {
+            Some("alice") => hotaru_mqtt::AuthResult::accept(),
+            _ => hotaru_mqtt::AuthResult::reject(ConnackReturnCode::NotAuthorized),
+        }
+    }
+}
+
+fn broker_with_auth() -> Broker<TcpStream> {
+    Broker::with_authenticator(Arc::new(OnlyAlice))
+}
+
+/// A refused CONNECT gets the authenticator's declared return code, leaves no
+/// session behind, and the connection closes.
+#[tokio::test]
+async fn a_refused_connect_gets_the_declared_code_and_no_session() {
+    let (port, broker) = start_broker_with(broker_with_auth()).await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    // No credentials at all — OnlyAlice refuses this.
+    send_packet(&mut writer, &connect_packet("stranger")).await;
+
+    match read_packet(&mut reader).await {
+        Packet::Connack(connack) => {
+            assert_eq!(ConnackReturnCode::NotAuthorized, connack.return_code);
+            assert!(!connack.session_present, "a refused CONNECT has no session");
+        }
+        other => panic!("expected the refusal CONNACK, got {other:?}"),
+    }
+
+    // The connection closes after the refusal...
+    let mut leftover = Vec::new();
+    let closed = timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut leftover),
+    )
+    .await;
+    assert!(closed.is_ok(), "connection should close after a refusal");
+    // ...and nothing was registered on the broker.
+    assert_eq!(0, broker.session_count(), "a refused CONNECT must not register");
+}
+
+/// A refused client's Will must not fire: it never had a session, so there is
+/// nothing whose death a Will could announce.
+#[tokio::test]
+async fn a_refused_connect_never_publishes_its_will() {
+    let (port, _broker) = start_broker_with(broker_with_auth()).await;
+
+    // Watcher connects as alice and subscribes to the would-be will topic.
+    let (mut watcher_reader, mut watcher_writer) = connect_raw(port).await;
+    let mut watcher_connect = match connect_packet("watcher") {
+        Packet::Connect(connect) => connect,
+        _ => unreachable!(),
+    };
+    watcher_connect.username = Some(Arc::from("alice"));
+    watcher_connect.password = Some(bytes::Bytes::from_static(b"pw"));
+    send_packet(&mut watcher_writer, &Packet::Connect(watcher_connect)).await;
+    match read_packet(&mut watcher_reader).await {
+        Packet::Connack(connack) => assert_eq!(ConnackReturnCode::Accepted, connack.return_code),
+        other => panic!("expected CONNACK, got {other:?}"),
+    }
+    send_packet(
+        &mut watcher_writer,
+        &Packet::Subscribe(SubscribePacket {
+            packet_id: 1,
+            subscriptions: vec![TopicSubscription {
+                topic: Arc::from("gone/#"),
+                qos: QoS::AtMostOnce,
+            }],
+        }),
+    )
+    .await;
+    let _ = read_packet(&mut watcher_reader).await;
+
+    // A stranger with a Will is refused.
+    let (mut refused_reader, mut refused_writer) = connect_raw(port).await;
+    let mut refused_connect = match connect_packet("stranger") {
+        Packet::Connect(connect) => connect,
+        _ => unreachable!(),
+    };
+    refused_connect.will = Some(hotaru_mqtt::WillPacket {
+        topic: Arc::from("gone/stranger"),
+        payload: bytes::Bytes::from_static(b"should never appear"),
+        qos: QoS::AtMostOnce,
+        retain: false,
+    });
+    send_packet(&mut refused_writer, &Packet::Connect(refused_connect)).await;
+    let _ = read_packet(&mut refused_reader).await; // the refusal CONNACK
+
+    // The watcher must hear nothing.
+    let waited = timeout(
+        Duration::from_millis(600),
+        codec::read_packet(&mut watcher_reader, ANY_SIZE),
+    )
+    .await;
+    assert!(
+        waited.is_err(),
+        "a refused client's Will was published: {waited:?}"
+    );
+}
+
+/// The accept half of the same authenticator still works — the refusal path
+/// must not have turned into "refuse everyone".
+#[tokio::test]
+async fn the_same_authenticator_still_accepts_valid_credentials() {
+    let (port, broker) = start_broker_with(broker_with_auth()).await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    let mut connect = match connect_packet("alice-client") {
+        Packet::Connect(connect) => connect,
+        _ => unreachable!(),
+    };
+    connect.username = Some(Arc::from("alice"));
+    connect.password = Some(bytes::Bytes::from_static(b"pw"));
+    send_packet(&mut writer, &Packet::Connect(connect)).await;
+
+    match read_packet(&mut reader).await {
+        Packet::Connack(connack) => assert_eq!(ConnackReturnCode::Accepted, connack.return_code),
+        other => panic!("expected CONNACK, got {other:?}"),
+    }
+    assert_eq!(1, broker.session_count());
+}
+
+// ----------------------------------------------------------------------------
+// Chain execution off the reader task
+// ----------------------------------------------------------------------------
+
+use hotaru_core::executable::ExecutableBinding;
+use hotaru_core::extensions::ParamsClone;
+use hotaru_mqtt::{MqttContext, MqttRequest, MqttResponse, PublishAck, PublishRequest};
+use hotaru_core::protocol::Protocol;
+
+type ServerRoot = Arc<
+    hotaru_core::url::UrlRoot<
+        MqttContext<hotaru_core::connection::tcp::TcpTransport>,
+        hotaru_core::connection::tcp::TcpTransport,
+    >,
+>;
+
+/// As `start_broker_with`, but also returns the `UrlRoot` so a test can
+/// register server-side endpoints on it before clients arrive.
+async fn start_broker_with_root() -> (u16, Broker<TcpStream>, ServerRoot) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let broker = Broker::<TcpStream>::accept_all();
+
+    let registry: ProtocolEntryRegistry<hotaru_core::connection::tcp::TcpTransport> =
+        ProtocolRegistryBuilder::new()
+            .protocol(ProtocolEntryBuilder::new(MQTT::server()))
+            .build();
+    let root = registry
+        .url::<MQTT>()
+        .expect("server entry should be registered");
+    let registry = Arc::new(registry);
+
+    let mut statics = Locals::new();
+    statics.set(BROKER_STATICS_KEY, broker.clone());
+    let runtime = Arc::new(RuntimeConfig::from_parts(
+        Default::default(),
+        Default::default(),
+        statics,
+    ));
+
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _peer)) => {
+                    let registry = registry.clone();
+                    let runtime = runtime.clone();
+                    tokio::spawn(async move {
+                        registry.serve(runtime, stream).await;
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (port, broker, root)
+}
+
+/// Register one endpoint on the server's `UrlRoot`.
+///
+/// `sub_url` is deprecated in favour of `register` — but `register` is private
+/// in hotaru_core 0.8.2, so the deprecation points at a replacement callers
+/// cannot reach. Allowed here rather than worked around.
+#[allow(deprecated)]
+fn register_endpoint(
+    root: &ServerRoot,
+    path: &str,
+    binding: ExecutableBinding<MqttContext<hotaru_core::connection::tcp::TcpTransport>>,
+    params: ParamsClone,
+) {
+    root.sub_url(path, binding, params)
+        .expect("endpoint registration");
+}
+
+/// The finding this whole PR exists for, reproduced end to end.
+///
+/// A server-side endpoint publishes QoS 1 back over the same connection from
+/// inside the chain. The chain used to run on the reader task, so the PUBACK
+/// the endpoint waits for could only be delivered by the very task the
+/// endpoint was blocking — a self-deadlock that only resolved at the 30 s ack
+/// timeout, dropping the triggering message for every subscriber. With the
+/// chain on its own worker the round trip completes promptly.
+#[tokio::test]
+async fn an_endpoint_publishing_qos1_over_its_own_connection_completes() {
+    let (port, _broker, root) = start_broker_with_root().await;
+    register_endpoint(
+        &root,
+        "reentry/topic",
+        ExecutableBinding::new().with_handler(Arc::new(
+            |mut endpoint_ctx: MqttContext| async move {
+                endpoint_ctx.request = MqttRequest::Publish(PublishRequest {
+                    topic: Arc::from("from/endpoint"),
+                    payload: bytes::Bytes::from_static(b"round trip"),
+                    qos: QoS::AtLeastOnce,
+                    retain: false,
+                });
+                // `send` uses the channel already installed on this ctx — the
+                // same connection the triggering PUBLISH arrived on.
+                let endpoint_ctx = <MQTT as Protocol>::send(endpoint_ctx).await?;
+                match &endpoint_ctx.response {
+                    MqttResponse::Published(PublishAck::Acknowledged(_)) => Ok(endpoint_ctx),
+                    other => panic!("endpoint publish was not acknowledged: {other:?}"),
+                }
+            },
+        )),
+        ParamsClone::default(),
+    );
+
+    let (mut reader, mut writer) = connect_raw(port).await;
+    send_packet(&mut writer, &connect_packet("reentrant")).await;
+    let _ = read_packet(&mut reader).await;
+
+    let started = std::time::Instant::now();
+    // Trigger the endpoint.
+    send_packet(
+        &mut writer,
+        &Packet::Publish(PublishPacket {
+            topic: Arc::from("reentry/topic"),
+            payload: bytes::Bytes::from_static(b"go"),
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            packet_id: None,
+        }),
+    )
+    .await;
+
+    // The endpoint's own QoS 1 publish arrives on this same connection…
+    let endpoint_publish_id = match read_packet(&mut reader).await {
+        Packet::Publish(publish) => {
+            assert_eq!("from/endpoint", &*publish.topic);
+            publish.packet_id.expect("QoS 1 carries a packet id")
+        }
+        other => panic!("expected the endpoint's publish, got {other:?}"),
+    };
+    // …we acknowledge it, and the reader — no longer blocked by the chain —
+    // must deliver that ack to the waiting endpoint promptly.
+    send_packet(&mut writer, &Packet::Puback(endpoint_publish_id)).await;
+
+    // Completion is observable as the whole exchange finishing fast: under the
+    // old inline execution this took the full 30 s ack timeout.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "endpoint round trip took {:?} — the reader was blocked by its own chain",
+        started.elapsed()
+    );
+}
+
+/// The reader must keep answering while a chain runs: a PINGREQ sent during a
+/// deliberately slow endpoint gets its PINGRESP before the endpoint finishes.
+#[tokio::test]
+async fn the_reader_answers_pings_while_a_chain_is_running() {
+    let (port, _broker, root) = start_broker_with_root().await;
+    register_endpoint(
+        &root,
+        "slow/topic",
+        ExecutableBinding::new().with_handler(Arc::new(
+            |slow_ctx: MqttContext| async move {
+                tokio::time::sleep(Duration::from_millis(1_500)).await;
+                Ok(slow_ctx)
+            },
+        )),
+        ParamsClone::default(),
+    );
+
+    let (mut reader, mut writer) = connect_raw(port).await;
+    send_packet(&mut writer, &connect_packet("pinger")).await;
+    let _ = read_packet(&mut reader).await;
+
+    send_packet(
+        &mut writer,
+        &Packet::Publish(PublishPacket {
+            topic: Arc::from("slow/topic"),
+            payload: bytes::Bytes::from_static(b"x"),
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            packet_id: None,
+        }),
+    )
+    .await;
+    // Give the publish a moment to reach the worker before pinging.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let started = std::time::Instant::now();
+    send_packet(&mut writer, &Packet::Pingreq).await;
+    match read_packet(&mut reader).await {
+        Packet::Pingresp => {}
+        other => panic!("expected PINGRESP, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_millis(1_000),
+        "PINGRESP took {:?} — the reader is still running chains inline",
+        started.elapsed()
+    );
+}
+
+/// One worker, fed in arrival order: two publishes from the same connection
+/// reach a subscriber in the order they were sent, even though the chain now
+/// runs off the reader.
+#[tokio::test]
+async fn publishes_keep_their_order_through_the_worker() {
+    let (port, _broker) = start_broker().await;
+
+    let (mut subscriber_reader, mut subscriber_writer) = connect_raw(port).await;
+    send_packet(&mut subscriber_writer, &connect_packet("order-watcher")).await;
+    let _ = read_packet(&mut subscriber_reader).await;
+    send_packet(
+        &mut subscriber_writer,
+        &Packet::Subscribe(SubscribePacket {
+            packet_id: 1,
+            subscriptions: vec![TopicSubscription {
+                topic: Arc::from("ordered/#"),
+                qos: QoS::AtMostOnce,
+            }],
+        }),
+    )
+    .await;
+    let _ = read_packet(&mut subscriber_reader).await;
+
+    let (mut publisher_reader, mut publisher_writer) = connect_raw(port).await;
+    send_packet(&mut publisher_writer, &connect_packet("order-sender")).await;
+    let _ = read_packet(&mut publisher_reader).await;
+    for sequence in ["first", "second", "third"] {
+        send_packet(
+            &mut publisher_writer,
+            &Packet::Publish(PublishPacket {
+                topic: Arc::from("ordered/seq"),
+                payload: bytes::Bytes::copy_from_slice(sequence.as_bytes()),
+                dup: false,
+                qos: QoS::AtMostOnce,
+                retain: false,
+                packet_id: None,
+            }),
+        )
+        .await;
+    }
+
+    for expected in ["first", "second", "third"] {
+        match read_packet(&mut subscriber_reader).await {
+            Packet::Publish(publish) => {
+                assert_eq!(expected.as_bytes(), &publish.payload[..],
+                           "publishes were reordered by the worker");
+            }
+            other => panic!("expected PUBLISH, got {other:?}"),
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Default admission policy (RFC #73)
+// ----------------------------------------------------------------------------
+
+/// An unconfigured broker refuses every CONNECT. A broker that was never told
+/// who may connect cannot answer the question, and the safe answer to a
+/// question you cannot answer is no.
+#[tokio::test]
+async fn an_unconfigured_broker_refuses_every_connect() {
+    let (port, broker) = start_broker_with(Broker::<TcpStream>::new()).await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    send_packet(&mut writer, &connect_packet("anyone")).await;
+
+    match read_packet(&mut reader).await {
+        Packet::Connack(connack) => {
+            assert_eq!(ConnackReturnCode::NotAuthorized, connack.return_code);
+            assert!(!connack.session_present);
+        }
+        other => panic!("expected the refusal CONNACK, got {other:?}"),
+    }
+    assert_eq!(0, broker.session_count(), "a refused CONNECT must not register");
+}
+
+// Keep-alive policy (RFC #78)
+// ----------------------------------------------------------------------------
+
+/// `keep_alive = 0` asks the server to hold the connection open with no
+/// inactivity deadline at all. The default policy refuses it: an
+/// unauthenticated peer must not be able to pin a connection for the life of
+/// the process.
+#[tokio::test]
+async fn a_disabled_keep_alive_is_refused_by_default() {
+    let (port, broker) = start_broker_with(Broker::new()).await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    let mut connect = connect_packet("forever");
+    if let Packet::Connect(ref mut c) = connect {
+        c.keep_alive = 0;
+    }
+    send_packet(&mut writer, &connect).await;
+
+    match read_packet(&mut reader).await {
+        Packet::Connack(connack) => {
+            assert_eq!(ConnackReturnCode::ServerUnavailable, connack.return_code);
+            assert!(!connack.session_present);
+        }
+        other => panic!("expected the refusal CONNACK, got {other:?}"),
+    }
+    assert_eq!(0, broker.session_count(), "a refused CONNECT must not register");
+}
+
+/// `Default` must agree with `new` — otherwise `Broker::default()` would be a
+/// quiet way back to the permissive behaviour.
+#[tokio::test]
+async fn default_agrees_with_new() {
+    let (port, broker) = start_broker_with(Broker::<TcpStream>::default()).await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    send_packet(&mut writer, &connect_packet("anyone")).await;
+
+    match read_packet(&mut reader).await {
+        Packet::Connack(connack) => {
+            assert_eq!(ConnackReturnCode::NotAuthorized, connack.return_code)
+        }
+        other => panic!("expected the refusal CONNACK, got {other:?}"),
+    }
+    assert_eq!(0, broker.session_count());
+}
+
+/// The permissive behaviour stays reachable, by a name that says what it is.
+#[tokio::test]
+async fn accept_all_still_accepts() {
+    let (port, broker) = start_broker_with(Broker::<TcpStream>::accept_all()).await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    send_packet(&mut writer, &connect_packet("anyone")).await;
+
+    match read_packet(&mut reader).await {
+        Packet::Connack(connack) => {
+            assert_eq!(ConnackReturnCode::Accepted, connack.return_code)
+        }
+        other => panic!("expected an accepting CONNACK, got {other:?}"),
+    }
+    assert_eq!(1, broker.session_count());
+}
+
+/// The refusal is policy, not a hard rule: an operator can restore the letter
+/// of §3.1.2.10 for deployments that need it.
+#[tokio::test]
+async fn a_disabled_keep_alive_is_accepted_when_opted_into() {
+    let (port, broker) = start_broker_with(accept_all_with(
+        MqttSafety::new().allow_disabled_keep_alive(),
+    ))
+    .await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    let mut connect = connect_packet("forever");
+    if let Packet::Connect(ref mut c) = connect {
+        c.keep_alive = 0;
+    }
+    send_packet(&mut writer, &connect).await;
+
+    match read_packet(&mut reader).await {
+        Packet::Connack(connack) => {
+            assert_eq!(ConnackReturnCode::Accepted, connack.return_code)
+        }
+        other => panic!("expected an accepting CONNACK, got {other:?}"),
+    }
+    assert_eq!(1, broker.session_count());
+}
+
+/// A keep-alive above the ceiling is refused outright rather than clamped down
+/// to it — the client must not be left believing it has a grace period the
+/// server will not honour.
+#[tokio::test]
+async fn a_keep_alive_above_the_ceiling_is_refused_not_clamped() {
+    let (port, broker) =
+        start_broker_with(accept_all_with(MqttSafety::new().with_max_keep_alive(120))).await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    let mut connect = connect_packet("patient");
+    if let Packet::Connect(ref mut c) = connect {
+        c.keep_alive = 121;
+    }
+    send_packet(&mut writer, &connect).await;
+
+    match read_packet(&mut reader).await {
+        Packet::Connack(connack) => {
+            assert_eq!(ConnackReturnCode::ServerUnavailable, connack.return_code)
+        }
+        other => panic!("expected the refusal CONNACK, got {other:?}"),
+    }
+    assert_eq!(0, broker.session_count());
+}
+
+/// The boundary itself is accepted: the ceiling is inclusive.
+#[tokio::test]
+async fn a_keep_alive_at_the_ceiling_is_accepted() {
+    let (port, _broker) =
+        start_broker_with(accept_all_with(MqttSafety::new().with_max_keep_alive(120))).await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    let mut connect = connect_packet("punctual");
+    if let Packet::Connect(ref mut c) = connect {
+        c.keep_alive = 120;
+    }
+    send_packet(&mut writer, &connect).await;
+
+    match read_packet(&mut reader).await {
+        Packet::Connack(connack) => {
+            assert_eq!(ConnackReturnCode::Accepted, connack.return_code)
+        }
+        other => panic!("expected an accepting CONNACK, got {other:?}"),
+    }
+}
+
+/// Safety limits and admission policy are independent knobs: asking for one
+/// must not silently hand back the other's permissive default.
+#[tokio::test]
+async fn with_safety_keeps_the_deny_all_default() {
+    let safety = MqttSafety::new().with_max_packet_size(1024);
+    let (port, broker) = start_broker_with(Broker::<TcpStream>::with_safety(safety)).await;
+    let (mut reader, mut writer) = connect_raw(port).await;
+
+    send_packet(&mut writer, &connect_packet("anyone")).await;
+
+    match read_packet(&mut reader).await {
+        Packet::Connack(connack) => {
+            assert_eq!(ConnackReturnCode::NotAuthorized, connack.return_code)
+        }
+        other => panic!("expected the refusal CONNACK, got {other:?}"),
+    }
+    assert_eq!(0, broker.session_count());
 }

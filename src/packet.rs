@@ -6,16 +6,18 @@
 //! `Packet` is the framework's `Message` type for `MqttProtocol`. Encoding
 //! and decoding live in `codec.rs`; this module is plain data definitions.
 
-use std::error::Error;
 use std::sync::Arc;
 
 use bitflags::bitflags;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 
-use hotaru_core::protocol::Message;
 
-use crate::codec::{decode_packet_from_bytes, encode_packet};
 use crate::request::{PacketId, QoS, SubackCode};
+
+/// Spec §2.2.3: the largest remaining-length a 4-byte variable-byte integer
+/// can encode, i.e. 2^28 − 1. A packet declaring more than this is malformed
+/// regardless of configuration.
+pub const MQTT_SPEC_MAX_PACKET_SIZE: usize = 268_435_455;
 
 #[derive(Debug, Clone)]
 pub enum Packet {
@@ -128,7 +130,7 @@ pub struct UnsubscribePacket {
 // ----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PacketType {
+pub(crate) enum PacketType {
     Connect = 1,
     Connack = 2,
     Publish = 3,
@@ -171,7 +173,7 @@ impl TryFrom<u8> for PacketType {
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct FixedHeaderFlags: u8 {
+    pub(crate) struct FixedHeaderFlags: u8 {
         const Bypass = 0b0000_0000;
         const Retain = 0b0000_0001;
         const QoS = 0b0000_0110;
@@ -181,7 +183,7 @@ bitflags! {
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct ConnectFlags: u8 {
+    pub(crate) struct ConnectFlags: u8 {
         const Username = 0b1000_0000;
         const Password = 0b0100_0000;
         const WillRetain = 0b0010_0000;
@@ -237,19 +239,3 @@ impl std::fmt::Display for ConnackReturnCode {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Message impl — connects Packet to hotaru_core's protocol Message trait
-// ----------------------------------------------------------------------------
-
-impl Message for Packet {
-    type BytesMut = BytesMut;
-
-    fn encode(&self, buf: &mut Self::BytesMut) -> Result<(), Box<dyn Error + Send + Sync>> {
-        buf.extend_from_slice(&encode_packet(self));
-        Ok(())
-    }
-
-    fn decode(buf: &mut Self::BytesMut) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
-        decode_packet_from_bytes(buf)
-    }
-}

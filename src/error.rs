@@ -58,6 +58,9 @@ pub enum Violation {
     HashWildcardNotTerminal,
     WildcardMixedWithLiteral,
     SessionAlreadyBound,
+    /// A fixed header declared a body larger than the configured cap. Raised
+    /// before the body buffer is allocated, so refusing costs the header only.
+    PacketTooLarge { len: usize, max: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +72,20 @@ pub enum CodecError {
     PayloadTooLong { len: usize, max: usize },
     QosInvalid(u8),
     ReservedFlagSet,
+    /// A QoS >= 1 PUBLISH was handed to an encoder without a packet id. The id
+    /// is what pairs the coming ack with this message; emitting the packet
+    /// without one is not a smaller packet, it is a different (malformed) one.
+    MissingPacketId,
+    /// Packet id 0 is reserved by spec 2.3.1 and must never be sent.
+    ZeroPacketId,
+    /// The topic does not fit the two-byte length field the wire format gives
+    /// it. Encoding it anyway would silently truncate the length (`as u16`),
+    /// producing a frame whose declared topic length disagrees with its bytes.
+    TopicTooLong { len: usize, max: usize },
+    /// The encoded body exceeds what a remaining-length field can express.
+    /// The encoder would otherwise emit a five-byte length that every
+    /// conforming decoder — including this crate's own — refuses.
+    BodyTooLong { len: usize, max: usize },
 }
 
 impl fmt::Display for MqttError {

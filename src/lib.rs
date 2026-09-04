@@ -1,28 +1,44 @@
 //! `hotaru_mqtt` — MQTT 3.1.1 broker + client built on `hotaru_core`.
 //!
+//! The crate root is the stable API surface: every supported type is
+//! re-exported here. `codec` is the one addressable module, holding the
+//! low-level wire encode/decode entry points; all other modules are private
+//! and their layout is free to change.
+//!
 //! Design memos (in repo root):
 //! - `MQTT_AOI_DESIGN.md` — outpoint shape / inbound dispatch / topic matching
 //! - `MQTT_BCH_DESIGN.md` — Channel / Context / Lifecycle
 //! - `MQTT_EFTU_DESIGN.md` — Broker API / Topic module / zero-copy / MqttError
 //! - `MQTT_W_POLICY.md` — silent-error policy
 
-pub mod broker;
-pub mod channel;
-pub mod client;
+mod broker;
+mod channel;
+mod client;
 pub mod codec;
-pub mod context;
-pub mod error;
-pub mod packet;
-pub mod protocol;
-pub mod request;
-pub mod session;
-pub mod topic;
-pub mod transport;
+mod context;
+mod error;
+mod packet;
+mod protocol;
+mod request;
+mod safety;
+mod session;
+mod topic;
+
+// ─── Re-export external dependency types used in public API ──────
+
+pub use async_trait::async_trait;
+pub use bytes::{Bytes, BytesMut};
+pub use dashmap::DashMap;
+pub use bitflags::bitflags;
+pub use hotaru_core::connection::TransportSpec;
+pub use hotaru_core::protocol::{Channel, Protocol};
+pub use hotaru_core::url::UrlNode;
 
 // ─── Re-exports for user-facing API ───────────────────────────────
 
 pub use broker::{
-    AcceptAllAuthenticator, AuthResult, Authenticator, Broker, SubscriberEntry,
+    AcceptAllAuthenticator, AuthResult, Authenticator, Broker, DenyAllAuthenticator,
+    SubscriberEntry,
 };
 pub use channel::{MqttChannel, WriteCmd};
 pub use client::MqttClientConfig;
@@ -41,7 +57,8 @@ pub use request::{
     Credentials, IncomingPublish, MqttRequest, MqttResponse, PacketId, PublishAck,
     PublishRequest, QoS, SubackCode, TopicFilter, WillMessage,
 };
-pub use session::{AckSlot, BindInfo, MqttSession};
+pub use safety::{MqttSafety, SPEC_MAX_PACKET_SIZE};
+pub use session::{AckKind, AckSlot, BindInfo, MqttSession};
 pub use topic::{
     parse_publish_topic, parse_subscribe_filter, path_to_wire_filter,
     validate_publish_topic, validate_subscribe_filter,
