@@ -23,7 +23,7 @@ use crate::request::{
     IncomingPublish, MqttRequest, MqttResponse, PublishAck, PublishRequest,
 };
 
-pub struct MqttContext<TS: TransportSpec = hotaru_io_tokio::TcpTransport> {
+pub struct MqttContext<TS: TransportSpec = hotaru_core::connection::tcp::TcpTransport> {
     /// `run!` path: injected by `RequestContext::inject_request`.
     pub request: MqttRequest,
 
