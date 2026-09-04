@@ -48,11 +48,11 @@ pub const CLIENT_CONFIG_STATICS_KEY: &str = "hotaru_mqtt::client_config";
 // MqttProtocol
 // ----------------------------------------------------------------------------
 
-pub type DefaultMqttTransport = hotaru_io_tokio::TcpTransport;
-pub type MQTT = MqttProtocol<hotaru_io_tokio::TcpStream, DefaultMqttTransport>;
+pub type DefaultMqttTransport = hotaru_core::connection::tcp::TcpTransport;
+pub type MQTT = MqttProtocol<tokio::net::TcpStream, DefaultMqttTransport>;
 
 pub struct MqttProtocol<
-    W: ConnStream = hotaru_io_tokio::TcpStream,
+    W: ConnStream = tokio::net::TcpStream,
     TS: TransportSpec<Wire = W> = DefaultMqttTransport,
 > {
     role: ProtocolRole,
