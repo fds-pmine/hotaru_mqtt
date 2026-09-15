@@ -9,12 +9,15 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
+use crate::packet::ProtocolVersion;
 use crate::protocol::DefaultInboundHandler;
 use crate::request::{Credentials, QoS, TopicFilter, WillMessage};
 
 /// All settings required to bring up an MQTT client session.
 pub struct MqttClientConfig {
     pub client_id: Arc<str>,
+    /// Wire protocol version for this session. Defaults to MQTT 3.1.1.
+    pub protocol_version: ProtocolVersion,
     pub clean_session: bool,
     pub keep_alive_secs: u16,
     pub connect_timeout: Duration,
@@ -29,6 +32,7 @@ impl MqttClientConfig {
     pub fn new(client_id: impl Into<Arc<str>>) -> Self {
         Self {
             client_id: client_id.into(),
+            protocol_version: ProtocolVersion::default(),
             clean_session: true,
             keep_alive_secs: 60,
             connect_timeout: Duration::from_secs(30),
@@ -37,6 +41,12 @@ impl MqttClientConfig {
             will: None,
             default_inbound: None,
         }
+    }
+
+    /// Select the MQTT wire version used by this client connection.
+    pub fn protocol_version(mut self, version: ProtocolVersion) -> Self {
+        self.protocol_version = version;
+        self
     }
 
     pub fn clean_session(mut self, value: bool) -> Self {

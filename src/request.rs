@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+use crate::properties::Properties;
+
 /// MQTT Quality of Service level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -80,6 +82,8 @@ impl Default for PublishRequest {
 /// What the user receives from an inbound PUBLISH (server or client side).
 #[derive(Debug, Clone)]
 pub struct IncomingPublish {
+    /// MQTT 5 properties received with the publish.
+    pub properties: Properties,
     pub topic: Arc<str>,
     pub payload: Bytes,
     pub qos: QoS,
