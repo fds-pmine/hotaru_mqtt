@@ -58,6 +58,14 @@ pub enum Violation {
     HashWildcardNotTerminal,
     WildcardMixedWithLiteral,
     SessionAlreadyBound,
+    /// MQTT 5 property which may occur only once was repeated.
+    DuplicateProperty(u8),
+    /// MQTT 5 property value is outside the range defined by the protocol.
+    MalformedProperty(u8),
+    /// Property identifier is not defined by MQTT 5.
+    UnknownProperty(u8),
+    /// MQTT UTF-8 strings must not contain U+0000.
+    Utf8NullCharacter,
     /// A fixed header declared a body larger than the configured cap. Raised
     /// before the body buffer is allocated, so refusing costs the header only.
     PacketTooLarge { len: usize, max: usize },
@@ -72,6 +80,10 @@ pub enum CodecError {
     PayloadTooLong { len: usize, max: usize },
     QosInvalid(u8),
     ReservedFlagSet,
+    /// A two-byte-length-prefixed field cannot represent this many bytes.
+    FieldTooLong { kind: &'static str, len: usize },
+    /// MQTT Variable Byte Integers are limited to 268,435,455.
+    VariableByteIntegerOutOfRange { value: usize },
     /// A QoS >= 1 PUBLISH was handed to an encoder without a packet id. The id
     /// is what pairs the coming ack with this message; emitting the packet
     /// without one is not a smaller packet, it is a different (malformed) one.
