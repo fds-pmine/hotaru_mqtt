@@ -21,6 +21,7 @@ mod packet;
 mod properties;
 mod protocol;
 mod request;
+mod safety;
 mod session;
 mod topic;
 
@@ -37,7 +38,8 @@ pub use hotaru_core::url::UrlNode;
 // ─── Re-exports for user-facing API ───────────────────────────────
 
 pub use broker::{
-    AcceptAllAuthenticator, AuthResult, Authenticator, Broker, SubscriberEntry,
+    AcceptAllAuthenticator, AuthResult, Authenticator, Broker, DenyAllAuthenticator,
+    SubscriberEntry,
 };
 pub use channel::{MqttChannel, WriteCmd};
 pub use client::MqttClientConfig;
@@ -57,7 +59,8 @@ pub use request::{
     Credentials, IncomingPublish, MqttRequest, MqttResponse, PacketId, PublishAck,
     PublishRequest, QoS, SubackCode, TopicFilter, WillMessage,
 };
-pub use session::{AckSlot, BindInfo, MqttSession};
+pub use safety::{MqttSafety, SPEC_MAX_PACKET_SIZE};
+pub use session::{AckKind, AckSlot, BindInfo, MqttSession};
 pub use topic::{
     parse_publish_topic, parse_subscribe_filter, path_to_wire_filter,
     validate_publish_topic, validate_subscribe_filter,

@@ -14,6 +14,11 @@ use bytes::Bytes;
 
 use crate::request::{PacketId, QoS, SubackCode};
 
+/// Spec §2.2.3: the largest remaining-length a 4-byte variable-byte integer
+/// can encode, i.e. 2^28 − 1. A packet declaring more than this is malformed
+/// regardless of configuration.
+pub const MQTT_SPEC_MAX_PACKET_SIZE: usize = 268_435_455;
+
 #[derive(Debug, Clone)]
 pub enum Packet {
     Connect(ConnectPacket),
