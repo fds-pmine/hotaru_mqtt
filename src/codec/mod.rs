@@ -7,10 +7,9 @@
 //! Encode path writes through `write_all(&payload[..])` — `Bytes` derefs to
 //! `&[u8]` with zero overhead.
 
-use std::error::Error;
 
 use bytes::BytesMut;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use hotaru_core::connection::{HotaruRead, HotaruWrite};
 
 use hotaru_core::protocol::Message;
 
@@ -46,7 +45,7 @@ use varint::{decode_remaining_length_from_slice, encode_remaining_length,
 /// decoding that length and allocating the body, so an oversized declaration
 /// costs one fixed header and no heap — the peer never gets to pick an
 /// allocation size. Callers pass the value from their `MqttSafety`.
-pub async fn read_packet<R: AsyncRead + Unpin>(
+pub async fn read_packet<R: HotaruRead<Error = std::io::Error> + Unpin + Send>(
     reader: &mut R,
     max_size: usize,
 ) -> Result<Packet, MqttError> {
@@ -83,7 +82,7 @@ pub async fn read_packet<R: AsyncRead + Unpin>(
 pub fn decode_packet_from_bytes(
     buf: &mut BytesMut,
     max_size: usize,
-) -> Result<Option<Packet>, Box<dyn Error + Send + Sync>> {
+) -> Result<Option<Packet>, MqttError> {
     if buf.len() < 2 {
         return Ok(None);
     }
@@ -100,10 +99,10 @@ pub fn decode_packet_from_bytes(
     // Before the `buf.len() < total` wait: an oversized declaration must fail
     // now, not sit here holding the connection open until the bytes arrive.
     if remaining > max_size {
-        return Err(Box::new(MqttError::Protocol(Violation::PacketTooLarge {
+        return Err(MqttError::Protocol(Violation::PacketTooLarge {
             len: remaining,
             max: max_size,
-        })));
+        }));
     }
 
     let header_len = 1 + rl_bytes;
@@ -114,8 +113,7 @@ pub fn decode_packet_from_bytes(
 
     let packet_bytes = buf.split_to(total);
     let body = &packet_bytes[header_len..];
-    let packet = parse_packet(first, packet_type, remaining, body)
-        .map_err(|e| -> Box<dyn Error + Send + Sync> { Box::new(e) })?;
+    let packet = parse_packet(first, packet_type, remaining, body)?;
     Ok(Some(packet))
 }
 
@@ -148,7 +146,7 @@ pub fn encode_packet(packet: &Packet) -> Result<Vec<u8>, CodecError> {
 
 /// Write a packet to an async writer. Used by the writer actor for control
 /// packets.
-pub async fn write_packet<W: AsyncWrite + Unpin>(
+pub async fn write_packet<W: HotaruWrite<Error = std::io::Error> + Unpin + Send>(
     writer: &mut W,
     packet: &Packet,
 ) -> Result<(), MqttError> {
@@ -160,7 +158,7 @@ pub async fn write_packet<W: AsyncWrite + Unpin>(
 /// Optimized write path for PUBLISH: writes the header in one syscall, then
 /// the payload `Bytes` directly with `write_all(&payload[..])` — no copy
 /// from `Bytes` to intermediate buffer.
-pub async fn write_publish_packet<W: AsyncWrite + Unpin>(
+pub async fn write_publish_packet<W: HotaruWrite<Error = std::io::Error> + Unpin + Send>(
     writer: &mut W,
     packet: &PublishPacket,
 ) -> Result<(), MqttError> {
@@ -207,8 +205,11 @@ pub async fn write_publish_packet<W: AsyncWrite + Unpin>(
 
 impl Message for Packet {
     type BytesMut = BytesMut;
+    /// 0.8.5's `Message` names its error instead of boxing it. `Infallible`
+    /// is for impls that cannot fail; a wire codec is the opposite of that.
+    type Error = MqttError;
 
-    fn encode(&self, buf: &mut Self::BytesMut) -> Result<(), Box<dyn Error + Send + Sync>> {
+    fn encode(&self, buf: &mut Self::BytesMut) -> Result<(), Self::Error> {
         buf.extend_from_slice(&encode_packet(self).map_err(MqttError::Codec)?);
         Ok(())
     }
@@ -218,7 +219,7 @@ impl Message for Packet {
     /// default cap rather than the spec ceiling: this path is not reachable
     /// with an operator's chosen value, and defaulting to "whatever the wire
     /// format can express" would leave a 256 MiB hole beside a 1 MiB door.
-    fn decode(buf: &mut Self::BytesMut) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
+    fn decode(buf: &mut Self::BytesMut) -> Result<Option<Self>, Self::Error> {
         decode_packet_from_bytes(buf, MqttSafety::new().max_packet_size())
     }
 }
