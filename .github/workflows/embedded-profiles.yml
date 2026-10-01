@@ -1,0 +1,24 @@
+# Blocked on #104: this crate declares no [features], so every cell below fails with
+# "does not contain these features". #104 must add the [features] section AND pin
+# hotaru_core with default-features = false, because --no-default-features on this crate
+# does not disable hotaru_core's own std/spawn_send defaults (without that a cell passes
+# while testing nothing). When #104 lands, flip `on:` to [push, pull_request]. Bare-metal
+# --target cells return once tokio/dashmap/hotaru_io_tokio are optional.
+name: Embedded profiles
+
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [spawn_local, spawn_local_atomic, spawn_local_no_atomic]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --lib --no-default-features --features embedded,${{ matrix.profile }}
