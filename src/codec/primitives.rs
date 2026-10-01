@@ -1,6 +1,6 @@
 //! Length-prefixed string / byte-slice readers and writers.
 
-use std::sync::Arc;
+use hotaru_core::marker::Arc;
 
 use bytes::Bytes;
 

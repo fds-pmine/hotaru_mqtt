@@ -6,7 +6,7 @@
 //! copy rather than two is what #64 and #80 were about — divergent
 //! implementations of this path are how the ack-routing defects arose.
 
-use std::sync::Arc;
+use hotaru_core::marker::Arc;
 
 use hotaru_core::connection::{ConnStream, TransportSpec};
 use tokio::time::timeout;

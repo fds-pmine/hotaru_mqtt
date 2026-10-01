@@ -10,11 +10,11 @@
 //! by whoever takes it first (typically the `Protocol::handle` loop).
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use hotaru_core::connection::{ConnMeta, ConnStream};
+use hotaru_core::marker::Arc;
 use hotaru_core::protocol::{Channel, ProtocolRole};
 use hotaru_core::connection::{HotaruRead, HotaruWrite};
 use tokio::sync::{Notify, mpsc};
@@ -68,6 +68,8 @@ pub struct MqttChannel<W: ConnStream> {
     session: Arc<MqttSession>,
 
     // ── Lifecycle signals ───────────────────────────────────────
+    // ponytail: marker::Arc is Rc under spawn_local_no_atomic; these two fields and
+    // the tokio::spawn in new() are the real no-atomic design points (#28/#31).
     open: Arc<AtomicBool>,
     shutdown: Arc<Notify>,
 }

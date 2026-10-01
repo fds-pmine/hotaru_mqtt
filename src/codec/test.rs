@@ -3,7 +3,7 @@
 use super::*;
 
 use std::io::Cursor;
-use std::sync::Arc;
+use hotaru_core::marker::Arc;
 
 use bytes::{Bytes, BytesMut};
 use hotaru_io_tokio::TokioIo;

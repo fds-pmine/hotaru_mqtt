@@ -9,7 +9,7 @@
 //! `AtomicU16` for the packet-id counter, `OnceLock` for the one-time bind,
 //! `DashMap` for per-packet-id inflight tracking.
 
-use std::sync::Arc;
+use hotaru_core::marker::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 
 use dashmap::DashMap;

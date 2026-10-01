@@ -6,11 +6,11 @@
 //! sends — while a subscriber lives in them, because the broker pushes PUBLISH
 //! frames back over the connection the subscriber itself opened.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use hotaru_core::app::common::RuntimeConfig;
 use hotaru_core::connection::{ConnStream, HotaruRead, TransportSpec};
+use hotaru_core::marker::Arc;
 use hotaru_core::protocol::{Channel as _, ProtocolFlow};
 use hotaru_core::url::UrlRoot;
 use tokio::time::timeout;

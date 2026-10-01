@@ -9,11 +9,11 @@
 //! to Phase 5 perf tuning.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
 use hotaru_core::connection::ConnStream;
+use hotaru_core::marker::Arc;
 use hotaru_core::protocol::Channel; // `close()` on the takeover path
 
 use crate::channel::MqttChannel;

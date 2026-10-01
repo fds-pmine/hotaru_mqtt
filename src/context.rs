@@ -10,7 +10,7 @@
 //! body reads `request`, endpoint body reads `incoming`. The framework guarantees
 //! this; user code that needs to inspect both should use `match`.
 
-use std::sync::Arc;
+use hotaru_core::marker::Arc;
 
 use hotaru_core::connection::TransportSpec;
 use hotaru_core::extensions::{Locals, Params};

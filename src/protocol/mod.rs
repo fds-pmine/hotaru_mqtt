@@ -8,13 +8,13 @@
 //!   so all `run!` ops reuse the session.
 
 use std::marker::PhantomData;
-use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use hotaru_core::app::common::RuntimeConfig;
 use hotaru_core::connection::{ConnStream, HotaruRead, HotaruWrite, TransportSpec};
+use hotaru_core::marker::Arc;
 use hotaru_core::protocol::{Channel as _, CtxError, Protocol, ProtocolFlow, ProtocolRole};
 use hotaru_core::url::UrlRoot;
 

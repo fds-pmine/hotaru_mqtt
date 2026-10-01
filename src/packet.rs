@@ -6,7 +6,7 @@
 //! `Packet` is the framework's `Message` type for `MqttProtocol`. Encoding
 //! and decoding live in `codec.rs`; this module is plain data definitions.
 
-use std::sync::Arc;
+use hotaru_core::marker::Arc;
 
 use bitflags::bitflags;
 use bytes::Bytes;

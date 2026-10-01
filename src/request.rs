@@ -4,7 +4,7 @@
 //! / `Response`. All three outpoint operations (`Publish` / `Subscribe` /
 //! `Unsubscribe`) go through this enum via `run!(...)`.
 
-use std::sync::Arc;
+use hotaru_core::marker::Arc;
 
 use bytes::Bytes;
 
