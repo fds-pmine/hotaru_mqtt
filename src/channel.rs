@@ -12,11 +12,12 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use hotaru_core::connection::{ConnMeta, ConnStream};
 use hotaru_core::protocol::{Channel, ProtocolRole};
 use hotaru_core::connection::{HotaruRead, HotaruWrite};
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Notify, mpsc};
 
 use crate::codec::{write_packet, write_publish_packet};
 use crate::error::MqttError;
@@ -147,8 +148,8 @@ impl<W: ConnStream> MqttChannel<W> {
     ///
     /// Called once by the `Protocol::handle` loop at startup. Channel clones
     /// (e.g. broker-held copies) cannot read — they only push commands.
-    pub async fn take_reader(&self) -> Option<<W::ReadHalf as HotaruRead>::Buffered> {
-        self.reader.lock().await.take()
+    pub fn take_reader(&self) -> Option<<W::ReadHalf as HotaruRead>::Buffered> {
+        self.reader.lock().expect("reader slot poisoned").take()
     }
 
     pub fn session(&self) -> &Arc<MqttSession> {

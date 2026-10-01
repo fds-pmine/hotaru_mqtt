@@ -107,7 +107,6 @@ where
 
     let mut reader = channel
         .take_reader()
-        .await
         .ok_or_else(|| MqttError::Configuration("reader already taken".into()))?;
 
     // Read the cap before the first packet: it has to bind on the CONNECT

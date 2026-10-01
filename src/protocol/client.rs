@@ -78,7 +78,6 @@ where
     // 1. Take exclusive reader ownership (single-take).
     let mut reader = channel
         .take_reader()
-        .await
         .ok_or_else(|| MqttError::Configuration("reader already taken".into()))?;
 
     // 2. Send CONNECT

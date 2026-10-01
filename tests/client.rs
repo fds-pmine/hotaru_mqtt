@@ -760,3 +760,20 @@ retransmittable even though the peer has not confirmed release"
         "the record should be cleared once PUBCOMP completes the flow"
     );
 }
+
+// ----------------------------------------------------------------------------
+// Reader ownership
+// ----------------------------------------------------------------------------
+
+/// The reader is single-take: once the session loop holds it, a clone of the
+/// channel gets `None`. CONNECT arriving proves the loop's own take succeeded.
+#[tokio::test]
+async fn take_reader_yields_none_once_the_session_holds_it() {
+    let (mut peer, channel) =
+        start_client_with_channel(MqttClientConfig::new("reader-once")).await;
+    match recv(&mut peer.0).await {
+        Packet::Connect(_) => {}
+        other => panic!("expected CONNECT, got {other:?}"),
+    }
+    assert!(channel.take_reader().is_none(), "reader was taken twice");
+}
