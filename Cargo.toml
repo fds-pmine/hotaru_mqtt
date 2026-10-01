@@ -17,7 +17,16 @@ dashmap = "6"
 hotaru_core = "=0.8.6"
 hotaru_io_tokio = "=0.8.6"
 tokio = { version = "1.28", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+hotaru_rt_embassy = { version = "=0.8.6", default-features = false, features = ["std"], optional = true }
+embassy-executor = { version = "0.10", default-features = false, features = ["platform-std", "executor-thread"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.28", features = ["io-util", "macros", "net", "rt", "sync", "time", "test-util"] }
 hotaru_http = "=0.8.6"
+
+[features]
+embassy-example = ["dep:hotaru_rt_embassy", "dep:embassy-executor"]
+
+[[example]]
+name = "embassy_client"
+required-features = ["embassy-example"]

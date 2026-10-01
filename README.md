@@ -100,6 +100,12 @@ End-to-end examples live in [`tests/integration.rs`](tests/integration.rs), whic
 cargo test
 ```
 
+A minimal Embassy client lives in [`examples/embassy_client.rs`](examples/embassy_client.rs). It stands the wire codec up on `hotaru_rt_embassy`, sends CONNECT and one QoS 1 PUBLISH to a broker (default `127.0.0.1:1883`; pass `--self-test` to use a scripted peer built into the example instead), and prints the CONNACK and PUBACK it receives:
+
+```sh
+cargo run --example embassy_client --features embassy-example -- --self-test
+```
+
 ## Internal layout
 
 These are internal modules, not addressable paths. Everything supported is
