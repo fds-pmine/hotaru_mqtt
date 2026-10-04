@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use hotaru_core::connection::{ConnMeta, ConnStream};
 use hotaru_core::protocol::{Channel, ProtocolRole};
-use tokio::io::{AsyncWriteExt, BufReader};
+use hotaru_core::connection::{HotaruRead, HotaruWrite};
 use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::codec::{write_packet, write_publish_packet};
@@ -43,7 +43,6 @@ pub(crate) fn next_connection_id() -> u64 {
 pub enum WriteCmd {
     Packet(Packet),
     Publish(PublishPacket),
-    Flush,
     Shutdown,
 }
 
@@ -53,7 +52,7 @@ pub enum WriteCmd {
 
 pub struct MqttChannel<W: ConnStream> {
     // ── Physical wire ───────────────────────────────────────────
-    reader: Arc<Mutex<Option<BufReader<W::ReadHalf>>>>,
+    reader: Arc<Mutex<Option<<W::ReadHalf as HotaruRead>::Buffered>>>,
     /// Writer actor's input. `pub(crate)` so `Broker::publish` can directly
     /// fanout `WriteCmd::Publish(...)` to subscriber channels (G simplification).
     pub(crate) cmd_tx: mpsc::UnboundedSender<WriteCmd>,
@@ -110,11 +109,14 @@ impl<W: ConnStream> MqttChannel<W> {
     /// Construct a new channel, spawn its writer actor, and stash the reader
     /// for `take_reader`. Called from `MqttProtocol::open_channel`.
     pub(crate) fn new(
-        reader: BufReader<W::ReadHalf>,
-        writer: W::WriteHalf,
+        reader: <W::ReadHalf as HotaruRead>::Buffered,
+        writer: <W::WriteHalf as HotaruWrite>::Buffered,
         meta: &W::Meta,
         role: ProtocolRole,
-    ) -> Self {
+    ) -> Self
+    where
+        W::WriteHalf: HotaruWrite<Error = std::io::Error>,
+    {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let open = Arc::new(AtomicBool::new(true));
         let shutdown = Arc::new(Notify::new());
@@ -145,7 +147,7 @@ impl<W: ConnStream> MqttChannel<W> {
     ///
     /// Called once by the `Protocol::handle` loop at startup. Channel clones
     /// (e.g. broker-held copies) cannot read — they only push commands.
-    pub async fn take_reader(&self) -> Option<BufReader<W::ReadHalf>> {
+    pub async fn take_reader(&self) -> Option<<W::ReadHalf as HotaruRead>::Buffered> {
         self.reader.lock().await.take()
     }
 
@@ -204,23 +206,32 @@ impl<W: ConnStream> MqttChannel<W> {
 // ----------------------------------------------------------------------------
 
 async fn writer_actor<W: ConnStream>(
-    mut writer: W::WriteHalf,
+    mut writer: <W::WriteHalf as HotaruWrite>::Buffered,
     mut cmd_rx: mpsc::UnboundedReceiver<WriteCmd>,
     shutdown: Arc<Notify>,
     open: Arc<AtomicBool>,
-) {
+) where
+    W::WriteHalf: HotaruWrite<Error = std::io::Error>,
+{
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 match cmd {
+                    // Flush after every packet. The writer 0.8.5 hands us is
+                    // buffered (8 KiB on the tokio backend); without this,
+                    // CONNACK (4 bytes), PUBACK (4), PINGRESP (2) sit in the
+                    // buffer until the connection accumulates 8 KiB of output.
+                    // MQTT packets are small and latency-sensitive - there is
+                    // no batching win here worth a stuck handshake. A batching
+                    // policy, if ever wanted, needs its own issue and its own
+                    // measurements.
                     Some(WriteCmd::Packet(p)) => {
                         if write_packet(&mut writer, &p).await.is_err() { break; }
+                        if writer.flush().await.is_err() { break; }
                     }
                     Some(WriteCmd::Publish(p)) => {
                         if write_publish_packet(&mut writer, &p).await.is_err() { break; }
-                    }
-                    Some(WriteCmd::Flush) => {
-                        let _ = writer.flush().await;  // W policy §1: shutdown-ish path
+                        if writer.flush().await.is_err() { break; }
                     }
                     Some(WriteCmd::Shutdown) | None => break,
                 }
